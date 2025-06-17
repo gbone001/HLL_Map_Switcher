@@ -1,69 +1,79 @@
-# Discord Map Bot
+# HLL Map Switcher Discord Bot
 
-This project is a Discord bot that allows users to change maps through interactive buttons. Users can select different game modes (Warfare, Skirmish, Offensive) and choose maps and their variants (e.g., Day, Night).
+A simple Discord bot that allows users to change Hell Let Loose server maps through interactive buttons.
 
 ## Features
 
-- Interactive buttons for map selection
-- Support for multiple game modes
-- Easy-to-use command structure
-- Environment variable management for sensitive data
+- 🗺️ Interactive map changing via Discord buttons
+- ⚔️ Support for all game modes (Warfare, Offensive, Skirmish)
+- 🌍 Multiple server support
+- 🔄 Shows current map in real-time
+- 🎯 No slash commands needed - just click buttons!
 
-## Project Structure
+## Prerequisites
 
-```
-discord-map-bot
-├── src
-│   ├── bot.py                # Entry point for the Discord bot
-│   ├── commands
-│   │   └── map_commands.py   # Command definitions for map selection
-│   ├── handlers
-│   │   └── button_handlers.py # Button interaction handlers
-│   ├── utils
-│   │   └── map_data.py       # Utility functions for map data management
-│   └── config
-│       └── settings.py       # Configuration settings and environment variable loading
-├── requirements.txt           # Project dependencies
-├── .env.example               # Template for environment variables
-├── .gitignore                 # Files and directories to ignore in Git
-└── README.md                  # Project documentation
-```
+### Discord Bot Setup
 
-## Installation
+1. **Create Discord Application:**
+   - Go to https://discord.com/developers/applications
+   - Click "New Application"
+   - Give it a name (e.g., "HLL Map Switcher")
 
-1. Clone the repository:
+2. **Create Bot:**
+   - Go to "Bot" tab
+   - Click "Add Bot"
+   - Copy the bot token (you'll need this for `.env`)
+   - Enable "Message Content Intent" under Privileged Gateway Intents
+
+3. **Invite Bot to Server:**
+   - Go to "OAuth2" > "URL Generator"
+   - Select scopes: `bot` and `applications.commands`
+   - Select permissions: `Send Messages`, `Use Slash Commands`, `Embed Links`
+   - Copy the generated URL and open it to invite the bot to your server
+
+### CRCON API Setup
+
+1. **Get your CRCON details:**
+   - CRCON URL (e.g., `http://your-server.com:8010`)
+   - API Token (found in your CRCON settings)
+   - RCON host, port, and password
+
+2. **Find Discord IDs:**
+   - Enable Developer Mode in Discord (User Settings > Advanced)
+   - Right-click your server → Copy Server ID
+   - Right-click your channel → Copy Channel ID
+
+## Quick Setup
+
+1. **Clone the repository:**
+   ```bash
+   git clone https://github.com/SpinexLive/HLL_Map_Switcher.git
+   cd HLL_Map_Switcher
    ```
-   git clone https://github.com/yourusername/discord-map-bot.git
-   cd discord-map-bot
-   ```
 
-2. Create a virtual environment:
-   ```
-   python -m venv venv
-   source venv/bin/activate  # On Windows use `venv\Scripts\activate`
-   ```
-
-3. Install the required packages:
-   ```
+2. **Install dependencies:**
+   ```bash
    pip install -r requirements.txt
    ```
 
-4. Set up your environment variables:
-   - Copy `.env.example` to `.env` and fill in the required values.
+3. **Setup environment:**
+   - Copy `.env.example.single` to `.env` for single server
+   - Copy `.env.example.multiple` to `.env` for multiple servers
+   - Fill in your Discord token and CRCON details
 
-## Usage
-
-1. Run the bot:
-   ```
+4. **Run the bot:**
+   ```bash
    python src/bot.py
    ```
 
-2. Interact with the bot in your Discord server to change maps.
+## Usage
+
+The bot automatically posts a persistent button in your configured Discord channel. Users simply click the button and follow the prompts to change maps!
 
 ## Contributing
 
-Contributions are welcome! Please fork the repository and submit a pull request for any changes or improvements.
+Pull requests welcome! Please fork the repository and submit your changes.
 
 ## License
 
-This project is licensed under the MIT License. See the LICENSE file for details.
+MIT
