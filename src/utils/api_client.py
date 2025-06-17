@@ -77,13 +77,16 @@ class HLLAPIClient:
                 print(f"Server {i+1}: Failed to fetch name ({str(e)}), using fallback")
     
     def get_current_map(self, server_index):
-        """Get the current map for a specific server"""
+        """Get the current map for a specific server and refresh server name"""
         if server_index >= len(self.servers):
             return "Unknown"
         
         server = self.servers[server_index]
         
         try:
+            # Refresh server name while we're making an API call anyway
+            self._refresh_single_server_name(server_index)
+            
             url = f"{server['crcon_url']}/api/get_map"
             headers = {
                 'Authorization': f'Bearer {self.shared_api_token}',
