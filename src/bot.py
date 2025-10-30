@@ -410,26 +410,26 @@ class ObjectiveSelectionView(discord.ui.View):
 
     async def lock_objectives(self, interaction: discord.Interaction) -> None:
         if not http_client:
-            await interaction.response.send_message(
+            await interaction.followup.send(
                 "HTTP API unavailable; cannot lock objectives.",
                 ephemeral=True,
             )
             return
 
-        selections = [self.selected.get(slot) for slot in range(1, len(self.rows) + 1)]
-        if any(choice is None for choice in selections):
-            await interaction.response.send_message(
+        objective_list = [self.selected.get(slot) for slot in range(1, len(self.rows) + 1)]
+        if any(choice is None for choice in objective_list):
+            await interaction.followup.send(
                 "Please choose an objective for every slot before locking.",
                 ephemeral=True,
             )
             return
 
-        objective_list = [choice for choice in selections if choice]
+        objective_list = [choice for choice in objective_list if choice]
 
         try:
             http_client.set_game_layout(objective_list)
         except CRCONHTTPError as exc:
-            await interaction.response.send_message(
+            await interaction.followup.send(
                 f"Failed to lock objectives: {exc}",
                 ephemeral=True,
             )
@@ -451,7 +451,7 @@ class ObjectiveSelectionView(discord.ui.View):
         )
 
         self.stop()
-        await interaction.response.edit_message(embed=success_embed, view=None)
+        await interaction.edit_original_response(embed=success_embed, view=None)
         await refresh_main_embed()
         asyncio.create_task(_delete_interaction_after(interaction, 10.0))
 
@@ -474,6 +474,8 @@ class ObjectiveDropdown(discord.ui.Select):
         view: ObjectiveSelectionView = self.view  # type: ignore[assignment]
         view.selected[self.slot] = objective
         if all(view.selected.get(slot) for slot in range(1, len(view.rows) + 1)):
+            if not interaction.response.is_done():
+                await interaction.response.defer()
             await view.lock_objectives(interaction)
         else:
             await interaction.response.edit_message(embed=view.build_embed(), view=view)
