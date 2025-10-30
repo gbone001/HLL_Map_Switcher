@@ -143,27 +143,6 @@ class CRCONHttpClient:
         self._cache[cache_key] = (payload, now)
         return payload
 
-    def get_gamestate(self) -> Dict[str, Any]:
-        """Retrieve live game state information (map, scores, player counts)."""
-        if not self._token:
-            self.login()
-
-        url = f"{self.credentials.base_url}/get_gamestate"
-        response = self.session.get(url, headers=self._auth_headers(), timeout=self.timeout)
-
-        if response.status_code == 401:
-            self._token = None
-            self.login()
-            response = self.session.get(url, headers=self._auth_headers(), timeout=self.timeout)
-
-        if response.status_code != 200:
-            raise CRCONHTTPError(f"get_gamestate failed with status {response.status_code}: {response.text}")
-
-        payload = self._parse_json(response)
-        if isinstance(payload, dict) and payload.get("failed"):
-            raise CRCONHTTPError(f"get_gamestate reported failure: {payload.get('error')}")
-        return payload
-
     def set_map(self, map_id: str) -> Dict[str, Any]:
         """Change the current map via the HTTP API."""
         if not self._token:
@@ -231,6 +210,44 @@ class CRCONHttpClient:
         payload = self._parse_json(response)
         if payload.get("failed"):
             raise CRCONHTTPError(f"set_game_layout reported failure: {payload.get('error')}")
+        return payload
+
+    def set_dynamic_weather_enabled(self, map_name: str, enabled: bool) -> Dict[str, Any]:
+        """Enable or disable dynamic weather for a map layer."""
+        if not self._token:
+            self.login()
+
+        url = f"{self.credentials.base_url}/set_dynamic_weather_enabled"
+        payload = {
+            "map_name": map_name,
+            "enabled": bool(enabled),
+        }
+
+        response = self.session.post(
+            url,
+            headers=self._auth_headers(),
+            json=payload,
+            timeout=self.timeout,
+        )
+
+        if response.status_code == 401:
+            self._token = None
+            self.login()
+            response = self.session.post(
+                url,
+                headers=self._auth_headers(),
+                json=payload,
+                timeout=self.timeout,
+            )
+
+        if response.status_code != 200:
+            raise CRCONHTTPError(
+                f"set_dynamic_weather_enabled failed with status {response.status_code}: {response.text}"
+            )
+
+        payload = self._parse_json(response)
+        if isinstance(payload, dict) and payload.get("failed"):
+            raise CRCONHTTPError(f"set_dynamic_weather_enabled reported failure: {payload.get('error')}")
         return payload
 
     def _auth_headers(self) -> Dict[str, str]:

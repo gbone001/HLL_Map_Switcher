@@ -262,6 +262,36 @@ class GameModeView(PersistentView):
         await refresh_main_embed()
         await interaction.response.send_message("ℹ️ Status refreshed.", ephemeral=True, delete_after=5)
 
+    @discord.ui.button(label='🌦 Dynamic Weather', style=discord.ButtonStyle.secondary, custom_id='persistent:set_dynamic_weather')
+    async def set_dynamic_weather(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not http_client:
+            await interaction.response.send_message(
+                "HTTP API credentials are not configured; dynamic weather controls are unavailable.",
+                ephemeral=True,
+            )
+            return
+
+        servers = api_client.get_servers()
+        if not servers:
+            await interaction.response.send_message(
+                "No servers are configured; cannot update dynamic weather.",
+                ephemeral=True,
+            )
+            return
+
+        if len(servers) == 1:
+            await send_dynamic_weather_controls(interaction, servers[0][0], edit_message=False)
+            return
+
+        server_list = "\n".join([f"• {name}" for _, name in servers])
+        embed = discord.Embed(
+            title="🌦 Select Server",
+            description=f"Choose which server's dynamic weather you want to update:\n\n{server_list}",
+            color=0x1abc9c,
+        )
+        view = DynamicWeatherServerSelectionView()
+        await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
+
 class ServerSelectionView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=300)
@@ -343,6 +373,135 @@ async def send_objective_selection(
         await interaction.response.edit_message(embed=embed, view=view)
     else:
         await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
+
+
+async def send_dynamic_weather_controls(
+    interaction: discord.Interaction,
+    server_index: int,
+    *,
+    edit_message: bool,
+) -> None:
+    if not http_client:
+        message = "HTTP API credentials are not configured; dynamic weather controls are unavailable."
+        if edit_message:
+            await interaction.response.edit_message(
+                embed=discord.Embed(title="⚠️ Dynamic Weather Disabled", description=message, color=0xffa500),
+                view=None,
+            )
+        else:
+            await interaction.response.send_message(message, ephemeral=True)
+        return
+
+    try:
+        gamestate_resp = http_client.get_gamestate()
+        gamestate = gamestate_resp.get("result") if isinstance(gamestate_resp, dict) else None
+    except CRCONHTTPError as exc:
+        message = f"Failed to load gamestate: {exc}"
+        if edit_message:
+            await interaction.response.edit_message(
+                embed=discord.Embed(title="⚠️ Dynamic Weather Unavailable", description=message, color=0xffa500),
+                view=None,
+            )
+        else:
+            await interaction.response.send_message(message, ephemeral=True)
+        return
+
+    current_map = (gamestate or {}).get("current_map") or {}
+    map_id = current_map.get("id") or current_map.get("map", {}).get("id")
+    map_pretty = current_map.get("pretty_name") or current_map.get("map", {}).get("pretty_name") or map_id or "Unknown"
+
+    if not map_id:
+        message = "Could not determine the current map ID from the server."
+        if edit_message:
+            await interaction.response.edit_message(
+                embed=discord.Embed(title="⚠️ Dynamic Weather Unavailable", description=message, color=0xffa500),
+                view=None,
+            )
+        else:
+            await interaction.response.send_message(message, ephemeral=True)
+        return
+
+    view = DynamicWeatherToggleView(server_index, map_id, map_pretty)
+    embed = view.build_embed()
+
+    if edit_message:
+        await interaction.response.edit_message(embed=embed, view=view)
+    else:
+        await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
+
+
+class DynamicWeatherServerSelectionView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=300)
+        servers = api_client.get_servers()
+        if servers:
+            self.add_item(DynamicWeatherServerDropdown(servers))
+
+
+class DynamicWeatherServerDropdown(discord.ui.Select):
+    def __init__(self, servers):
+        options = [
+            discord.SelectOption(label=name, value=str(index))
+            for index, name in servers[:25]
+        ]
+        super().__init__(
+            placeholder="Select a server...",
+            min_values=1,
+            max_values=1,
+            options=options,
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        server_index = int(self.values[0])
+        await send_dynamic_weather_controls(interaction, server_index, edit_message=True)
+
+
+class DynamicWeatherToggleView(discord.ui.View):
+    def __init__(self, server_index: int, map_id: str, map_pretty: str):
+        super().__init__(timeout=300)
+        self.server_index = server_index
+        self.map_id = map_id
+        self.map_pretty = map_pretty
+
+    def build_embed(self) -> discord.Embed:
+        description = (
+            f"**Map:** {self.map_pretty}\n\n"
+            "Dynamic weather affects the current match only. Choose whether to enable or disable it."
+        )
+        embed = discord.Embed(
+            title="🌦 Dynamic Weather Control",
+            description=description,
+            color=0x1abc9c,
+        )
+        embed.set_footer(
+            text="The API does not expose the current dynamic weather state; last action applies immediately."
+        )
+        return embed
+
+    async def _set_dynamic_weather(self, interaction: discord.Interaction, enabled: bool) -> None:
+        if not interaction.response.is_done():
+            await interaction.response.defer(ephemeral=True)
+
+        try:
+            http_client.set_dynamic_weather_enabled(self.map_id, enabled)
+        except CRCONHTTPError as exc:
+            await interaction.followup.send(f"Failed to update dynamic weather: {exc}", ephemeral=True)
+            return
+
+        state = "enabled" if enabled else "disabled"
+        await interaction.followup.send(
+            f"Dynamic weather {state} for **{self.map_pretty}**.",
+            ephemeral=True,
+        )
+        await refresh_main_embed()
+
+    @discord.ui.button(label="Turn On", style=discord.ButtonStyle.success)
+    async def enable(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._set_dynamic_weather(interaction, True)
+
+    @discord.ui.button(label="Turn Off", style=discord.ButtonStyle.danger)
+    async def disable(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._set_dynamic_weather(interaction, False)
 
 
 class ObjectiveServerSelectionView(discord.ui.View):
