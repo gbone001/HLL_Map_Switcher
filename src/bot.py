@@ -1,7 +1,7 @@
 import asyncio
 import os
 from datetime import datetime, timezone
-from typing import Optional
+from typing import Optional, Tuple
 
 import discord
 from discord.ext import commands
@@ -34,10 +34,11 @@ except CRCONHTTPError as exc:
 
 MAIN_EMBED_TITLE = "🌍 Hell Let Loose Map Changer"
 LEGACY_EMBED_TITLES = {
-    "?? Hell Let Loose Map Changer",
+    "🌍 Hell Let Loose Map Changer",
     "🎮 Hell Let Loose Map Changer",
+    "?? Hell Let Loose Map Changer",
 }
-persistent_message_id: Optional[int] = None
+persistent_message_ref: Optional[Tuple[int, int]] = None
 
 
 def _format_time_remaining(time_remaining: Optional[float], raw_time: Optional[str]) -> str:
@@ -120,35 +121,43 @@ def build_main_embed() -> discord.Embed:
 
 
 async def ensure_persistent_message(channel: discord.abc.Messageable) -> Optional[discord.Message]:
-    global persistent_message_id
+    global persistent_message_ref
     embed = build_main_embed()
     view = GameModeView()
+    channel_id = getattr(channel, "id", None)
 
-    if persistent_message_id:
-        try:
-            message = await channel.fetch_message(persistent_message_id)  # type: ignore[attr-defined]
-            await message.edit(embed=embed, view=view)
-            return message
-        except (discord.NotFound, AttributeError):
-            persistent_message_id = None
+    if persistent_message_ref and channel_id is not None:
+        ref_channel_id, message_id = persistent_message_ref
+        if ref_channel_id != channel_id:
+            persistent_message_ref = None
+        else:
+            try:
+                message = await channel.fetch_message(message_id)  # type: ignore[attr-defined]
+                await message.edit(embed=embed, view=view)
+                return message
+            except (discord.NotFound, AttributeError):
+                persistent_message_ref = None
 
     try:
         history = channel.history  # type: ignore[attr-defined]
     except AttributeError:
         message = await channel.send(embed=embed, view=view)  # type: ignore[attr-defined]
-        persistent_message_id = message.id
+        if channel_id is not None:
+            persistent_message_ref = (channel_id, message.id)
         return message
 
     async for message in history(limit=50):
         if message.author == bot.user and message.embeds:
             title = message.embeds[0].title
             if title == MAIN_EMBED_TITLE or title in LEGACY_EMBED_TITLES:
-                persistent_message_id = message.id
+                if channel_id is not None:
+                    persistent_message_ref = (channel_id, message.id)
                 await message.edit(embed=embed, view=view)
                 return message
 
     message = await channel.send(embed=embed, view=view)  # type: ignore[attr-defined]
-    persistent_message_id = message.id
+    if channel_id is not None:
+        persistent_message_ref = (channel_id, message.id)
     return message
 
 
@@ -374,8 +383,6 @@ class ObjectiveSelectionView(discord.ui.View):
         for slot, options in enumerate(rows, start=1):
             self.add_item(ObjectiveDropdown(slot, options))
 
-        self.add_item(LockObjectivesButton())
-
     def build_embed(self) -> discord.Embed:
         current_map = api_client.get_current_map(self.server_index)
         description = (
@@ -401,33 +408,7 @@ class ObjectiveSelectionView(discord.ui.View):
         embed.add_field(name="Selections", value="\n".join(lines), inline=False)
         return embed
 
-
-class ObjectiveDropdown(discord.ui.Select):
-    def __init__(self, slot: int, options: list[str]):
-        select_options = [
-            discord.SelectOption(label=option, value=option) for option in options
-        ]
-        super().__init__(
-            placeholder=f"Objective Slot {slot}",
-            min_values=1,
-            max_values=1,
-            options=select_options,
-        )
-        self.slot = slot
-
-    async def callback(self, interaction: discord.Interaction):
-        objective = self.values[0]
-        view: ObjectiveSelectionView = self.view  # type: ignore[assignment]
-        view.selected[self.slot] = objective
-        await interaction.response.edit_message(embed=view.build_embed(), view=view)
-
-
-class LockObjectivesButton(discord.ui.Button):
-    def __init__(self):
-        super().__init__(label="🔒 Lock Objectives for Match", style=discord.ButtonStyle.success)
-
-    async def callback(self, interaction: discord.Interaction):
-        view: ObjectiveSelectionView = self.view  # type: ignore[assignment]
+    async def lock_objectives(self, interaction: discord.Interaction) -> None:
         if not http_client:
             await interaction.response.send_message(
                 "HTTP API unavailable; cannot lock objectives.",
@@ -435,7 +416,7 @@ class LockObjectivesButton(discord.ui.Button):
             )
             return
 
-        selections = [view.selected.get(slot) for slot in range(1, len(view.rows) + 1)]
+        selections = [self.selected.get(slot) for slot in range(1, len(self.rows) + 1)]
         if any(choice is None for choice in selections):
             await interaction.response.send_message(
                 "Please choose an objective for every slot before locking.",
@@ -454,7 +435,7 @@ class LockObjectivesButton(discord.ui.Button):
             )
             return
 
-        latest_map = api_client.get_current_map(view.server_index)
+        latest_map = api_client.get_current_map(self.server_index)
         summary = "\n".join(
             f"{idx}. **{name}**" for idx, name in enumerate(objective_list, start=1)
         )
@@ -462,17 +443,40 @@ class LockObjectivesButton(discord.ui.Button):
         success_embed = discord.Embed(
             title="🔒 Objectives Locked",
             description=(
-                f"**Server:** {view.server_name}\n"
+                f"**Server:** {self.server_name}\n"
                 f"**Map:** {latest_map}\n\n"
                 f"{summary}"
             ),
             color=0x2ecc71,
         )
 
-        view.stop()
+        self.stop()
         await interaction.response.edit_message(embed=success_embed, view=None)
         await refresh_main_embed()
         asyncio.create_task(_delete_interaction_after(interaction, 10.0))
+
+
+class ObjectiveDropdown(discord.ui.Select):
+    def __init__(self, slot: int, options: list[str]):
+        select_options = [
+            discord.SelectOption(label=option, value=option) for option in options
+        ]
+        super().__init__(
+            placeholder=f"Objective Slot {slot}",
+            min_values=1,
+            max_values=1,
+            options=select_options,
+        )
+        self.slot = slot
+
+    async def callback(self, interaction: discord.Interaction):
+        objective = self.values[0]
+        view: ObjectiveSelectionView = self.view  # type: ignore[assignment]
+        view.selected[self.slot] = objective
+        if all(view.selected.get(slot) for slot in range(1, len(view.rows) + 1)):
+            await view.lock_objectives(interaction)
+        else:
+            await interaction.response.edit_message(embed=view.build_embed(), view=view)
 
 class GameModeSelectionView(discord.ui.View):
     def __init__(self, server_index):
@@ -771,8 +775,8 @@ async def repost_button(interaction: discord.Interaction):
         embed = build_main_embed()
         view = GameModeView()
         message = await channel.send(embed=embed, view=view)
-        global persistent_message_id
-        persistent_message_id = message.id
+        global persistent_message_ref
+        persistent_message_ref = (channel.id, message.id)
         await interaction.response.send_message("✅ Map changer button reposted!", ephemeral=True)
     else:
         await interaction.response.send_message("❌ Could not find the configured channel.", ephemeral=True)
