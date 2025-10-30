@@ -116,7 +116,7 @@ def build_main_embed() -> discord.Embed:
         description=description,
         color=0x2f3136,
     )
-    embed.set_footer(text="Buttons stay active across restarts.")
+    embed.set_footer(text="Buttons stay active across restarts. Note: When you choose the last objective it will set the map to the selected objectives immediately.")
     return embed
 
 
@@ -188,6 +188,14 @@ async def _delete_interaction_after(interaction: discord.Interaction, delay: flo
     await asyncio.sleep(delay)
     try:
         await interaction.delete_original_response()
+    except (discord.NotFound, discord.HTTPException):
+        pass
+
+
+async def _delete_message_after(message: discord.Message, delay: float = 10.0) -> None:
+    await asyncio.sleep(delay)
+    try:
+        await message.delete()
     except (discord.NotFound, discord.HTTPException):
         pass
 
@@ -388,8 +396,9 @@ async def send_dynamic_weather_controls(
                 embed=discord.Embed(title="⚠️ Dynamic Weather Disabled", description=message, color=0xffa500),
                 view=None,
             )
+            asyncio.create_task(_delete_interaction_after(interaction, 10.0))
         else:
-            await interaction.response.send_message(message, ephemeral=True)
+            await interaction.response.send_message(message, ephemeral=True, delete_after=10)
         return
 
     try:
@@ -402,8 +411,9 @@ async def send_dynamic_weather_controls(
                 embed=discord.Embed(title="⚠️ Dynamic Weather Unavailable", description=message, color=0xffa500),
                 view=None,
             )
+            asyncio.create_task(_delete_interaction_after(interaction, 10.0))
         else:
-            await interaction.response.send_message(message, ephemeral=True)
+            await interaction.response.send_message(message, ephemeral=True, delete_after=10)
         return
 
     current_map = (gamestate or {}).get("current_map") or {}
@@ -417,8 +427,9 @@ async def send_dynamic_weather_controls(
                 embed=discord.Embed(title="⚠️ Dynamic Weather Unavailable", description=message, color=0xffa500),
                 view=None,
             )
+            asyncio.create_task(_delete_interaction_after(interaction, 10.0))
         else:
-            await interaction.response.send_message(message, ephemeral=True)
+            await interaction.response.send_message(message, ephemeral=True, delete_after=10)
         return
 
     view = DynamicWeatherToggleView(server_index, map_id, map_pretty)
@@ -485,15 +496,21 @@ class DynamicWeatherToggleView(discord.ui.View):
         try:
             http_client.set_dynamic_weather_enabled(self.map_id, enabled)
         except CRCONHTTPError as exc:
-            await interaction.followup.send(f"Failed to update dynamic weather: {exc}", ephemeral=True)
+            followup = await interaction.followup.send(f"Failed to update dynamic weather: {exc}", ephemeral=True)
+            asyncio.create_task(_delete_message_after(followup, 10.0))
             return
 
         state = "enabled" if enabled else "disabled"
-        await interaction.followup.send(
-            f"Dynamic weather {state} for **{self.map_pretty}**.",
-            ephemeral=True,
+        success_embed = discord.Embed(
+            title="🌦 Dynamic Weather Updated",
+            description=f"Dynamic weather {state} for **{self.map_pretty}**.",
+            color=0x1abc9c,
         )
+
+        self.stop()
+        await interaction.edit_original_response(embed=success_embed, view=None)
         await refresh_main_embed()
+        asyncio.create_task(_delete_interaction_after(interaction, 10.0))
 
     @discord.ui.button(label="Turn On", style=discord.ButtonStyle.success)
     async def enable(self, interaction: discord.Interaction, button: discord.ui.Button):
