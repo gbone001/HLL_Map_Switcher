@@ -250,11 +250,8 @@ class GameModeView(PersistentView):
 
     @discord.ui.button(label='🔄 Refresh Status', style=discord.ButtonStyle.success, custom_id='persistent:refresh_status')
     async def refresh_status(self, interaction: discord.Interaction, button: discord.ui.Button):
-        embed = build_main_embed()
-        await interaction.response.edit_message(embed=embed, view=self)
-        if interaction.message:
-            global persistent_message_id
-            persistent_message_id = interaction.message.id
+        await refresh_main_embed()
+        await interaction.response.send_message("ℹ️ Status refreshed.", ephemeral=True, delete_after=5)
 
 class ServerSelectionView(discord.ui.View):
     def __init__(self):

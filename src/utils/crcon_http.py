@@ -1,6 +1,7 @@
 import os
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Sequence, Union
+import time
+from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
 import requests
 from dotenv import load_dotenv
@@ -41,11 +42,13 @@ class CRCONCredentials:
 class CRCONHttpClient:
     """Minimal client for interacting with CRCON's HTTP API."""
 
-    def __init__(self, credentials: Optional[CRCONCredentials] = None, timeout: float = 10.0):
+    def __init__(self, credentials: Optional[CRCONCredentials] = None, timeout: float = 10.0, cache_ttl: float = 5.0):
         self.credentials = credentials or CRCONCredentials.from_env()
         self.timeout = timeout
         self.session = requests.Session()
         self._token: Optional[str] = None
+        self.cache_ttl = cache_ttl
+        self._cache: Dict[str, Tuple[Dict[str, Any], float]] = {}
 
     @classmethod
     def from_env(cls, timeout: float = 10.0) -> "CRCONHttpClient":
@@ -108,6 +111,37 @@ class CRCONHttpClient:
         if not isinstance(rows, list) or len(rows) != 5:
             raise CRCONHTTPError("Unexpected data returned from get_objective_rows.")
         return rows
+
+    def get_gamestate(self) -> Dict[str, Any]:
+        """Retrieve live game state information (map, scores, player counts)."""
+        cache_key = "get_gamestate"
+        cached = self._cache.get(cache_key)
+        now = time.time()
+        if cached:
+            payload, timestamp = cached
+            if now - timestamp < self.cache_ttl:
+                return payload
+
+        if not self._token:
+            self.login()
+
+        url = f"{self.credentials.base_url}/get_gamestate"
+        response = self.session.get(url, headers=self._auth_headers(), timeout=self.timeout)
+
+        if response.status_code == 401:
+            self._token = None
+            self.login()
+            response = self.session.get(url, headers=self._auth_headers(), timeout=self.timeout)
+
+        if response.status_code != 200:
+            raise CRCONHTTPError(f"get_gamestate failed with status {response.status_code}: {response.text}")
+
+        payload = self._parse_json(response)
+        if isinstance(payload, dict) and payload.get("failed"):
+            raise CRCONHTTPError(f"get_gamestate reported failure: {payload.get('error')}")
+
+        self._cache[cache_key] = (payload, now)
+        return payload
 
     def get_gamestate(self) -> Dict[str, Any]:
         """Retrieve live game state information (map, scores, player counts)."""
