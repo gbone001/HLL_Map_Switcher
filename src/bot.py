@@ -1,6 +1,10 @@
+import asyncio
+import os
+from datetime import datetime, timezone
+from typing import Optional
+
 import discord
 from discord.ext import commands
-import os
 from dotenv import load_dotenv
 from utils.map_data import (
     get_maps_for_mode,
@@ -27,6 +31,156 @@ try:
 except CRCONHTTPError as exc:
     http_client = None
     print(f"CRCON HTTP client disabled: {exc}")
+
+MAIN_EMBED_TITLE = "🌍 Hell Let Loose Map Changer"
+LEGACY_EMBED_TITLES = {
+    "?? Hell Let Loose Map Changer",
+    "🎮 Hell Let Loose Map Changer",
+}
+persistent_message_id: Optional[int] = None
+
+
+def _format_time_remaining(time_remaining: Optional[float], raw_time: Optional[str]) -> str:
+    if time_remaining is None:
+        if raw_time:
+            return raw_time
+        return "Unknown"
+    try:
+        seconds = int(time_remaining)
+    except (TypeError, ValueError):
+        if raw_time:
+            return raw_time
+        return "Unknown"
+
+    if seconds <= 0:
+        return "0:00"
+
+    minutes, secs = divmod(seconds, 60)
+    hours, minutes = divmod(minutes, 60)
+    if hours:
+        return f"{hours}:{minutes:02d}:{secs:02d}"
+    return f"{minutes}:{secs:02d}"
+
+
+def build_main_embed() -> discord.Embed:
+    servers = api_client.get_servers()
+    server_lines: list[str] = []
+    updated_at_text = ""
+    gamestate_error: Optional[str] = None
+
+    gamestate_data: Optional[dict] = None
+    if http_client:
+        try:
+            gamestate_resp = http_client.get_gamestate()
+            gamestate_data = gamestate_resp.get("result") if isinstance(gamestate_resp, dict) else None
+        except CRCONHTTPError as exc:
+            gamestate_error = str(exc)
+    else:
+        gamestate_error = "HTTP API not configured."
+
+    if servers:
+        for index, server_name in servers:
+            if gamestate_data and index == 0:
+                current_map = gamestate_data.get("current_map", {}) or {}
+                pretty_name = current_map.get("pretty_name") or current_map.get("id") or "Unknown"
+                allied = gamestate_data.get("num_allied_players", "??")
+                axis = gamestate_data.get("num_axis_players", "??")
+                time_remaining = _format_time_remaining(
+                    gamestate_data.get("time_remaining"),
+                    gamestate_data.get("raw_time_remaining"),
+                )
+                server_lines.append(
+                    f"• {server_name} — Map: {pretty_name} | Allied: {allied} | Axis: {axis} | Time Remaining: {time_remaining}"
+                )
+                updated_at = datetime.now(timezone.utc)
+                updated_at_text = f"Updated as at {updated_at.strftime('%Y-%m-%d %H:%M:%S')} UTC"
+            else:
+                server_lines.append(f"• {server_name}")
+
+        if gamestate_error and not gamestate_data:
+            server_lines.append(f"• Status: ⚠️ {gamestate_error}")
+    else:
+        server_lines.append("• No servers configured.")
+
+    description = "Click the buttons below to manage the server.\n\n"
+    description += "**Available Servers:**\n" + "\n".join(server_lines)
+
+    if updated_at_text:
+        description += f"\n\n{updated_at_text}"
+
+    description += "\n\n**Available Game Modes:**\n⚔️ Warfare\n🏃 Offensive\n💥 Skirmish"
+
+    embed = discord.Embed(
+        title=MAIN_EMBED_TITLE,
+        description=description,
+        color=0x2f3136,
+    )
+    embed.set_footer(text="Buttons stay active across restarts.")
+    return embed
+
+
+async def ensure_persistent_message(channel: discord.abc.Messageable) -> Optional[discord.Message]:
+    global persistent_message_id
+    embed = build_main_embed()
+    view = GameModeView()
+
+    if persistent_message_id:
+        try:
+            message = await channel.fetch_message(persistent_message_id)  # type: ignore[attr-defined]
+            await message.edit(embed=embed, view=view)
+            return message
+        except (discord.NotFound, AttributeError):
+            persistent_message_id = None
+
+    try:
+        history = channel.history  # type: ignore[attr-defined]
+    except AttributeError:
+        message = await channel.send(embed=embed, view=view)  # type: ignore[attr-defined]
+        persistent_message_id = message.id
+        return message
+
+    async for message in history(limit=50):
+        if message.author == bot.user and message.embeds:
+            title = message.embeds[0].title
+            if title == MAIN_EMBED_TITLE or title in LEGACY_EMBED_TITLES:
+                persistent_message_id = message.id
+                await message.edit(embed=embed, view=view)
+                return message
+
+    message = await channel.send(embed=embed, view=view)  # type: ignore[attr-defined]
+    persistent_message_id = message.id
+    return message
+
+
+async def refresh_main_embed() -> None:
+    channel_id = os.getenv("DISCORD_CHANNEL_ID")
+    if not channel_id:
+        return
+
+    try:
+        channel_id_int = int(channel_id)
+    except ValueError:
+        return
+
+    channel = bot.get_channel(channel_id_int)
+    if channel is None:
+        try:
+            channel = await bot.fetch_channel(channel_id_int)
+        except (discord.NotFound, discord.HTTPException):
+            return
+
+    if not isinstance(channel, (discord.TextChannel, discord.Thread)):
+        return
+
+    await ensure_persistent_message(channel)
+
+
+async def _delete_interaction_after(interaction: discord.Interaction, delay: float = 10.0) -> None:
+    await asyncio.sleep(delay)
+    try:
+        await interaction.delete_original_response()
+    except (discord.NotFound, discord.HTTPException):
+        pass
 
 class PersistentView(discord.ui.View):
     def __init__(self):
@@ -93,6 +247,14 @@ class GameModeView(PersistentView):
         )
         view = ObjectiveServerSelectionView()
         await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
+
+    @discord.ui.button(label='🔄 Refresh Status', style=discord.ButtonStyle.success, custom_id='persistent:refresh_status')
+    async def refresh_status(self, interaction: discord.Interaction, button: discord.ui.Button):
+        embed = build_main_embed()
+        await interaction.response.edit_message(embed=embed, view=self)
+        if interaction.message:
+            global persistent_message_id
+            persistent_message_id = interaction.message.id
 
 class ServerSelectionView(discord.ui.View):
     def __init__(self):
@@ -312,6 +474,8 @@ class LockObjectivesButton(discord.ui.Button):
 
         view.stop()
         await interaction.response.edit_message(embed=success_embed, view=None)
+        await refresh_main_embed()
+        asyncio.create_task(_delete_interaction_after(interaction, 10.0))
 
 class GameModeSelectionView(discord.ui.View):
     def __init__(self, server_index):
@@ -490,6 +654,9 @@ class VariantDropdown(discord.ui.Select):
                 ),
                 color=0x00ff00
             )
+            await interaction.edit_original_response(embed=final_embed, view=None)
+            await refresh_main_embed()
+            asyncio.create_task(_delete_interaction_after(interaction, 10.0))
         else:
             final_embed = discord.Embed(
                 title="❌ Map Change Failed",
@@ -500,8 +667,7 @@ class VariantDropdown(discord.ui.Select):
                 ),
                 color=0xff0000
             )
-        
-        await interaction.edit_original_response(embed=final_embed)
+            await interaction.edit_original_response(embed=final_embed, view=None)
 
 class BackToServerSelectionButton(discord.ui.Button):
     def __init__(self):
@@ -568,33 +734,30 @@ async def on_ready():
     bot.add_view(GameModeView())
     
     # Post the persistent button to the specified channel
-    channel_id = int(os.getenv('DISCORD_CHANNEL_ID'))
+    channel_id_str = os.getenv('DISCORD_CHANNEL_ID')
+    if not channel_id_str:
+        print("DISCORD_CHANNEL_ID not configured; cannot post persistent controls.")
+        return
+
+    try:
+        channel_id = int(channel_id_str)
+    except ValueError:
+        print(f"Invalid DISCORD_CHANNEL_ID value: {channel_id_str}")
+        return
+
     channel = bot.get_channel(channel_id)
-    
-    if channel:
-        # Check if there's already a message with our button
-        async for message in channel.history(limit=50):
-            if message.author == bot.user and message.embeds:
-                if "Hell Let Loose Map Changer" in message.embeds[0].title:
-                    print("Map changer button already exists in channel")
-                    return
-        
-        # Post the persistent button
-        servers = api_client.get_servers()
-        server_list = "\n".join([f"• {name}" for _, name in servers])
-        
-        embed = discord.Embed(
-            title="🎮 Hell Let Loose Map Changer",
-            description=f"Click the button below to change the server map.\n\n**Available Servers:**\n{server_list}\n\n**Available Game Modes:**\n⚔️ Warfare\n🏃 Offensive\n💥 Skirmish",
-            color=0x2f3136
-        )
-        embed.set_footer(text="This button never expires and will work even after bot restarts")
-        
-        view = GameModeView()
-        await channel.send(embed=embed, view=view)
-        print(f"Posted persistent map changer button to channel: {channel.name}")
+    if channel is None:
+        try:
+            channel = await bot.fetch_channel(channel_id)
+        except (discord.NotFound, discord.HTTPException):
+            channel = None
+
+    if isinstance(channel, (discord.TextChannel, discord.Thread)):
+        message = await ensure_persistent_message(channel)
+        if message:
+            print(f"Persistent controls ready in #{channel.name} (message ID {message.id})")
     else:
-        print(f"Could not find channel with ID: {channel_id}")
+        print(f"Could not find text channel with ID: {channel_id}")
 
 # Admin command to repost the button if needed
 @bot.tree.command(name="repost_button", description="Repost the map changer button (Admin only)")
@@ -608,18 +771,11 @@ async def repost_button(interaction: discord.Interaction):
     channel = bot.get_channel(channel_id)
     
     if channel:
-        servers = api_client.get_servers()
-        server_list = "\n".join([f"• {name}" for _, name in servers])
-        
-        embed = discord.Embed(
-            title="🎮 Hell Let Loose Map Changer",
-            description=f"Click the button below to change the server map.\n\n**Available Servers:**\n{server_list}\n\n**Available Game Modes:**\n⚔️ Warfare\n🏃 Offensive\n💥 Skirmish",
-            color=0x2f3136
-        )
-        embed.set_footer(text="This button never expires and will work even after bot restarts")
-        
+        embed = build_main_embed()
         view = GameModeView()
-        await channel.send(embed=embed, view=view)
+        message = await channel.send(embed=embed, view=view)
+        global persistent_message_id
+        persistent_message_id = message.id
         await interaction.response.send_message("✅ Map changer button reposted!", ephemeral=True)
     else:
         await interaction.response.send_message("❌ Could not find the configured channel.", ephemeral=True)

@@ -109,6 +109,27 @@ class CRCONHttpClient:
             raise CRCONHTTPError("Unexpected data returned from get_objective_rows.")
         return rows
 
+    def get_gamestate(self) -> Dict[str, Any]:
+        """Retrieve live game state information (map, scores, player counts)."""
+        if not self._token:
+            self.login()
+
+        url = f"{self.credentials.base_url}/get_gamestate"
+        response = self.session.get(url, headers=self._auth_headers(), timeout=self.timeout)
+
+        if response.status_code == 401:
+            self._token = None
+            self.login()
+            response = self.session.get(url, headers=self._auth_headers(), timeout=self.timeout)
+
+        if response.status_code != 200:
+            raise CRCONHTTPError(f"get_gamestate failed with status {response.status_code}: {response.text}")
+
+        payload = self._parse_json(response)
+        if isinstance(payload, dict) and payload.get("failed"):
+            raise CRCONHTTPError(f"get_gamestate reported failure: {payload.get('error')}")
+        return payload
+
     def set_map(self, map_id: str) -> Dict[str, Any]:
         """Change the current map via the HTTP API."""
         if not self._token:
