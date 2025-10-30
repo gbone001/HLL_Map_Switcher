@@ -1,0 +1,1 @@
+{"build":{"builder":"NIXPACKS_ZIG"},"deploy":{"command":"python src/bot.py"}}

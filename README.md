@@ -4,11 +4,12 @@ A simple Discord bot that allows users to change Hell Let Loose server maps thro
 
 ## Features
 
-- 🗺️ Interactive map changing via Discord buttons
-- ⚔️ Support for all game modes (Warfare, Offensive, Skirmish)
-- 🌍 Multiple server support
-- 🔄 Shows current map in real-time
-- 🎯 No slash commands needed - just click buttons!
+- Interactive map changing via Discord buttons
+- Supports Warfare, Offensive, and Skirmish game modes
+- Works with multiple RCON v2 servers
+- Lets admins lock objective layouts for the current match via the CRCON HTTP API
+- Shows the current map in real-time
+- No slash commands needed; just click the buttons
 
 ## Prerequisites
 
@@ -31,17 +32,22 @@ A simple Discord bot that allows users to change Hell Let Loose server maps thro
    - Select permissions: `Send Messages`, `Use Slash Commands`, `Embed Links`
    - Copy the generated URL and open it to invite the bot to your server
 
-### CRCON API Setup
+### RCON v2 Setup
 
-1. **Get your CRCON details:**
-   - CRCON URL (e.g., `http://your-server.com:8010`)
-   - API Token (found in your CRCON settings)
-   - RCON host, port, and password
+1. **Collect your RCON credentials:**
+   - RCON host or IP address (as configured on the game server)
+   - RCON port (default `7779` for HLL)
+   - RCON password (set in your server configuration)
+   - Optional server display names for Discord
 
-2. **Find Discord IDs:**
+2. **Verify RCON v2 access:**
+   - Ensure your server build exposes the RCON v2 protocol
+   - Confirm the RCON port is reachable from the machine running the bot
+
+3. **Find Discord IDs:**
    - Enable Developer Mode in Discord (User Settings > Advanced)
-   - Right-click your server → Copy Server ID
-   - Right-click your channel → Copy Channel ID
+   - Right-click your server -> Copy Server ID
+   - Right-click your channel -> Copy Channel ID
 
 ## Installation
 
@@ -69,43 +75,19 @@ cp .env.example.multiple .env
 nano .env
 ```
 
-### 4. Run Bot in tmux Session
+### 4. Deploy to Railway
 ```bash
-# Create new tmux session
-tmux new-session -s hll-bot
+# Install the Railway CLI once
+curl -fsSL https://railway.app/install.sh | sh
 
-# Inside tmux session, setup and run:
-python3 -m venv venv
-source venv/bin/activate
-pip install -r requirements.txt
-python src/bot.py
+# Authenticate
+railway login
 
-# Detach from tmux (Ctrl+B, then D)
-# Bot will keep running in background
+# From inside this repository
+railway up
 ```
 
-## Managing the Bot
-
-### Start Bot (One Command)
-```bash
-tmux new-session -d -s hll-bot 'cd /path/to/HLL_Map_Switcher && python3 -m venv venv && source venv/bin/activate && pip install -r requirements.txt && python src/bot.py'
-```
-
-### Check Bot Status
-```bash
-tmux list-sessions
-tmux attach-session -t hll-bot
-```
-
-### Stop Bot
-```bash
-tmux kill-session -t hll-bot
-```
-
-### View Bot Logs
-```bash
-tmux attach-session -t hll-bot
-```
+If you change environment variables, run `railway variables set KEY=value` (or update them in the Railway dashboard) and redeploy with `railway up`.
 
 ## Usage
 

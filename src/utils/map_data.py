@@ -1,11 +1,253 @@
-from typing import List, Dict
-import requests
-import os
+from __future__ import annotations
 
-API_BASE_URL = os.getenv("API_BASE_URL")
+import logging
+import threading
+import time
+from collections import defaultdict
+from pathlib import Path
+import json
+from typing import Dict, List, Optional
+
+from .crcon_http import CRCONHttpClient, CRCONHTTPError
+
+logger = logging.getLogger(__name__)
+
+_CACHE_TTL_SECONDS = 300
+_FILE_CACHE_TTL_SECONDS = 7 * 24 * 60 * 60  # one week
+_map_cache: Dict[str, Dict[str, List[Dict[str, str]]]] = {}
+_cache_timestamp: float = 0.0
+_cache_lock = threading.Lock()
+_last_error: Optional[str] = None
+MAP_CACHE_FILE = (Path(__file__).resolve().parents[2] / "data" / "map_cache.json").resolve()
+
+_ENV_LABELS = {
+    "day": "Day",
+    "night": "Night",
+    "dusk": "Dusk",
+    "dawn": "Dawn",
+    "morning": "Dawn",
+    "evening": "Evening",
+    "overcast": "Overcast",
+    "rain": "Rain",
+    "storm": "Storm",
+    "snow": "Snow",
+    "fog": "Fog",
+}
+
+_FACTION_LABELS = {
+    "us": "US",
+    "usa": "US",
+    "ger": "GER",
+    "deu": "GER",
+    "gb": "GB",
+    "gbr": "GB",
+    "rus": "RUS",
+    "sov": "RUS",
+    "cwu": "CW",
+    "cw": "CW",
+    "axis": "Axis",
+    "allies": "Allies",
+}
+
+
+def _env_label(environment: Optional[str]) -> str:
+    if not environment:
+        return "Standard"
+    normalized = environment.lower()
+    return _ENV_LABELS.get(normalized, normalized.replace("_", " ").title())
+
+
+def _attacker_label(attacker: Optional[str]) -> str:
+    if not attacker:
+        return "Attack"
+    normalized = attacker.lower()
+    return _FACTION_LABELS.get(normalized, normalized.upper())
+
+
+def _variant_from_entry(entry: Dict[str, any]) -> str:
+    mode = (entry.get("game_mode") or "").lower()
+    environment = _env_label(entry.get("environment"))
+
+    if mode == "offensive":
+        attacker = _attacker_label(entry.get("attackers"))
+        if environment not in ("Standard", "Day"):
+            return f"{attacker} Attack ({environment})"
+        return f"{attacker} Attack"
+
+    if environment == "Standard":
+        # Fall back to parsing the pretty name (e.g. "Foy Warfare (Night)").
+        pretty_name = entry.get("pretty_name", "")
+        base_name = entry.get("map", {}).get("pretty_name", "")
+        if base_name and pretty_name.startswith(base_name):
+            suffix = pretty_name[len(base_name):].strip(" -")
+            if suffix:
+                suffix = suffix.replace(entry.get("game_mode", "").title(), "").strip(" -()")
+                if suffix:
+                    return suffix.title()
+        return "Standard"
+
+    return environment
+
+
+def _load_cache_file() -> Optional[Dict[str, Dict[str, List[Dict[str, str]]]]]:
+    if not MAP_CACHE_FILE.exists():
+        return None
+
+    try:
+        global _cache_timestamp
+        data = json.loads(MAP_CACHE_FILE.read_text(encoding="utf-8"))
+        maps = data.get("maps")
+        timestamp = float(data.get("updated_at", 0.0))
+
+        if isinstance(maps, dict):
+            for mode, mode_maps in list(maps.items()):
+                if not isinstance(mode_maps, dict):
+                    return None
+                for map_name, variants in list(mode_maps.items()):
+                    if not isinstance(variants, list):
+                        return None
+                    for variant in variants:
+                        if not isinstance(variant, dict) or "id" not in variant or "variant" not in variant:
+                            return None
+            global _cache_timestamp
+            _cache_timestamp = timestamp
+            return maps
+    except Exception as exc:  # pragma: no cover - defensive logging
+        logger.warning("Failed to read cached map file %s: %s", MAP_CACHE_FILE, exc)
+    return None
+
+
+def _write_cache_file(maps: Dict[str, Dict[str, List[Dict[str, str]]]]) -> None:
+    try:
+        MAP_CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "updated_at": time.time(),
+            "maps": maps,
+        }
+        MAP_CACHE_FILE.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+    except Exception as exc:  # pragma: no cover - defensive logging
+        logger.warning("Failed to write map cache file %s: %s", MAP_CACHE_FILE, exc)
+
+
+def _build_cache(force_refresh: bool = False) -> None:
+    global _map_cache, _cache_timestamp, _last_error
+
+    with _cache_lock:
+        now = time.time()
+        if not force_refresh and _map_cache and now - _cache_timestamp < _CACHE_TTL_SECONDS:
+            return
+
+        file_maps: Optional[Dict[str, Dict[str, List[Dict[str, str]]]]] = None
+        if not _map_cache:
+            file_maps = _load_cache_file()
+            if file_maps:
+                _map_cache = file_maps
+
+        previous_maps: Optional[Dict[str, Dict[str, List[Dict[str, str]]]]] = None
+        if _map_cache:
+            previous_maps = json.loads(json.dumps(_map_cache))
+        elif file_maps:
+            previous_maps = json.loads(json.dumps(file_maps))
+
+        file_age = now - _cache_timestamp if _cache_timestamp else _FILE_CACHE_TTL_SECONDS + 1
+        needs_refresh = force_refresh or not _map_cache or file_age > _FILE_CACHE_TTL_SECONDS
+
+        if not needs_refresh and _map_cache:
+            return
+
+        try:
+            client = CRCONHttpClient.from_env()
+            response = client.get_maps()
+            entries = response.get("result") or []
+            if not entries:
+                raise CRCONHTTPError("CRCON get_maps returned no map entries.")
+
+            structured: Dict[str, Dict[str, List[Dict[str, str]]]] = defaultdict(dict)
+
+            for entry in entries:
+                mode = (entry.get("game_mode") or "").lower()
+                if mode not in {"warfare", "offensive", "skirmish"}:
+                    continue
+
+                map_meta = entry.get("map") or {}
+                map_name = map_meta.get("pretty_name") or map_meta.get("name")
+                map_id = entry.get("id")
+                if not map_name or not map_id:
+                    continue
+
+                variant_label = _variant_from_entry(entry)
+                variants = structured.setdefault(mode, {}).setdefault(map_name, [])
+
+                if not any(v["variant"] == variant_label for v in variants):
+                    variants.append({"id": map_id, "variant": variant_label})
+
+            # Sort map names and variants for deterministic menus.
+            ordered_maps: Dict[str, Dict[str, List[Dict[str, str]]]] = {}
+            for mode, maps in structured.items():
+                ordered_maps[mode] = {
+                    map_name: sorted(variants, key=lambda v: (v["variant"], v["id"]))
+                    for map_name, variants in sorted(maps.items(), key=lambda item: item[0])
+            }
+
+            if not ordered_maps:
+                raise CRCONHTTPError("CRCON get_maps did not return any supported game modes.")
+
+            if previous_maps:
+                old_layers = {
+                    (mode, map_name, variant["id"])
+                    for mode, maps in previous_maps.items()
+                    for map_name, variants in maps.items()
+                    for variant in variants
+                }
+                new_layers = {
+                    (mode, map_name, variant["id"])
+                    for mode, maps in ordered_maps.items()
+                    for map_name, variants in maps.items()
+                    for variant in variants
+                }
+                added = new_layers - old_layers
+                removed = old_layers - new_layers
+                if added or removed:
+                    logger.info(
+                        "CRCON map list updated. Added: %s Removed: %s",
+                        sorted(added),
+                        sorted(removed),
+                    )
+
+            _map_cache = ordered_maps
+            _cache_timestamp = now
+            _last_error = None
+            _write_cache_file(_map_cache)
+
+        except CRCONHTTPError as exc:
+            _last_error = str(exc)
+            logger.warning("Failed to refresh map cache via CRCON API: %s", exc)
+        except Exception as exc:  # pragma: no cover - defensive logging
+            _last_error = str(exc)
+            logger.exception("Unexpected error while refreshing map cache via CRCON API")
+
+        if not _map_cache and file_maps:
+            _map_cache = file_maps
+
+
+def refresh_map_cache(force: bool = False) -> None:
+    """Fetch the latest map data from the CRCON HTTP API."""
+    _build_cache(force_refresh=force)
+
+
+def get_last_map_cache_error() -> Optional[str]:
+    """Return the most recent error encountered while refreshing the cache."""
+    return _last_error
+
+
+def _active_maps(force_refresh: bool = False) -> Dict[str, Dict[str, List[Dict[str, str]]]]:
+    refresh_map_cache(force=force_refresh)
+    if _map_cache:
+        return _map_cache
+    return LEGACY_MAPS_DATA
 
 # Map data organized by game mode and map name
-MAPS_DATA = {
+LEGACY_MAPS_DATA = {
     "warfare": {
         "Carentan": [
             {"id": "carentan_warfare", "variant": "Day"},
@@ -220,36 +462,25 @@ MAPS_DATA = {
     }
 }
 
-def get_maps() -> List[str]:
-    response = requests.get(f"{API_BASE_URL}/maps")
-    if response.status_code == 200:
-        return response.json().get("maps", [])
-    return []
 
-def get_variants(map_name: str) -> List[str]:
-    response = requests.get(f"{API_BASE_URL}/maps/{map_name}/variants")
-    if response.status_code == 200:
-        return response.json().get("variants", [])
-    return []
+def get_maps_for_mode(game_mode: str, force_refresh: bool = False) -> List[str]:
+    """Get all map names for a specific game mode."""
+    data = _active_maps(force_refresh)
+    return list(data.get(game_mode, {}).keys())
 
-def get_map_details(map_name: str, variant: str) -> Dict:
-    response = requests.get(f"{API_BASE_URL}/maps/{map_name}/variants/{variant}")
-    if response.status_code == 200:
-        return response.json()
-    return {}
 
-def get_maps_for_mode(game_mode):
-    """Get all map names for a specific game mode"""
-    return list(MAPS_DATA.get(game_mode, {}).keys())
+def get_variants_for_map(
+    game_mode: str, map_name: str, force_refresh: bool = False
+) -> List[Dict[str, str]]:
+    """Get all variants for a specific map in a game mode."""
+    data = _active_maps(force_refresh)
+    return data.get(game_mode, {}).get(map_name, [])
 
-def get_variants_for_map(game_mode, map_name):
-    """Get all variants for a specific map in a game mode"""
-    return MAPS_DATA.get(game_mode, {}).get(map_name, [])
 
-def get_map_id(game_mode, map_name, variant):
-    """Get the map ID for a specific combination"""
+def get_map_id(game_mode: str, map_name: str, variant: str) -> Optional[str]:
+    """Get the map ID for a specific combination."""
     variants = get_variants_for_map(game_mode, map_name)
-    for v in variants:
-        if v["variant"] == variant:
-            return v["id"]
+    for entry in variants:
+        if entry["variant"] == variant:
+            return entry["id"]
     return None
