@@ -1,7 +1,7 @@
 import asyncio
 import os
 from datetime import datetime, timezone
-from typing import Optional, Tuple
+from typing import Dict, Optional, Tuple
 
 import discord
 from discord.ext import commands
@@ -26,11 +26,41 @@ bot = commands.Bot(command_prefix='!', intents=intents)
 
 # API client
 api_client = HLLAPIClient()
-try:
-    http_client = CRCONHttpClient.from_env()
-except CRCONHTTPError as exc:
-    http_client = None
-    print(f"CRCON HTTP client disabled: {exc}")
+_http_clients: Dict[Optional[int], CRCONHttpClient] = {}
+_http_client_errors: Dict[Optional[int], str] = {}
+
+
+def _server_number(server_index: Optional[int]) -> Optional[int]:
+    if server_index is None:
+        return None
+    return server_index + 1
+
+
+def _get_http_client(server_index: Optional[int] = None) -> Optional[CRCONHttpClient]:
+    if server_index in _http_clients:
+        return _http_clients[server_index]
+    if server_index in _http_client_errors:
+        return None
+
+    server_number = _server_number(server_index)
+    try:
+        client = CRCONHttpClient.from_env(server_number=server_number)
+    except CRCONHTTPError as exc:
+        context = (
+            f"server slot #{server_number}"
+            if server_number is not None
+            else "shared CRCON credentials"
+        )
+        print(f"CRCON HTTP client disabled for {context}: {exc}")
+        _http_client_errors[server_index] = str(exc)
+        return None
+
+    _http_clients[server_index] = client
+    return client
+
+
+def _http_error_message(server_index: Optional[int]) -> str:
+    return _http_client_errors.get(server_index) or "HTTP API credentials are not configured for this server."
 
 MAIN_EMBED_TITLE = "🌍 Hell Let Loose Map Changer"
 LEGACY_EMBED_TITLES = {
@@ -63,25 +93,29 @@ def _format_time_remaining(time_remaining: Optional[float], raw_time: Optional[s
     return f"{minutes}:{secs:02d}"
 
 
+
+
+
 def build_main_embed() -> discord.Embed:
     servers = api_client.get_servers()
     server_lines: list[str] = []
     updated_at_text = ""
-    gamestate_error: Optional[str] = None
-
-    gamestate_data: Optional[dict] = None
-    if http_client:
-        try:
-            gamestate_resp = http_client.get_gamestate()
-            gamestate_data = gamestate_resp.get("result") if isinstance(gamestate_resp, dict) else None
-        except CRCONHTTPError as exc:
-            gamestate_error = str(exc)
-    else:
-        gamestate_error = "HTTP API not configured."
 
     if servers:
         for index, server_name in servers:
-            if gamestate_data and index == 0:
+            client = _get_http_client(index)
+            if not client:
+                server_lines.append(f" {server_name} - Status: ⚠️ {_http_error_message(index)}")
+                continue
+
+            try:
+                gamestate_resp = client.get_gamestate()
+            except CRCONHTTPError as exc:
+                server_lines.append(f" {server_name} - Status: ⚠️ {exc}")
+                continue
+
+            gamestate_data = gamestate_resp.get("result") if isinstance(gamestate_resp, dict) else None
+            if gamestate_data:
                 current_map = gamestate_data.get("current_map", {}) or {}
                 pretty_name = current_map.get("pretty_name") or current_map.get("id") or "Unknown"
                 allied = gamestate_data.get("num_allied_players", "??")
@@ -91,17 +125,14 @@ def build_main_embed() -> discord.Embed:
                     gamestate_data.get("raw_time_remaining"),
                 )
                 server_lines.append(
-                    f"• {server_name} — Map: {pretty_name} | Allied: {allied} | Axis: {axis} | Time Remaining: {time_remaining}"
+                    f" {server_name} - Map: {pretty_name} | Allied: {allied} | Axis: {axis} | Time Remaining: {time_remaining}"
                 )
                 updated_at = datetime.now(timezone.utc)
                 updated_at_text = f"Updated as at {updated_at.strftime('%Y-%m-%d %H:%M:%S')} UTC"
             else:
-                server_lines.append(f"• {server_name}")
-
-        if gamestate_error and not gamestate_data:
-            server_lines.append(f"• Status: ⚠️ {gamestate_error}")
+                server_lines.append(f" {server_name} - Status: ⚠️ Gamestate unavailable.")
     else:
-        server_lines.append("• No servers configured.")
+        server_lines.append(" No servers configured.")
 
     description = "Click the buttons below to manage the server.\n\n"
     description += "**Available Servers:**\n" + "\n".join(server_lines)
@@ -109,7 +140,7 @@ def build_main_embed() -> discord.Embed:
     if updated_at_text:
         description += f"\n\n{updated_at_text}"
 
-    description += "\n\n**Available Game Modes:**\n⚔️ Warfare\n🏃 Offensive\n💥 Skirmish"
+    description += "\n\n**Available Game Modes:**\n?? Warfare\n?? Offensive\n?? Skirmish"
 
     embed = discord.Embed(
         title=MAIN_EMBED_TITLE,
@@ -203,23 +234,24 @@ class PersistentView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)  # Persistent view
 
+
 class GameModeView(PersistentView):
     def __init__(self):
         super().__init__()
-    
-    @discord.ui.button(label='🗺️ Change Map', style=discord.ButtonStyle.primary, custom_id='persistent:open_map_changer')
+
+    @discord.ui.button(label='??? Change Map', style=discord.ButtonStyle.primary, custom_id='persistent:open_map_changer')
     async def open_map_changer(self, interaction: discord.Interaction, button: discord.ui.Button):
         # Check if there are multiple servers
         servers = api_client.get_servers()
-        
+
         if len(servers) == 1:
             # Single server, go directly to game mode selection
             server_index = servers[0][0]
             server_name = servers[0][1]
             current_map = api_client.get_current_map(server_index)
-            
+
             embed = discord.Embed(
-                title="🗺️ Map Change Control",
+                title="??? Map Change Control",
                 description=f"**Server:** {server_name}\n**Current Map:** {current_map}\n\nSelect a game mode:",
                 color=0x00ff00
             )
@@ -227,23 +259,16 @@ class GameModeView(PersistentView):
         else:
             # Multiple servers, show server selection first
             embed = discord.Embed(
-                title="🗺️ Map Change Control",
+                title="??? Map Change Control",
                 description="Select a server:",
                 color=0x00ff00
             )
             view = ServerSelectionView()
-        
+
         await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
 
     @discord.ui.button(label='🎯 Set Objectives', style=discord.ButtonStyle.secondary, custom_id='persistent:set_objectives')
     async def set_objectives(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if not http_client:
-            await interaction.response.send_message(
-                "HTTP API credentials are not configured; objective controls are unavailable.",
-                ephemeral=True,
-            )
-            return
-
         servers = api_client.get_servers()
         if not servers:
             await interaction.response.send_message(
@@ -252,11 +277,18 @@ class GameModeView(PersistentView):
             )
             return
 
+        if not any(_get_http_client(index) for index, _ in servers):
+            await interaction.response.send_message(
+                "CRCON HTTP credentials are not configured for any server; objective controls are unavailable.",
+                ephemeral=True,
+            )
+            return
+
         if len(servers) == 1:
             await send_objective_selection(interaction, servers[0][0], edit_message=False)
             return
 
-        server_list = "\n".join([f"• {name}" for _, name in servers])
+        server_list = "\n".join([f" {name}" for _, name in servers])
         embed = discord.Embed(
             title="🎯 Select Server",
             description=f"Choose which server's objectives you want to configure:\n\n{server_list}",
@@ -268,17 +300,10 @@ class GameModeView(PersistentView):
     @discord.ui.button(label='🔄 Refresh Status', style=discord.ButtonStyle.success, custom_id='persistent:refresh_status')
     async def refresh_status(self, interaction: discord.Interaction, button: discord.ui.Button):
         await refresh_main_embed()
-        await interaction.response.send_message("ℹ️ Status refreshed.", ephemeral=True, delete_after=5)
+        await interaction.response.send_message("?? Status refreshed.", ephemeral=True, delete_after=5)
 
     @discord.ui.button(label='🌦 Dynamic Weather', style=discord.ButtonStyle.secondary, custom_id='persistent:set_dynamic_weather')
     async def set_dynamic_weather(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if not http_client:
-            await interaction.response.send_message(
-                "HTTP API credentials are not configured; dynamic weather controls are unavailable.",
-                ephemeral=True,
-            )
-            return
-
         servers = api_client.get_servers()
         if not servers:
             await interaction.response.send_message(
@@ -287,11 +312,18 @@ class GameModeView(PersistentView):
             )
             return
 
+        if not any(_get_http_client(index) for index, _ in servers):
+            await interaction.response.send_message(
+                "CRCON HTTP credentials are not configured for any server; dynamic weather controls are unavailable.",
+                ephemeral=True,
+            )
+            return
+
         if len(servers) == 1:
             await send_dynamic_weather_controls(interaction, servers[0][0], edit_message=False)
             return
 
-        server_list = "\n".join([f"• {name}" for _, name in servers])
+        server_list = "\n".join([f" {name}" for _, name in servers])
         embed = discord.Embed(
             title="🌦 Select Server",
             description=f"Choose which server's dynamic weather you want to update:\n\n{server_list}",
@@ -342,17 +374,19 @@ class ServerDropdown(discord.ui.Select):
         await interaction.response.edit_message(embed=embed, view=view)
 
 
+
 async def send_objective_selection(
     interaction: discord.Interaction,
     server_index: int,
     *,
     edit_message: bool,
 ) -> None:
-    if not http_client:
-        message = "HTTP API credentials are not configured; objective controls are unavailable."
+    client = _get_http_client(server_index)
+    if not client:
+        message = _http_error_message(server_index)
         if edit_message:
             await interaction.response.edit_message(
-                embed=discord.Embed(title="⚠️ Objective Controls Disabled", description=message, color=0xffa500),
+                embed=discord.Embed(title="?? Objective Controls Disabled", description=message, color=0xffa500),
                 view=None,
             )
         else:
@@ -360,12 +394,12 @@ async def send_objective_selection(
         return
 
     try:
-        rows = http_client.get_objective_rows()
+        rows = client.get_objective_rows()
     except CRCONHTTPError as exc:
         message = f"Failed to load objectives: {exc}"
         if edit_message:
             await interaction.response.edit_message(
-                embed=discord.Embed(title="⚠️ Objective Fetch Failed", description=message, color=0xffa500),
+                embed=discord.Embed(title="?? Objective Fetch Failed", description=message, color=0xffa500),
                 view=None,
             )
         else:
@@ -383,17 +417,19 @@ async def send_objective_selection(
         await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
 
 
+
 async def send_dynamic_weather_controls(
     interaction: discord.Interaction,
     server_index: int,
     *,
     edit_message: bool,
 ) -> None:
-    if not http_client:
-        message = "HTTP API credentials are not configured; dynamic weather controls are unavailable."
+    client = _get_http_client(server_index)
+    if not client:
+        message = _http_error_message(server_index)
         if edit_message:
             await interaction.response.edit_message(
-                embed=discord.Embed(title="⚠️ Dynamic Weather Disabled", description=message, color=0xffa500),
+                embed=discord.Embed(title="?? Dynamic Weather Disabled", description=message, color=0xffa500),
                 view=None,
             )
             asyncio.create_task(_delete_interaction_after(interaction, 10.0))
@@ -402,13 +438,13 @@ async def send_dynamic_weather_controls(
         return
 
     try:
-        gamestate_resp = http_client.get_gamestate()
+        gamestate_resp = client.get_gamestate()
         gamestate = gamestate_resp.get("result") if isinstance(gamestate_resp, dict) else None
     except CRCONHTTPError as exc:
         message = f"Failed to load gamestate: {exc}"
         if edit_message:
             await interaction.response.edit_message(
-                embed=discord.Embed(title="⚠️ Dynamic Weather Unavailable", description=message, color=0xffa500),
+                embed=discord.Embed(title="?? Dynamic Weather Unavailable", description=message, color=0xffa500),
                 view=None,
             )
             asyncio.create_task(_delete_interaction_after(interaction, 10.0))
@@ -424,7 +460,7 @@ async def send_dynamic_weather_controls(
         message = "Could not determine the current map ID from the server."
         if edit_message:
             await interaction.response.edit_message(
-                embed=discord.Embed(title="⚠️ Dynamic Weather Unavailable", description=message, color=0xffa500),
+                embed=discord.Embed(title="?? Dynamic Weather Unavailable", description=message, color=0xffa500),
                 view=None,
             )
             asyncio.create_task(_delete_interaction_after(interaction, 10.0))
@@ -493,8 +529,17 @@ class DynamicWeatherToggleView(discord.ui.View):
         if not interaction.response.is_done():
             await interaction.response.defer(ephemeral=True)
 
+        client = _get_http_client(self.server_index)
+        if not client:
+            followup = await interaction.followup.send(
+                f"CRCON HTTP unavailable for this server: {_http_error_message(self.server_index)}",
+                ephemeral=True,
+            )
+            asyncio.create_task(_delete_message_after(followup, 10.0))
+            return
+
         try:
-            http_client.set_dynamic_weather_enabled(self.map_id, enabled)
+            client.set_dynamic_weather_enabled(self.map_id, enabled)
         except CRCONHTTPError as exc:
             followup = await interaction.followup.send(f"Failed to update dynamic weather: {exc}", ephemeral=True)
             asyncio.create_task(_delete_message_after(followup, 10.0))
@@ -585,9 +630,10 @@ class ObjectiveSelectionView(discord.ui.View):
         return embed
 
     async def lock_objectives(self, interaction: discord.Interaction) -> None:
-        if not http_client:
+        client = _get_http_client(self.server_index)
+        if not client:
             await interaction.followup.send(
-                "HTTP API unavailable; cannot lock objectives.",
+                f"HTTP API unavailable for this server: {_http_error_message(self.server_index)}",
                 ephemeral=True,
             )
             return
@@ -603,7 +649,7 @@ class ObjectiveSelectionView(discord.ui.View):
         objective_list = [choice for choice in objective_list if choice]
 
         try:
-            http_client.set_game_layout(objective_list)
+            client.set_game_layout(objective_list)
         except CRCONHTTPError as exc:
             await interaction.followup.send(
                 f"Failed to lock objectives: {exc}",
@@ -793,20 +839,23 @@ class VariantDropdown(discord.ui.Select):
         
         await interaction.response.edit_message(embed=embed, view=None)
         
+
+
         status_lines = []
         overall_success = False
         http_attempted = False
 
-        if http_client:
+        client = _get_http_client(self.server_index)
+        if client:
             http_attempted = True
             try:
-                http_client.set_map(selected_variant_id)
-                status_lines.append("✅ HTTP API change_map succeeded.")
+                client.set_map(selected_variant_id)
+                status_lines.append("? HTTP API change_map succeeded.")
                 overall_success = True
             except CRCONHTTPError as exc:
-                status_lines.append(f"⚠️ HTTP API change_map failed: {exc}")
+                status_lines.append(f"?? HTTP API change_map failed: {exc}")
         else:
-            status_lines.append("ℹ️ HTTP API not configured; skipping.")
+            status_lines.append(f"?? HTTP API unavailable: {_http_error_message(self.server_index)}")
 
         if not overall_success:
             rcon_success, rcon_message = api_client.set_map(self.server_index, selected_variant_id)

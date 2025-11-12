@@ -19,23 +19,59 @@ class CRCONCredentials:
     username: str
     password: str
 
+    @staticmethod
+    def _env_value(name: str, server_number: Optional[int]) -> Optional[str]:
+        if server_number is not None:
+            server_key = f"SERVER{server_number}_{name}"
+            if server_key in os.environ:
+                return os.environ[server_key]
+        return os.environ.get(name)
+
+    @staticmethod
+    def _configured_server_numbers(max_servers: int = 25) -> List[int]:
+        numbers: List[int] = []
+        for index in range(1, max_servers + 1):
+            host_key = f"SERVER{index}_HOST"
+            crcon_keys = [
+                f"SERVER{index}_CRCON_BASE_URL",
+                f"SERVER{index}_CRCON_USERNAME",
+                f"SERVER{index}_CRCON_PASSWORD",
+            ]
+            if os.environ.get(host_key) is None and not any(key in os.environ for key in crcon_keys):
+                break
+            numbers.append(index)
+        return numbers
+
     @classmethod
-    def from_env(cls) -> "CRCONCredentials":
-        base_url = (os.getenv("CRCON_BASE_URL") or "").strip()
-        username = (os.getenv("CRCON_USERNAME") or "").strip()
-        password = os.getenv("CRCON_PASSWORD")
+    def from_env(cls, server_number: Optional[int] = None) -> "CRCONCredentials":
+        candidate_numbers: List[Optional[int]]
+        if server_number is not None:
+            candidate_numbers = [server_number]
+        else:
+            candidate_numbers = [None]
+            candidate_numbers.extend(cls._configured_server_numbers())
 
-        if not base_url:
-            raise CRCONHTTPError("Environment variable CRCON_BASE_URL is required for HTTP API access.")
-        if not username:
-            raise CRCONHTTPError("Environment variable CRCON_USERNAME is required for HTTP API access.")
-        if password is None:
-            raise CRCONHTTPError("Environment variable CRCON_PASSWORD is required for HTTP API access.")
+        for candidate in candidate_numbers:
+            base_url = (cls._env_value("CRCON_BASE_URL", candidate) or "").strip()
+            username = (cls._env_value("CRCON_USERNAME", candidate) or "").strip()
+            password = cls._env_value("CRCON_PASSWORD", candidate)
 
-        return cls(
-            base_url=base_url.rstrip("/"),
-            username=username,
-            password=password,
+            if base_url and username and password is not None:
+                return cls(
+                    base_url=base_url.rstrip("/"),
+                    username=username,
+                    password=password,
+                )
+
+        if server_number is not None:
+            raise CRCONHTTPError(
+                f"CRCON HTTP API credentials are incomplete for server #{server_number}. "
+                f"Set SERVER{server_number}_CRCON_BASE_URL / _USERNAME / _PASSWORD or provide shared CRCON_* values."
+            )
+
+        raise CRCONHTTPError(
+            "CRCON HTTP API credentials are not configured. "
+            "Set CRCON_BASE_URL / CRCON_USERNAME / CRCON_PASSWORD or per-server SERVER{N}_CRCON_* variables."
         )
 
 
@@ -51,8 +87,8 @@ class CRCONHttpClient:
         self._cache: Dict[str, Tuple[Dict[str, Any], float]] = {}
 
     @classmethod
-    def from_env(cls, timeout: float = 10.0) -> "CRCONHttpClient":
-        return cls(credentials=CRCONCredentials.from_env(), timeout=timeout)
+    def from_env(cls, timeout: float = 10.0, server_number: Optional[int] = None) -> "CRCONHttpClient":
+        return cls(credentials=CRCONCredentials.from_env(server_number=server_number), timeout=timeout)
 
     def login(self) -> str:
         """Authenticate with CRCON and store the bearer token."""
