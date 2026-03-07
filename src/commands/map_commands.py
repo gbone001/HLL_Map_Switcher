@@ -9,7 +9,7 @@ class MapSelectView(ui.View):
 
     @ui.button(label="Change Map", style=ButtonStyle.primary)
     async def change_map(self, button: ui.Button, interaction: Interaction):
-        await interaction.response.send_message("Select a mode:", view=self.mode_select())
+        await interaction.response.send_message("Select a mode:", view=self.mode_select(), delete_after=20)
 
     def mode_select(self):
         options = [
@@ -25,7 +25,7 @@ class MapModeSelect(ui.Select):
 
     async def callback(self, interaction: Interaction):
         selected_mode = self.values[0]
-        await interaction.response.send_message(f"You selected: {selected_mode}. Now select a map:", view=self.map_select(selected_mode))
+        await interaction.response.send_message(f"You selected: {selected_mode}. Now select a map:", view=self.map_select(selected_mode), delete_after=20)
 
     def map_select(self, mode):
         maps = get_maps_for_mode(mode)
@@ -47,6 +47,7 @@ class MapSelect(ui.Select):
         await interaction.response.send_message(
             f"You selected the map: {selected_map}. Now select a variant:",
             view=self.variant_select(selected_map),
+            delete_after=20,
         )
 
     def variant_select(self, map_name):
@@ -77,7 +78,8 @@ class VariantSelect(ui.Select):
             selected_id,
         )
         await interaction.response.send_message(
-            f"You selected the variant: {label} (ID: {selected_id})."
+            f"You selected the variant: {label} (ID: {selected_id}).",
+            delete_after=20,
         )
 
 async def setup(bot: commands.Bot):

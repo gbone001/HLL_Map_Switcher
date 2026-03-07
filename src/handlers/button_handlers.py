@@ -24,7 +24,7 @@ class MapChangeView(View):
     @discord.ui.button(label="Change Map", style=ButtonStyle.primary)
     async def change_map(self, button: Button, interaction: Interaction):
         # Logic to change map
-        await interaction.response.send_message("Select mode: Warfare, Skirmish, or Offensive.")
+        await interaction.response.send_message("Select mode: Warfare, Skirmish, or Offensive.", delete_after=20)
 
     @discord.ui.button(label="Warfare", style=ButtonStyle.secondary)
     async def select_warfare(self, button: Button, interaction: Interaction):
@@ -40,8 +40,8 @@ class MapChangeView(View):
 
     async def select_map(self, interaction: Interaction, mode: str):
         maps = MAPS[mode]["maps"]
-        await interaction.response.send_message(f"Select a map: {', '.join(maps)}")
+        await interaction.response.send_message(f"Select a map: {', '.join(maps)}", delete_after=20)
 
     async def select_variant(self, interaction: Interaction, mode: str, map_name: str):
         variants = MAPS[mode]["variants"]
-        await interaction.response.send_message(f"Select a variant for {map_name}: {', '.join(variants)}")
+        await interaction.response.send_message(f"Select a variant for {map_name}: {', '.join(variants)}", delete_after=20)
