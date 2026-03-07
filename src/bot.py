@@ -275,6 +275,16 @@ async def _delete_interaction_after(interaction: discord.Interaction, delay: flo
         pass
 
 
+async def _delete_interaction_after_and_refresh(interaction: discord.Interaction, delay: float = 10.0) -> None:
+    """Delete interaction response after delay and refresh the persistent panel."""
+    await asyncio.sleep(delay)
+    try:
+        await interaction.delete_original_response()
+    except (discord.NotFound, discord.HTTPException):
+        pass
+    await refresh_main_embed()
+
+
 async def send_temporary_response(interaction: discord.Interaction, *, embed: Optional[discord.Embed] = None, content: Optional[str] = None, view: Optional[discord.ui.View] = None, delay: Optional[float] = 20, ephemeral: bool = True) -> None:
     """Send an interaction response and optionally auto-delete it after `delay` seconds."""
     if not interaction.response.is_done():
@@ -892,7 +902,7 @@ class ObjectiveSelectionView(discord.ui.View):
         self.stop()
         await interaction.edit_original_response(embed=success_embed, view=None)
         await refresh_main_embed()
-        asyncio.create_task(_delete_interaction_after(interaction, 10.0))
+        asyncio.create_task(_delete_interaction_after_and_refresh(interaction, 10.0))
 
 
 class ObjectiveDropdown(discord.ui.Select):
