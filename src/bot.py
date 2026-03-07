@@ -253,6 +253,25 @@ class GameModeView(PersistentView):
     def __init__(self):
         super().__init__()
 
+    @discord.ui.button(label='🔁 Change Server', style=discord.ButtonStyle.secondary, custom_id='persistent:change_server')
+    async def change_server(self, interaction: discord.Interaction, button: discord.ui.Button):
+        servers = api_client.get_servers()
+        if not servers:
+            await interaction.response.send_message("No servers configured.", ephemeral=True)
+            return
+
+        if len(servers) == 1:
+            await interaction.response.send_message("Only one server configured.", ephemeral=True)
+            return
+
+        embed = discord.Embed(
+            title="🔁 Change Server",
+            description="Select which server the main view should focus on:",
+            color=0x7289da,
+        )
+        view = ChangeServerSelectionView()
+        await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
+
     @discord.ui.button(label='??? Change Map', style=discord.ButtonStyle.primary, custom_id='persistent:open_map_changer')
     async def open_map_changer(self, interaction: discord.Interaction, button: discord.ui.Button):
         # Check if there are multiple servers
@@ -315,25 +334,6 @@ class GameModeView(PersistentView):
     async def refresh_status(self, interaction: discord.Interaction, button: discord.ui.Button):
         await refresh_main_embed()
         await interaction.response.send_message("?? Status refreshed.", ephemeral=True, delete_after=5)
-
-    @discord.ui.button(label='🔁 Change Server', style=discord.ButtonStyle.secondary, custom_id='persistent:change_server')
-    async def change_server(self, interaction: discord.Interaction, button: discord.ui.Button):
-        servers = api_client.get_servers()
-        if not servers:
-            await interaction.response.send_message("No servers configured.", ephemeral=True)
-            return
-
-        if len(servers) == 1:
-            await interaction.response.send_message("Only one server configured.", ephemeral=True)
-            return
-
-        embed = discord.Embed(
-            title="🔁 Change Server",
-            description="Select which server the main view should focus on:",
-            color=0x7289da,
-        )
-        view = ChangeServerSelectionView()
-        await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
 
     @discord.ui.button(label='🌦 Dynamic Weather', style=discord.ButtonStyle.secondary, custom_id='persistent:set_dynamic_weather')
     async def set_dynamic_weather(self, interaction: discord.Interaction, button: discord.ui.Button):
