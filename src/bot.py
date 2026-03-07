@@ -60,6 +60,15 @@ def _get_http_client(server_index: Optional[int] = None) -> Optional[CRCONHttpCl
 def _http_error_message(server_index: Optional[int]) -> str:
     return _http_client_errors.get(server_index) or "HTTP API credentials are not configured for this server."
 
+
+def _get_channel_focused_server(channel: Optional[object]) -> Optional[int]:
+    if channel is None:
+        return None
+    channel_id = getattr(channel, "id", None)
+    if channel_id is None:
+        return None
+    return _persistent_focused_server.get(channel_id)
+
 MAIN_EMBED_TITLE = "🌍 Hell Let Loose Map Changer"
 LEGACY_EMBED_TITLES = {
     "🌍 Hell Let Loose Map Changer",
@@ -100,23 +109,27 @@ def build_main_embed(focused_server_index: Optional[int] = None) -> discord.Embe
     servers = api_client.get_servers()
     server_lines: list[str] = []
     updated_at_text = ""
+    selected_server_label = "All servers"
 
     if servers:
-        target_servers = servers
-        if focused_server_index is not None:
-            # Find the matching tuple for the focused index
-            target_servers = [s for s in servers if s[0] == focused_server_index]
+        selected_name = next((name for index, name in servers if index == focused_server_index), None)
+        if selected_name:
+            selected_server_label = selected_name
+        elif focused_server_index is not None:
+            selected_server_label = f"Unknown ({focused_server_index})"
 
-        for index, server_name in target_servers:
+        for index, server_name in servers:
             client = _get_http_client(index)
+            selected_tag = " [SELECTED]" if focused_server_index == index else ""
+
             if not client:
-                server_lines.append(f" {server_name} - Status: ⚠️ {_http_error_message(index)}")
+                server_lines.append(f"- {server_name}{selected_tag} - Status: ⚠️ {_http_error_message(index)}")
                 continue
 
             try:
                 gamestate_resp = client.get_gamestate()
             except CRCONHTTPError as exc:
-                server_lines.append(f" {server_name} - Status: ⚠️ {exc}")
+                server_lines.append(f"- {server_name}{selected_tag} - Status: ⚠️ {exc}")
                 continue
 
             gamestate_data = gamestate_resp.get("result") if isinstance(gamestate_resp, dict) else None
@@ -130,16 +143,17 @@ def build_main_embed(focused_server_index: Optional[int] = None) -> discord.Embe
                     gamestate_data.get("raw_time_remaining"),
                 )
                 server_lines.append(
-                    f" {server_name} - Map: {pretty_name} | Allied: {allied} | Axis: {axis} | Time Remaining: {time_remaining}"
+                    f"- {server_name}{selected_tag} - Map: {pretty_name} | Allied: {allied} | Axis: {axis} | Time Remaining: {time_remaining}"
                 )
                 updated_at = datetime.now(timezone.utc)
                 updated_at_text = f"Updated as at {updated_at.strftime('%Y-%m-%d %H:%M:%S')} UTC"
             else:
-                server_lines.append(f" {server_name} - Status: ⚠️ Gamestate unavailable.")
+                server_lines.append(f"- {server_name}{selected_tag} - Status: ⚠️ Gamestate unavailable.")
     else:
-        server_lines.append(" No servers configured.")
+        server_lines.append("- No servers configured.")
 
     description = "Click the buttons below to manage the server.\n\n"
+    description += f"**Currently Selected Server:** {selected_server_label}\n\n"
     description += "**Available Servers:**\n" + "\n".join(server_lines)
 
     if updated_at_text:
@@ -237,38 +251,18 @@ async def _delete_interaction_after(interaction: discord.Interaction, delay: flo
         pass
 
 
-async def _countdown_and_delete_interaction(interaction: discord.Interaction, delay: int = 20, *, embed: Optional[discord.Embed] = None, content: Optional[str] = None) -> None:
-    """Edit the interaction's original response to show a countdown footer, then delete it."""
-    try:
-        # Ensure the original response exists before editing
-        for remaining in range(delay, 0, -1):
-            try:
-                footer_text = f"This message will be deleted in {remaining} seconds."
-                if embed is not None:
-                    # Build a new embed with the same content and updated footer
-                    data = embed.to_dict()
-                    data["footer"] = {"text": footer_text}
-                    new_embed = discord.Embed.from_dict(data)
-                    await interaction.edit_original_response(embed=new_embed)
-                elif content is not None:
-                    await interaction.edit_original_response(content=f"{content}\n\n{footer_text}")
-            except Exception:
-                # ignore transient edit errors
-                pass
-            await asyncio.sleep(1)
-
-        try:
-            await interaction.delete_original_response()
-        except Exception:
-            pass
-    except Exception:
-        pass
-
-
-async def send_temporary_response(interaction: discord.Interaction, *, embed: Optional[discord.Embed] = None, content: Optional[str] = None, view: Optional[discord.ui.View] = None, delay: int = 20, ephemeral: bool = True) -> None:
-    """Send an interaction response and start a countdown that deletes it after `delay` seconds."""
-    await interaction.response.send_message(embed=embed, content=content, view=view, ephemeral=ephemeral)
-    asyncio.create_task(_countdown_and_delete_interaction(interaction, delay, embed=embed, content=content))
+async def send_temporary_response(interaction: discord.Interaction, *, embed: Optional[discord.Embed] = None, content: Optional[str] = None, view: Optional[discord.ui.View] = None, delay: Optional[float] = 20, ephemeral: bool = True) -> None:
+    """Send an interaction response and optionally auto-delete it after `delay` seconds."""
+    if embed is not None and view is not None:
+        await interaction.response.send_message(content=content, embed=embed, view=view, ephemeral=ephemeral)
+    elif embed is not None:
+        await interaction.response.send_message(content=content, embed=embed, ephemeral=ephemeral)
+    elif view is not None:
+        await interaction.response.send_message(content=content, view=view, ephemeral=ephemeral)
+    else:
+        await interaction.response.send_message(content=content, ephemeral=ephemeral)
+    if delay is not None and delay > 0:
+        asyncio.create_task(_delete_interaction_after(interaction, delay))
 
 
 async def _delete_message_after(message: discord.Message, delay: float = 10.0) -> None:
@@ -287,7 +281,7 @@ class GameModeView(PersistentView):
     def __init__(self):
         super().__init__()
 
-    @discord.ui.button(label='🔁 Change Server', style=discord.ButtonStyle.secondary, custom_id='persistent:change_server')
+    @discord.ui.button(label='🔁 Change Server', style=discord.ButtonStyle.secondary, custom_id='persistent:change_server', row=0)
     async def change_server(self, interaction: discord.Interaction, button: discord.ui.Button):
         servers = api_client.get_servers()
         if not servers:
@@ -304,15 +298,33 @@ class GameModeView(PersistentView):
             color=0x7289da,
         )
         view = ChangeServerSelectionView()
-        await send_temporary_response(interaction, embed=embed, view=view, delay=20)
+        await send_temporary_response(interaction, embed=embed, view=view, delay=None)
 
-    @discord.ui.button(label='??? Change Map', style=discord.ButtonStyle.primary, custom_id='persistent:open_map_changer')
+    @discord.ui.button(label='🔄 Refresh Status', style=discord.ButtonStyle.success, custom_id='persistent:refresh_status', row=0)
+    async def refresh_status(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await refresh_main_embed()
+        await send_temporary_response(interaction, content="Status refreshed.", delay=20)
+
+    @discord.ui.button(label='??? Change Map', style=discord.ButtonStyle.primary, custom_id='persistent:open_map_changer', row=1)
     async def open_map_changer(self, interaction: discord.Interaction, button: discord.ui.Button):
-        # Check if there are multiple servers
         servers = api_client.get_servers()
+        focused_server = _get_channel_focused_server(interaction.channel)
+
+        if focused_server is not None and any(index == focused_server for index, _ in servers):
+            server_index = focused_server
+            server_name = api_client.get_server_name(server_index)
+            current_map = api_client.get_current_map(server_index)
+
+            embed = discord.Embed(
+                title="??? Map Change Control",
+                description=f"**Server:** {server_name}\n**Current Map:** {current_map}\n\nSelect a game mode:",
+                color=0x00ff00
+            )
+            view = GameModeSelectionView(server_index)
+            await send_temporary_response(interaction, embed=embed, view=view, delay=None)
+            return
 
         if len(servers) == 1:
-            # Single server, go directly to game mode selection
             server_index = servers[0][0]
             server_name = servers[0][1]
             current_map = api_client.get_current_map(server_index)
@@ -324,7 +336,6 @@ class GameModeView(PersistentView):
             )
             view = GameModeSelectionView(server_index)
         else:
-            # Multiple servers, show server selection first
             embed = discord.Embed(
                 title="??? Map Change Control",
                 description="Select a server:",
@@ -332,9 +343,9 @@ class GameModeView(PersistentView):
             )
             view = ServerSelectionView()
 
-        await send_temporary_response(interaction, embed=embed, view=view, delay=20)
+        await send_temporary_response(interaction, embed=embed, view=view, delay=None)
 
-    @discord.ui.button(label='🎯 Set Objectives', style=discord.ButtonStyle.secondary, custom_id='persistent:set_objectives')
+    @discord.ui.button(label='🎯 Set Objectives', style=discord.ButtonStyle.secondary, custom_id='persistent:set_objectives', row=1)
     async def set_objectives(self, interaction: discord.Interaction, button: discord.ui.Button):
         servers = api_client.get_servers()
         if not servers:
@@ -349,6 +360,11 @@ class GameModeView(PersistentView):
             )
             return
 
+        focused_server = _get_channel_focused_server(interaction.channel)
+        if focused_server is not None and any(index == focused_server for index, _ in servers):
+            await send_objective_selection(interaction, focused_server, edit_message=False)
+            return
+
         if len(servers) == 1:
             await send_objective_selection(interaction, servers[0][0], edit_message=False)
             return
@@ -360,14 +376,9 @@ class GameModeView(PersistentView):
             color=0x9b59b6,
         )
         view = ObjectiveServerSelectionView()
-        await send_temporary_response(interaction, embed=embed, view=view, delay=20)
+        await send_temporary_response(interaction, embed=embed, view=view, delay=None)
 
-    @discord.ui.button(label='🔄 Refresh Status', style=discord.ButtonStyle.success, custom_id='persistent:refresh_status')
-    async def refresh_status(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await refresh_main_embed()
-        await send_temporary_response(interaction, content="Status refreshed.", delay=20)
-
-    @discord.ui.button(label='🌦 Dynamic Weather', style=discord.ButtonStyle.secondary, custom_id='persistent:set_dynamic_weather')
+    @discord.ui.button(label='🌦 Dynamic Weather', style=discord.ButtonStyle.secondary, custom_id='persistent:set_dynamic_weather', row=1)
     async def set_dynamic_weather(self, interaction: discord.Interaction, button: discord.ui.Button):
         servers = api_client.get_servers()
         if not servers:
@@ -382,6 +393,11 @@ class GameModeView(PersistentView):
             )
             return
 
+        focused_server = _get_channel_focused_server(interaction.channel)
+        if focused_server is not None and any(index == focused_server for index, _ in servers):
+            await send_dynamic_weather_controls(interaction, focused_server, edit_message=False)
+            return
+
         if len(servers) == 1:
             await send_dynamic_weather_controls(interaction, servers[0][0], edit_message=False)
             return
@@ -393,7 +409,7 @@ class GameModeView(PersistentView):
             color=0x1abc9c,
         )
         view = DynamicWeatherServerSelectionView()
-        await send_temporary_response(interaction, embed=embed, view=view, delay=20)
+        await send_temporary_response(interaction, embed=embed, view=view, delay=None)
 
 class ServerSelectionView(discord.ui.View):
     def __init__(self):
@@ -451,9 +467,17 @@ class ChangeServerDropdown(discord.ui.Select):
                     await msg.edit(embed=embed)
                 except (discord.NotFound, discord.HTTPException):
                     # recreate persistent message
-                    await ensure_persistent_message(channel)
+                    if isinstance(channel, (discord.TextChannel, discord.Thread)):
+                        await ensure_persistent_message(channel)
 
-            await send_temporary_response(interaction, content=f"Main view updated to {api_client.get_server_name(selected)}.", delay=20)
+            await send_temporary_response(
+                interaction,
+                content=(
+                    f"Selected server set to {api_client.get_server_name(selected)}. "
+                    "Change Map, Set Objectives, and Dynamic Weather now target this server."
+                ),
+                delay=20,
+            )
         except Exception as exc:
             await send_temporary_response(interaction, content=f"Error updating main view: {exc}", delay=20)
 
@@ -505,6 +529,7 @@ async def send_objective_selection(
                 embed=discord.Embed(title="?? Objective Controls Disabled", description=message, color=0xffa500),
                 view=None,
             )
+            asyncio.create_task(_delete_interaction_after(interaction, 20.0))
         else:
             await send_temporary_response(interaction, content=message, delay=20)
         return
@@ -518,6 +543,7 @@ async def send_objective_selection(
                 embed=discord.Embed(title="?? Objective Fetch Failed", description=message, color=0xffa500),
                 view=None,
             )
+            asyncio.create_task(_delete_interaction_after(interaction, 20.0))
         else:
             await send_temporary_response(interaction, content=message, delay=20)
         return
@@ -530,7 +556,7 @@ async def send_objective_selection(
     if edit_message:
         await interaction.response.edit_message(embed=embed, view=view)
     else:
-        await send_temporary_response(interaction, embed=embed, view=view, delay=20)
+        await send_temporary_response(interaction, embed=embed, view=view, delay=None)
 
 
 
@@ -548,7 +574,7 @@ async def send_dynamic_weather_controls(
                 embed=discord.Embed(title="?? Dynamic Weather Disabled", description=message, color=0xffa500),
                 view=None,
             )
-            asyncio.create_task(_delete_interaction_after(interaction, 10.0))
+            asyncio.create_task(_delete_interaction_after(interaction, 20.0))
         else:
             await send_temporary_response(interaction, content=message, delay=20)
         return
@@ -563,7 +589,7 @@ async def send_dynamic_weather_controls(
                 embed=discord.Embed(title="?? Dynamic Weather Unavailable", description=message, color=0xffa500),
                 view=None,
             )
-            asyncio.create_task(_delete_interaction_after(interaction, 10.0))
+            asyncio.create_task(_delete_interaction_after(interaction, 20.0))
         else:
             await send_temporary_response(interaction, content=message, delay=20)
         return
@@ -579,7 +605,7 @@ async def send_dynamic_weather_controls(
                 embed=discord.Embed(title="?? Dynamic Weather Unavailable", description=message, color=0xffa500),
                 view=None,
             )
-            asyncio.create_task(_delete_interaction_after(interaction, 10.0))
+            asyncio.create_task(_delete_interaction_after(interaction, 20.0))
         else:
             await send_temporary_response(interaction, content=message, delay=20)
         return
@@ -590,7 +616,7 @@ async def send_dynamic_weather_controls(
     if edit_message:
         await interaction.response.edit_message(embed=embed, view=view)
     else:
-        await send_temporary_response(interaction, embed=embed, view=view, delay=20)
+        await send_temporary_response(interaction, embed=embed, view=view, delay=None)
 
 
 class DynamicWeatherServerSelectionView(discord.ui.View):
@@ -653,7 +679,7 @@ class DynamicWeatherToggleView(discord.ui.View):
                 wait=True,
             )
             if followup is not None:
-                asyncio.create_task(_delete_message_after(followup, 10.0))
+                asyncio.create_task(_delete_message_after(followup, 20.0))
             return
 
         try:
@@ -665,7 +691,7 @@ class DynamicWeatherToggleView(discord.ui.View):
                 wait=True,
             )
             if followup is not None:
-                asyncio.create_task(_delete_message_after(followup, 10.0))
+                asyncio.create_task(_delete_message_after(followup, 20.0))
             return
 
         state = "enabled" if enabled else "disabled"
@@ -1007,6 +1033,7 @@ class VariantDropdown(discord.ui.Select):
                 color=0xff0000
             )
             await interaction.edit_original_response(embed=final_embed, view=None)
+            asyncio.create_task(_delete_interaction_after(interaction, 20.0))
 
 class BackToServerSelectionButton(discord.ui.Button):
     def __init__(self):
