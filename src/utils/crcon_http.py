@@ -16,8 +16,7 @@ class CRCONHTTPError(Exception):
 @dataclass
 class CRCONCredentials:
     base_url: str
-    username: str
-    password: str
+    token: Optional[str] = None
 
     @staticmethod
     def _env_value(name: str, server_number: Optional[int]) -> Optional[str]:
@@ -34,8 +33,7 @@ class CRCONCredentials:
             host_key = f"SERVER{index}_HOST"
             crcon_keys = [
                 f"SERVER{index}_CRCON_BASE_URL",
-                f"SERVER{index}_CRCON_USERNAME",
-                f"SERVER{index}_CRCON_PASSWORD",
+                f"SERVER{index}_CRCON_TOKEN",
             ]
             if os.environ.get(host_key) is None and not any(key in os.environ for key in crcon_keys):
                 break
@@ -53,25 +51,20 @@ class CRCONCredentials:
 
         for candidate in candidate_numbers:
             base_url = (cls._env_value("CRCON_BASE_URL", candidate) or "").strip()
-            username = (cls._env_value("CRCON_USERNAME", candidate) or "").strip()
-            password = cls._env_value("CRCON_PASSWORD", candidate)
+            token = cls._env_value("CRCON_TOKEN", candidate)
 
-            if base_url and username and password is not None:
-                return cls(
-                    base_url=base_url.rstrip("/"),
-                    username=username,
-                    password=password,
-                )
+            if base_url and token:
+                return cls(base_url=base_url.rstrip("/"), token=token)
 
         if server_number is not None:
             raise CRCONHTTPError(
                 f"CRCON HTTP API credentials are incomplete for server #{server_number}. "
-                f"Set SERVER{server_number}_CRCON_BASE_URL / _USERNAME / _PASSWORD or provide shared CRCON_* values."
+                f"Set SERVER{server_number}_CRCON_BASE_URL and SERVER{server_number}_CRCON_TOKEN."
             )
 
         raise CRCONHTTPError(
             "CRCON HTTP API credentials are not configured. "
-            "Set CRCON_BASE_URL / CRCON_USERNAME / CRCON_PASSWORD or per-server SERVER{N}_CRCON_* variables."
+            "Set CRCON_BASE_URL and CRCON_TOKEN, or per-server SERVER{N}_CRCON_* variables."
         )
 
 
@@ -92,20 +85,14 @@ class CRCONHttpClient:
 
     def login(self) -> str:
         """Authenticate with CRCON and store the bearer token."""
-        url = f"{self.credentials.base_url}/login"
-        payload = {"username": self.credentials.username, "password": self.credentials.password}
-        response = self.session.post(url, json=payload, timeout=self.timeout)
+        # Require a static API token; token-only auth is enforced.
+        if getattr(self.credentials, "token", None):
+            self._token = self.credentials.token
+            return self._token
 
-        if response.status_code != 200:
-            raise CRCONHTTPError(f"Login failed with status {response.status_code}: {response.text}")
-
-        data = self._parse_json(response)
-        token = data.get("result") or data.get("token") or data.get("access_token")
-        if not token:
-            raise CRCONHTTPError("Login response did not include a token.")
-
-        self._token = token
-        return token
+        raise CRCONHTTPError(
+            "CRCON HTTP API requires an API token. Set CRCON_TOKEN or SERVER{N}_CRCON_TOKEN in the environment."
+        )
 
     def get_maps(self) -> Dict[str, Any]:
         """Retrieve the full map list using the authenticated session."""

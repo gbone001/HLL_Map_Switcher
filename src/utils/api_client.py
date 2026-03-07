@@ -20,8 +20,8 @@ class HLLAPIClient:
         if not self.servers:
             raise ValueError(
                 "No CRCON servers configured. "
-                "Set CRCON_BASE_URL / CRCON_USERNAME / CRCON_PASSWORD for a single server, "
-                "or SERVER{N}_CRCON_BASE_URL / _USERNAME / _PASSWORD for multiple servers."
+                "No CRCON servers configured. Set CRCON_BASE_URL and CRCON_TOKEN for a single server, "
+                "or SERVER{N}_CRCON_BASE_URL and SERVER{N}_CRCON_TOKEN for multiple servers."
             )
         self._clients: Dict[Optional[int], CRCONHttpClient] = {}
 
@@ -31,8 +31,7 @@ class HLLAPIClient:
             keys = (
                 f"SERVER{index}_NAME",
                 f"SERVER{index}_CRCON_BASE_URL",
-                f"SERVER{index}_CRCON_USERNAME",
-                f"SERVER{index}_CRCON_PASSWORD",
+                f"SERVER{index}_CRCON_TOKEN",
             )
             if any(key in os.environ for key in keys):
                 numbers.append(index)

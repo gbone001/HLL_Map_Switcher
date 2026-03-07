@@ -8,6 +8,8 @@ A simple Discord bot that allows users to change Hell Let Loose server maps thro
 - Supports Warfare, Offensive, and Skirmish game modes
 - Works with multiple RCON v2 servers
 - Lets admins lock objective layouts for the current match via the CRCON HTTP API
+ - Works with the CRCON HTTP API (token-based) and multiple servers
+ - Lets admins lock objective layouts for the current match via the CRCON HTTP API
 - Shows the current map in real-time
 - No slash commands needed; just click the buttons
 
@@ -32,17 +34,15 @@ A simple Discord bot that allows users to change Hell Let Loose server maps thro
    - Select permissions: `Send Messages`, `Use Slash Commands`, `Embed Links`
    - Copy the generated URL and open it to invite the bot to your server
 
-### RCON v2 Setup
+### CRCON HTTP API Setup
 
-1. **Collect your RCON credentials:**
-   - RCON host or IP address (as configured on the game server)
-   - RCON port (default `7779` for HLL)
-   - RCON password (set in your server configuration)
+1. **Collect your CRCON HTTP API details:**
+   - CRCON API base URL (e.g. `https://your-crcon-host/api`) — set `CRCON_BASE_URL` or per-server `SERVER{N}_CRCON_BASE_URL`
+   - API token (Django token) — set `CRCON_TOKEN` or per-server `SERVER{N}_CRCON_TOKEN`
    - Optional server display names for Discord
 
-2. **Verify RCON v2 access:**
-   - Ensure your server build exposes the RCON v2 protocol
-   - Confirm the RCON port is reachable from the machine running the bot
+2. **Obtain an API token:**
+   - Log into your CRCON web admin (usually at `{CRCON_BASE_URL}/admin`), create a service user, and generate a Django API token for that user.
 
 3. **Find Discord IDs:**
    - Enable Developer Mode in Discord (User Settings > Advanced)
