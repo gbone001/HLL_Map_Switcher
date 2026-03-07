@@ -128,18 +128,20 @@ def build_main_embed(focused_server_index: Optional[int] = None) -> discord.Embe
         elif focused_server_index is not None:
             selected_server_label = f"Unknown ({focused_server_index})"
 
-        for index, server_name in servers:
+        for position, (index, server_name) in enumerate(servers, start=1):
             client = _get_http_client(index)
             selected_prefix = "**[SELECTED]** " if focused_server_index == index else ""
 
             if not client:
-                server_lines.append(f"- {selected_prefix}{server_name} - Status: ⚠️ {_http_error_message(index)}")
+                server_lines.append(f"{position}. {selected_prefix}{server_name}")
+                server_lines.append(f"   Status: ⚠️ {_http_error_message(index)}")
                 continue
 
             try:
                 gamestate_resp = client.get_gamestate()
             except CRCONHTTPError as exc:
-                server_lines.append(f"- {selected_prefix}{server_name} - Status: ⚠️ {exc}")
+                server_lines.append(f"{position}. {selected_prefix}{server_name}")
+                server_lines.append(f"   Status: ⚠️ {exc}")
                 continue
 
             gamestate_data = gamestate_resp.get("result") if isinstance(gamestate_resp, dict) else None
@@ -165,15 +167,16 @@ def build_main_embed(focused_server_index: Optional[int] = None) -> discord.Embe
                     if known_state is not None:
                         dynamic_weather_text = "Enabled" if known_state else "Disabled"
 
-                server_lines.append(
-                    f"- {selected_prefix}{server_name} - Map: {pretty_name} | Allied: {allied} | Axis: {axis} | Time Remaining: {time_remaining}"
-                )
-                server_lines.append(f"  Dynamic Weather: {dynamic_weather_text}")
+                server_lines.append(f"{position}. {selected_prefix}{server_name}")
+                server_lines.append(f"   Map: {pretty_name}")
+                server_lines.append(f"   Allied: {allied} | Axis: {axis} | Time Remaining: {time_remaining}")
+                server_lines.append(f"   Dynamic Weather: {dynamic_weather_text}")
                 aest = timezone(timedelta(hours=10), name="AEST")
                 updated_at = datetime.now(aest)
                 updated_at_text = f"Updated as at {updated_at.strftime('%d %B %Y - %H:%M:%S')} AEST"
             else:
-                server_lines.append(f"- {selected_prefix}{server_name} - Status: ⚠️ Gamestate unavailable.")
+                server_lines.append(f"{position}. {selected_prefix}{server_name}")
+                server_lines.append("   Status: ⚠️ Gamestate unavailable.")
     else:
         server_lines.append("- No servers configured.")
 
