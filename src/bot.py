@@ -252,16 +252,48 @@ async def _delete_interaction_after(interaction: discord.Interaction, delay: flo
 
 async def send_temporary_response(interaction: discord.Interaction, *, embed: Optional[discord.Embed] = None, content: Optional[str] = None, view: Optional[discord.ui.View] = None, delay: Optional[float] = 20, ephemeral: bool = True) -> None:
     """Send an interaction response and optionally auto-delete it after `delay` seconds."""
-    if embed is not None and view is not None:
-        await interaction.response.send_message(content=content, embed=embed, view=view, ephemeral=ephemeral)
-    elif embed is not None:
-        await interaction.response.send_message(content=content, embed=embed, ephemeral=ephemeral)
-    elif view is not None:
-        await interaction.response.send_message(content=content, view=view, ephemeral=ephemeral)
+    if not interaction.response.is_done():
+        if embed is not None and view is not None:
+            await interaction.response.send_message(content=content, embed=embed, view=view, ephemeral=ephemeral)
+        elif embed is not None:
+            await interaction.response.send_message(content=content, embed=embed, ephemeral=ephemeral)
+        elif view is not None:
+            await interaction.response.send_message(content=content, view=view, ephemeral=ephemeral)
+        else:
+            await interaction.response.send_message(content=content, ephemeral=ephemeral)
+        if delay is not None and delay > 0:
+            asyncio.create_task(_delete_interaction_after(interaction, delay))
     else:
-        await interaction.response.send_message(content=content, ephemeral=ephemeral)
-    if delay is not None and delay > 0:
-        asyncio.create_task(_delete_interaction_after(interaction, delay))
+        if embed is not None and view is not None:
+            followup = await interaction.followup.send(
+                content=content or "",
+                embed=embed,
+                view=view,
+                ephemeral=ephemeral,
+                wait=True,
+            )
+        elif embed is not None:
+            followup = await interaction.followup.send(
+                content=content or "",
+                embed=embed,
+                ephemeral=ephemeral,
+                wait=True,
+            )
+        elif view is not None:
+            followup = await interaction.followup.send(
+                content=content or "",
+                view=view,
+                ephemeral=ephemeral,
+                wait=True,
+            )
+        else:
+            followup = await interaction.followup.send(
+                content=content or "",
+                ephemeral=ephemeral,
+                wait=True,
+            )
+        if delay is not None and delay > 0 and followup is not None:
+            asyncio.create_task(_delete_message_after(followup, delay))
 
 
 async def _delete_message_after(message: discord.Message, delay: float = 10.0) -> None:
@@ -361,10 +393,14 @@ class GameModeView(PersistentView):
 
         focused_server = _get_channel_focused_server(interaction.channel)
         if focused_server is not None and any(index == focused_server for index, _ in servers):
+            if not interaction.response.is_done():
+                await interaction.response.defer(ephemeral=True)
             await send_objective_selection(interaction, focused_server, edit_message=False)
             return
 
         if len(servers) == 1:
+            if not interaction.response.is_done():
+                await interaction.response.defer(ephemeral=True)
             await send_objective_selection(interaction, servers[0][0], edit_message=False)
             return
 
@@ -394,10 +430,14 @@ class GameModeView(PersistentView):
 
         focused_server = _get_channel_focused_server(interaction.channel)
         if focused_server is not None and any(index == focused_server for index, _ in servers):
+            if not interaction.response.is_done():
+                await interaction.response.defer(ephemeral=True)
             await send_dynamic_weather_controls(interaction, focused_server, edit_message=False)
             return
 
         if len(servers) == 1:
+            if not interaction.response.is_done():
+                await interaction.response.defer(ephemeral=True)
             await send_dynamic_weather_controls(interaction, servers[0][0], edit_message=False)
             return
 
