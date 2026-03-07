@@ -78,6 +78,8 @@ LEGACY_EMBED_TITLES = {
 persistent_message_ref: Optional[Tuple[int, int]] = None
 # Map channel_id -> focused server index (None = show all)
 _persistent_focused_server: Dict[int, Optional[int]] = {}
+# Map (server_index, map_pretty_name) -> current objectives last set through this bot
+_current_objectives_state: Dict[Tuple[int, str], list[str]] = {}
 # Map (server_index, map_id) -> dynamic weather state last set through this bot
 _dynamic_weather_state: Dict[Tuple[int, str], bool] = {}
 
@@ -104,14 +106,10 @@ def _format_time_remaining(time_remaining: Optional[float], raw_time: Optional[s
     return f"{minutes}:{secs:02d}"
 
 
-def _format_objective_rows(rows: list[list[str]]) -> str:
-    formatted_slots: list[str] = []
-    for slot, options in enumerate(rows, start=1):
-        if not options:
-            continue
-        slot_options = " / ".join(str(option) for option in options)
-        formatted_slots.append(f"S{slot}: {slot_options}")
-    return "; ".join(formatted_slots) if formatted_slots else "Unavailable"
+def _format_current_objectives(objectives: list[str]) -> str:
+    if not objectives:
+        return "Unknown"
+    return " -> ".join(objectives)
 
 
 
@@ -156,12 +154,10 @@ def build_main_embed(focused_server_index: Optional[int] = None) -> discord.Embe
                     gamestate_data.get("raw_time_remaining"),
                 )
 
-                objective_rows_text = "Unavailable"
-                try:
-                    objective_rows = client.get_objective_rows()
-                    objective_rows_text = _format_objective_rows(objective_rows)
-                except CRCONHTTPError:
-                    objective_rows_text = "Unavailable"
+                objective_rows_text = "Unknown"
+                known_objectives = _current_objectives_state.get((index, str(pretty_name)))
+                if known_objectives is not None:
+                    objective_rows_text = _format_current_objectives(known_objectives)
 
                 dynamic_weather_text = "Unknown"
                 if map_id:
@@ -878,6 +874,7 @@ class ObjectiveSelectionView(discord.ui.View):
             return
 
         latest_map = api_client.get_current_map(self.server_index)
+        _current_objectives_state[(self.server_index, latest_map)] = list(objective_list)
         summary = "\n".join(
             f"{idx}. **{name}**" for idx, name in enumerate(objective_list, start=1)
         )
@@ -1079,6 +1076,11 @@ class VariantDropdown(discord.ui.Select):
         
         if overall_success:
             new_current_map = api_client.get_current_map(self.server_index)
+            stale_objective_keys = [
+                key for key in _current_objectives_state if key[0] == self.server_index
+            ]
+            for key in stale_objective_keys:
+                _current_objectives_state.pop(key, None)
             
             final_embed = discord.Embed(
                 title="✅ Map Changed Successfully!",
