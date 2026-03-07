@@ -168,7 +168,6 @@ def build_main_embed(focused_server_index: Optional[int] = None) -> discord.Embe
                 server_lines.append(
                     f"- {selected_prefix}{server_name} - Map: {pretty_name} | Allied: {allied} | Axis: {axis} | Time Remaining: {time_remaining}"
                 )
-                server_lines.append(f"  Objectives: {objective_rows_text}")
                 server_lines.append(f"  Dynamic Weather: {dynamic_weather_text}")
                 aest = timezone(timedelta(hours=10), name="AEST")
                 updated_at = datetime.now(aest)
