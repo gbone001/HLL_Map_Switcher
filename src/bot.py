@@ -67,6 +67,8 @@ LEGACY_EMBED_TITLES = {
     "?? Hell Let Loose Map Changer",
 }
 persistent_message_ref: Optional[Tuple[int, int]] = None
+# Map channel_id -> focused server index (None = show all)
+_persistent_focused_server: Dict[int, Optional[int]] = {}
 
 
 def _format_time_remaining(time_remaining: Optional[float], raw_time: Optional[str]) -> str:
@@ -94,13 +96,18 @@ def _format_time_remaining(time_remaining: Optional[float], raw_time: Optional[s
 
 
 
-def build_main_embed() -> discord.Embed:
+def build_main_embed(focused_server_index: Optional[int] = None) -> discord.Embed:
     servers = api_client.get_servers()
     server_lines: list[str] = []
     updated_at_text = ""
 
     if servers:
-        for index, server_name in servers:
+        target_servers = servers
+        if focused_server_index is not None:
+            # Find the matching tuple for the focused index
+            target_servers = [s for s in servers if s[0] == focused_server_index]
+
+        for index, server_name in target_servers:
             client = _get_http_client(index)
             if not client:
                 server_lines.append(f" {server_name} - Status: ⚠️ {_http_error_message(index)}")
@@ -151,9 +158,13 @@ def build_main_embed() -> discord.Embed:
 
 async def ensure_persistent_message(channel: discord.abc.Messageable) -> Optional[discord.Message]:
     global persistent_message_ref
-    embed = build_main_embed()
-    view = GameModeView()
     channel_id = getattr(channel, "id", None)
+    focused = None
+    if channel_id is not None:
+        focused = _persistent_focused_server.get(channel_id)
+    embed = build_main_embed(focused_server_index=focused)
+    view = GameModeView()
+    
 
     if persistent_message_ref and channel_id is not None:
         ref_channel_id, message_id = persistent_message_ref
@@ -173,6 +184,8 @@ async def ensure_persistent_message(channel: discord.abc.Messageable) -> Optiona
         message = await channel.send(embed=embed, view=view)  # type: ignore[attr-defined]
         if channel_id is not None:
             persistent_message_ref = (channel_id, message.id)
+            # initialize focus map
+            _persistent_focused_server[channel_id] = None
         return message
 
     async for message in history(limit=50):
@@ -182,6 +195,9 @@ async def ensure_persistent_message(channel: discord.abc.Messageable) -> Optiona
                 if channel_id is not None:
                     persistent_message_ref = (channel_id, message.id)
                 await message.edit(embed=embed, view=view)
+                # ensure focus map initialized
+                if channel_id is not None and channel_id not in _persistent_focused_server:
+                    _persistent_focused_server[channel_id] = None
                 return message
 
     message = await channel.send(embed=embed, view=view)  # type: ignore[attr-defined]
@@ -300,6 +316,25 @@ class GameModeView(PersistentView):
         await refresh_main_embed()
         await interaction.response.send_message("?? Status refreshed.", ephemeral=True, delete_after=5)
 
+    @discord.ui.button(label='🔁 Change Server', style=discord.ButtonStyle.secondary, custom_id='persistent:change_server')
+    async def change_server(self, interaction: discord.Interaction, button: discord.ui.Button):
+        servers = api_client.get_servers()
+        if not servers:
+            await interaction.response.send_message("No servers configured.", ephemeral=True)
+            return
+
+        if len(servers) == 1:
+            await interaction.response.send_message("Only one server configured.", ephemeral=True)
+            return
+
+        embed = discord.Embed(
+            title="🔁 Change Server",
+            description="Select which server the main view should focus on:",
+            color=0x7289da,
+        )
+        view = ChangeServerSelectionView()
+        await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
+
     @discord.ui.button(label='🌦 Dynamic Weather', style=discord.ButtonStyle.secondary, custom_id='persistent:set_dynamic_weather')
     async def set_dynamic_weather(self, interaction: discord.Interaction, button: discord.ui.Button):
         servers = api_client.get_servers()
@@ -338,6 +373,59 @@ class ServerSelectionView(discord.ui.View):
         servers = api_client.get_servers()
         if servers:
             self.add_item(ServerDropdown(servers))
+
+
+class ChangeServerSelectionView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=300)
+        servers = api_client.get_servers()
+        if servers:
+            self.add_item(ChangeServerDropdown(servers))
+
+
+class ChangeServerDropdown(discord.ui.Select):
+    def __init__(self, servers):
+        options = [
+            discord.SelectOption(label=server_name, description=f"Focus main view on {server_name}", value=str(server_index))
+            for server_index, server_name in servers[:25]
+        ]
+        super().__init__(
+            placeholder="Choose a server to focus...",
+            min_values=1,
+            max_values=1,
+            options=options
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        try:
+            channel = interaction.channel
+            if channel is None:
+                await interaction.response.send_message("Unable to determine channel to update.", ephemeral=True)
+                return
+
+            selected = int(self.values[0])
+            channel_id = getattr(channel, "id", None)
+            if channel_id is None:
+                await interaction.response.send_message("Unable to determine channel to update.", ephemeral=True)
+                return
+
+            # Store focus and update persistent message if present
+            _persistent_focused_server[channel_id] = selected
+
+            # Update persistent message if we have a reference for this channel
+            if persistent_message_ref and persistent_message_ref[0] == channel_id:
+                _, message_id = persistent_message_ref
+                try:
+                    msg = await channel.fetch_message(message_id)  # type: ignore[attr-defined]
+                    embed = build_main_embed(focused_server_index=selected)
+                    await msg.edit(embed=embed)
+                except (discord.NotFound, discord.HTTPException):
+                    # recreate persistent message
+                    await ensure_persistent_message(channel)
+
+            await interaction.response.send_message(f"Main view updated to {api_client.get_server_name(selected)}.", ephemeral=True)
+        except Exception as exc:
+            await interaction.response.send_message(f"Error updating main view: {exc}", ephemeral=True)
 
 class ServerDropdown(discord.ui.Select):
     def __init__(self, servers):
@@ -532,15 +620,22 @@ class DynamicWeatherToggleView(discord.ui.View):
             followup = await interaction.followup.send(
                 f"CRCON HTTP unavailable for this server: {_http_error_message(self.server_index)}",
                 ephemeral=True,
+                wait=True,
             )
-            asyncio.create_task(_delete_message_after(followup, 10.0))
+            if followup is not None:
+                asyncio.create_task(_delete_message_after(followup, 10.0))
             return
 
         try:
             client.set_dynamic_weather_enabled(self.map_id, enabled)
         except CRCONHTTPError as exc:
-            followup = await interaction.followup.send(f"Failed to update dynamic weather: {exc}", ephemeral=True)
-            asyncio.create_task(_delete_message_after(followup, 10.0))
+            followup = await interaction.followup.send(
+                f"Failed to update dynamic weather: {exc}",
+                ephemeral=True,
+                wait=True,
+            )
+            if followup is not None:
+                asyncio.create_task(_delete_message_after(followup, 10.0))
             return
 
         state = "enabled" if enabled else "disabled"
@@ -975,14 +1070,24 @@ async def on_ready():
 @bot.tree.command(name="repost_button", description="Repost the map changer button (Admin only)")
 async def repost_button(interaction: discord.Interaction):
     # Check if user has admin permissions
-    if not interaction.user.guild_permissions.administrator:
+    if not isinstance(interaction.user, discord.Member) or not interaction.user.guild_permissions.administrator:
         await interaction.response.send_message("❌ You need administrator permissions to use this command.", ephemeral=True)
         return
-    
-    channel_id = int(os.getenv('DISCORD_CHANNEL_ID'))
+
+    channel_id_str = os.getenv('DISCORD_CHANNEL_ID')
+    if not channel_id_str:
+        await interaction.response.send_message("❌ DISCORD_CHANNEL_ID is not configured.", ephemeral=True)
+        return
+
+    try:
+        channel_id = int(channel_id_str)
+    except ValueError:
+        await interaction.response.send_message("❌ DISCORD_CHANNEL_ID is invalid.", ephemeral=True)
+        return
+
     channel = bot.get_channel(channel_id)
-    
-    if channel:
+
+    if isinstance(channel, (discord.TextChannel, discord.Thread)):
         embed = build_main_embed()
         view = GameModeView()
         message = await channel.send(embed=embed, view=view)
