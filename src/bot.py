@@ -78,6 +78,8 @@ LEGACY_EMBED_TITLES = {
 persistent_message_ref: Optional[Tuple[int, int]] = None
 # Map channel_id -> focused server index (None = show all)
 _persistent_focused_server: Dict[int, Optional[int]] = {}
+# Map (server_index, map_id) -> dynamic weather state last set through this bot
+_dynamic_weather_state: Dict[Tuple[int, str], bool] = {}
 
 
 def _format_time_remaining(time_remaining: Optional[float], raw_time: Optional[str]) -> str:
@@ -100,6 +102,16 @@ def _format_time_remaining(time_remaining: Optional[float], raw_time: Optional[s
     if hours:
         return f"{hours}:{minutes:02d}:{secs:02d}"
     return f"{minutes}:{secs:02d}"
+
+
+def _format_objective_rows(rows: list[list[str]]) -> str:
+    formatted_slots: list[str] = []
+    for slot, options in enumerate(rows, start=1):
+        if not options:
+            continue
+        slot_options = " / ".join(str(option) for option in options)
+        formatted_slots.append(f"S{slot}: {slot_options}")
+    return "; ".join(formatted_slots) if formatted_slots else "Unavailable"
 
 
 
@@ -135,6 +147,7 @@ def build_main_embed(focused_server_index: Optional[int] = None) -> discord.Embe
             gamestate_data = gamestate_resp.get("result") if isinstance(gamestate_resp, dict) else None
             if gamestate_data:
                 current_map = gamestate_data.get("current_map", {}) or {}
+                map_id = str(current_map.get("id") or "")
                 pretty_name = current_map.get("pretty_name") or current_map.get("id") or "Unknown"
                 allied = gamestate_data.get("num_allied_players", "??")
                 axis = gamestate_data.get("num_axis_players", "??")
@@ -142,9 +155,25 @@ def build_main_embed(focused_server_index: Optional[int] = None) -> discord.Embe
                     gamestate_data.get("time_remaining"),
                     gamestate_data.get("raw_time_remaining"),
                 )
+
+                objective_rows_text = "Unavailable"
+                try:
+                    objective_rows = client.get_objective_rows()
+                    objective_rows_text = _format_objective_rows(objective_rows)
+                except CRCONHTTPError:
+                    objective_rows_text = "Unavailable"
+
+                dynamic_weather_text = "Unknown"
+                if map_id:
+                    known_state = _dynamic_weather_state.get((index, map_id))
+                    if known_state is not None:
+                        dynamic_weather_text = "Enabled" if known_state else "Disabled"
+
                 server_lines.append(
                     f"- {selected_prefix}{server_name} - Map: {pretty_name} | Allied: {allied} | Axis: {axis} | Time Remaining: {time_remaining}"
                 )
+                server_lines.append(f"  Objectives: {objective_rows_text}")
+                server_lines.append(f"  Dynamic Weather: {dynamic_weather_text}")
                 aest = timezone(timedelta(hours=10), name="AEST")
                 updated_at = datetime.now(aest)
                 updated_at_text = f"Updated as at {updated_at.strftime('%d %B %Y - %H:%M:%S')} AEST"
@@ -733,6 +762,8 @@ class DynamicWeatherToggleView(discord.ui.View):
             if followup is not None:
                 asyncio.create_task(_delete_message_after(followup, 20.0))
             return
+
+        _dynamic_weather_state[(self.server_index, self.map_id)] = enabled
 
         state = "enabled" if enabled else "disabled"
         success_embed = discord.Embed(
