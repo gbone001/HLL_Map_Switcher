@@ -120,16 +120,16 @@ def build_main_embed(focused_server_index: Optional[int] = None) -> discord.Embe
 
         for index, server_name in servers:
             client = _get_http_client(index)
-            selected_tag = " [SELECTED]" if focused_server_index == index else ""
+            selected_prefix = "**[SELECTED]** " if focused_server_index == index else ""
 
             if not client:
-                server_lines.append(f"- {server_name}{selected_tag} - Status: ⚠️ {_http_error_message(index)}")
+                server_lines.append(f"- {selected_prefix}{server_name} - Status: ⚠️ {_http_error_message(index)}")
                 continue
 
             try:
                 gamestate_resp = client.get_gamestate()
             except CRCONHTTPError as exc:
-                server_lines.append(f"- {server_name}{selected_tag} - Status: ⚠️ {exc}")
+                server_lines.append(f"- {selected_prefix}{server_name} - Status: ⚠️ {exc}")
                 continue
 
             gamestate_data = gamestate_resp.get("result") if isinstance(gamestate_resp, dict) else None
@@ -143,12 +143,12 @@ def build_main_embed(focused_server_index: Optional[int] = None) -> discord.Embe
                     gamestate_data.get("raw_time_remaining"),
                 )
                 server_lines.append(
-                    f"- {server_name}{selected_tag} - Map: {pretty_name} | Allied: {allied} | Axis: {axis} | Time Remaining: {time_remaining}"
+                    f"- {selected_prefix}{server_name} - Map: {pretty_name} | Allied: {allied} | Axis: {axis} | Time Remaining: {time_remaining}"
                 )
                 updated_at = datetime.now(timezone.utc)
                 updated_at_text = f"Updated as at {updated_at.strftime('%Y-%m-%d %H:%M:%S')} UTC"
             else:
-                server_lines.append(f"- {server_name}{selected_tag} - Status: ⚠️ Gamestate unavailable.")
+                server_lines.append(f"- {selected_prefix}{server_name} - Status: ⚠️ Gamestate unavailable.")
     else:
         server_lines.append("- No servers configured.")
 
@@ -158,8 +158,6 @@ def build_main_embed(focused_server_index: Optional[int] = None) -> discord.Embe
 
     if updated_at_text:
         description += f"\n\n{updated_at_text}"
-
-    description += "\n\n**Available Game Modes:**\n?? Warfare\n?? Offensive\n?? Skirmish"
 
     embed = discord.Embed(
         title=MAIN_EMBED_TITLE,
@@ -470,14 +468,15 @@ class ChangeServerDropdown(discord.ui.Select):
                     if isinstance(channel, (discord.TextChannel, discord.Thread)):
                         await ensure_persistent_message(channel)
 
-            await send_temporary_response(
-                interaction,
+            await interaction.response.edit_message(
                 content=(
                     f"Selected server set to {api_client.get_server_name(selected)}. "
                     "Change Map, Set Objectives, and Dynamic Weather now target this server."
                 ),
-                delay=20,
+                embed=None,
+                view=None,
             )
+            asyncio.create_task(_delete_interaction_after(interaction, 10.0))
         except Exception as exc:
             await send_temporary_response(interaction, content=f"Error updating main view: {exc}", delay=20)
 
