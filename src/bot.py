@@ -9,9 +9,7 @@ from dotenv import load_dotenv
 from utils.map_data import (
     get_maps_for_mode,
     get_variants_for_map,
-    get_map_id,
     refresh_map_cache,
-    get_last_map_cache_error,
 )
 from utils.api_client import HLLAPIClient
 from utils.crcon_http import CRCONHttpClient, CRCONHTTPError
@@ -843,11 +841,9 @@ class VariantDropdown(discord.ui.Select):
 
         status_lines = []
         overall_success = False
-        http_attempted = False
 
         client = _get_http_client(self.server_index)
         if client:
-            http_attempted = True
             try:
                 client.set_map(selected_variant_id)
                 status_lines.append("? HTTP API change_map succeeded.")
@@ -856,16 +852,6 @@ class VariantDropdown(discord.ui.Select):
                 status_lines.append(f"?? HTTP API change_map failed: {exc}")
         else:
             status_lines.append(f"?? HTTP API unavailable: {_http_error_message(self.server_index)}")
-
-        if not overall_success:
-            rcon_success, rcon_message = api_client.set_map(self.server_index, selected_variant_id)
-            if rcon_success:
-                status_lines.append("✅ RCON fallback succeeded.")
-                overall_success = True
-            else:
-                status_lines.append(f"❌ RCON fallback failed: {rcon_message}")
-        elif http_attempted:
-            status_lines.append("ℹ️ RCON fallback not required.")
 
         status_summary = "\n".join(f"• {line}" for line in status_lines)
         
@@ -953,10 +939,8 @@ async def on_ready():
     print(f'{bot.user} has connected to Discord!')
     print(f'Bot is in {len(bot.guilds)} guilds')
 
-    refresh_map_cache(force=True)
-    cache_error = get_last_map_cache_error()
-    if cache_error:
-        print(f"Warning: failed to refresh map cache via CRCON API ({cache_error})")
+    # Warm cache when available, but avoid noisy startup warnings if CRCON isn't reachable yet.
+    refresh_map_cache(force=False)
     
     # Add the persistent view
     bot.add_view(GameModeView())
