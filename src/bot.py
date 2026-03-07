@@ -304,7 +304,7 @@ class GameModeView(PersistentView):
         await refresh_main_embed()
         await send_temporary_response(interaction, content="Status refreshed.", delay=20)
 
-    @discord.ui.button(label='??? Change Map', style=discord.ButtonStyle.primary, custom_id='persistent:open_map_changer', row=1)
+    @discord.ui.button(label='🗺️ Change Map', style=discord.ButtonStyle.primary, custom_id='persistent:open_map_changer', row=1)
     async def open_map_changer(self, interaction: discord.Interaction, button: discord.ui.Button):
         servers = api_client.get_servers()
         focused_server = _get_channel_focused_server(interaction.channel)
