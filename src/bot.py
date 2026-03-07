@@ -1,6 +1,6 @@
 import asyncio
 import os
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Dict, Optional, Tuple
 
 import discord
@@ -109,7 +109,7 @@ def build_main_embed(focused_server_index: Optional[int] = None) -> discord.Embe
     servers = api_client.get_servers()
     server_lines: list[str] = []
     updated_at_text = ""
-    selected_server_label = "All servers"
+    selected_server_label = "None"
 
     if servers:
         selected_name = next((name for index, name in servers if index == focused_server_index), None)
@@ -145,8 +145,9 @@ def build_main_embed(focused_server_index: Optional[int] = None) -> discord.Embe
                 server_lines.append(
                     f"- {selected_prefix}{server_name} - Map: {pretty_name} | Allied: {allied} | Axis: {axis} | Time Remaining: {time_remaining}"
                 )
-                updated_at = datetime.now(timezone.utc)
-                updated_at_text = f"Updated as at {updated_at.strftime('%Y-%m-%d %H:%M:%S')} UTC"
+                aest = timezone(timedelta(hours=10), name="AEST")
+                updated_at = datetime.now(aest)
+                updated_at_text = f"Updated as at {updated_at.strftime('%d %B %Y - %H:%M:%S')} AEST"
             else:
                 server_lines.append(f"- {selected_prefix}{server_name} - Status: ⚠️ Gamestate unavailable.")
     else:
