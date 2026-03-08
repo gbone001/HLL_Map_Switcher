@@ -345,6 +345,135 @@ class PersistentView(discord.ui.View):
         super().__init__(timeout=None)  # Persistent view
 
 
+class AddAdminCamModal(discord.ui.Modal, title="ADD ADMIN CAM ACCESS"):
+    player_id = discord.ui.TextInput(
+        label="Player ID (see hllrecords.com)",
+        placeholder="Paste Steam64 / EOS / game Player ID from hllrecords.com",
+        required=True,
+        max_length=64,
+    )
+
+    def __init__(self, server_index: int):
+        super().__init__()
+        self.server_index = server_index
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        client = _get_http_client(self.server_index)
+        if not client:
+            await send_temporary_response(
+                interaction,
+                content=f"CRCON HTTP unavailable for this server: {_http_error_message(self.server_index)}",
+                delay=10,
+            )
+            return
+
+        player_id = str(self.player_id.value).strip()
+        if not player_id:
+            await send_temporary_response(interaction, content="Player NOT FOUND", delay=10)
+            return
+
+        try:
+            added = client.add_admin(player_id=player_id, role="spectator", description="Admin cam access")
+        except CRCONHTTPError:
+            added = False
+
+        if added:
+            await send_temporary_response(interaction, content="Player ADDED", delay=10)
+        else:
+            await send_temporary_response(interaction, content="Player NOT FOUND", delay=10)
+
+
+class RemoveAdminCamConfirmView(discord.ui.View):
+    def __init__(self, server_index: int, player_id: str, player_name: str):
+        super().__init__(timeout=300)
+        self.server_index = server_index
+        self.player_id = player_id
+        self.player_name = player_name
+
+    @discord.ui.button(label="Yes", style=discord.ButtonStyle.danger)
+    async def confirm_yes(self, interaction: discord.Interaction, button: discord.ui.Button):
+        client = _get_http_client(self.server_index)
+        if not client:
+            await interaction.response.edit_message(
+                content=f"CRCON HTTP unavailable for this server: {_http_error_message(self.server_index)}",
+                embed=None,
+                view=None,
+            )
+            asyncio.create_task(_delete_interaction_after(interaction, 10.0))
+            return
+
+        try:
+            removed = client.remove_admin(self.player_id)
+        except CRCONHTTPError:
+            removed = False
+
+        if removed:
+            message = "Player REMOVED"
+        else:
+            message = "Player NOT FOUND"
+
+        await interaction.response.edit_message(content=message, embed=None, view=None)
+        asyncio.create_task(_delete_interaction_after(interaction, 10.0))
+
+    @discord.ui.button(label="No", style=discord.ButtonStyle.secondary)
+    async def confirm_no(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.edit_message(content="Cancelled.", embed=None, view=None)
+        asyncio.create_task(_delete_interaction_after(interaction, 1.0))
+
+
+class RemoveAdminCamSelect(discord.ui.Select):
+    def __init__(self, server_index: int, spectators: list[dict]):
+        self.server_index = server_index
+        self._by_player_id = {
+            str(entry.get("player_id")): entry
+            for entry in spectators
+            if entry.get("player_id")
+        }
+
+        options = []
+        for entry in spectators[:25]:
+            player_id = str(entry.get("player_id") or "")
+            if not player_id:
+                continue
+            name = str(entry.get("name") or player_id)
+            options.append(
+                discord.SelectOption(
+                    label=name[:100],
+                    value=player_id,
+                    description=f"ID: {player_id}"[:100],
+                )
+            )
+
+        super().__init__(
+            placeholder="Select spectator admin user to remove...",
+            min_values=1,
+            max_values=1,
+            options=options,
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        selected_player_id = self.values[0]
+        selected_entry = self._by_player_id.get(selected_player_id, {})
+        selected_name = str(selected_entry.get("name") or selected_player_id)
+
+        embed = discord.Embed(
+            title="Remove Admin Cam User",
+            description=(
+                f"Remove spectator access for **{selected_name}**?\n"
+                f"Player ID: `{selected_player_id}`"
+            ),
+            color=0xe67e22,
+        )
+        view = RemoveAdminCamConfirmView(self.server_index, selected_player_id, selected_name)
+        await interaction.response.edit_message(embed=embed, view=view)
+
+
+class RemoveAdminCamSelectionView(discord.ui.View):
+    def __init__(self, server_index: int, spectators: list[dict]):
+        super().__init__(timeout=300)
+        self.add_item(RemoveAdminCamSelect(server_index, spectators))
+
+
 class GameModeView(PersistentView):
     def __init__(self):
         super().__init__()
@@ -486,6 +615,101 @@ class GameModeView(PersistentView):
         )
         view = DynamicWeatherServerSelectionView()
         await send_temporary_response(interaction, embed=embed, view=view, delay=None)
+
+    @discord.ui.button(
+        label='🗑️ REMOVE ADMIN CAM USER',
+        style=discord.ButtonStyle.secondary,
+        custom_id='persistent:remove_admin_cam_access',
+        row=2,
+    )
+    async def remove_admin_cam_access(self, interaction: discord.Interaction, button: discord.ui.Button):
+        servers = api_client.get_servers()
+        if not servers:
+            await send_temporary_response(interaction, content="No servers are configured; cannot remove admin cam access.", delay=10)
+            return
+
+        focused_server = _get_channel_focused_server(interaction.channel)
+        if focused_server is not None and any(index == focused_server for index, _ in servers):
+            server_index = focused_server
+        elif len(servers) == 1:
+            server_index = servers[0][0]
+        else:
+            await send_temporary_response(
+                interaction,
+                content="Please set a focused server first using Change Server.",
+                delay=10,
+            )
+            return
+
+        client = _get_http_client(server_index)
+        if not client:
+            await send_temporary_response(
+                interaction,
+                content=f"CRCON HTTP unavailable for this server: {_http_error_message(server_index)}",
+                delay=10,
+            )
+            return
+
+        try:
+            admins = client.get_admin_ids()
+        except CRCONHTTPError as exc:
+            await send_temporary_response(
+                interaction,
+                content=f"Failed to load admin users: {exc}",
+                delay=10,
+            )
+            return
+
+        spectator_admins = [
+            row for row in admins
+            if str(row.get("role", "")).lower() == "spectator"
+        ]
+        if not spectator_admins:
+            await send_temporary_response(interaction, content="No users with spectator access found.", delay=10)
+            return
+
+        embed = discord.Embed(
+            title="Remove Admin Cam User",
+            description="Select a user with spectator access to remove.",
+            color=0xe67e22,
+        )
+        view = RemoveAdminCamSelectionView(server_index, spectator_admins)
+        await send_temporary_response(interaction, embed=embed, view=view, delay=None)
+
+    @discord.ui.button(
+        label='🎥 ADD ADMIN CAM ACCESS',
+        style=discord.ButtonStyle.danger,
+        custom_id='persistent:add_admin_cam_access',
+        row=2,
+    )
+    async def add_admin_cam_access(self, interaction: discord.Interaction, button: discord.ui.Button):
+        servers = api_client.get_servers()
+        if not servers:
+            await send_temporary_response(interaction, content="No servers are configured; cannot add admin cam access.", delay=10)
+            return
+
+        focused_server = _get_channel_focused_server(interaction.channel)
+        if focused_server is not None and any(index == focused_server for index, _ in servers):
+            server_index = focused_server
+        elif len(servers) == 1:
+            server_index = servers[0][0]
+        else:
+            await send_temporary_response(
+                interaction,
+                content="Please set a focused server first using Change Server.",
+                delay=10,
+            )
+            return
+
+        if not _get_http_client(server_index):
+            await send_temporary_response(
+                interaction,
+                content=f"CRCON HTTP unavailable for this server: {_http_error_message(server_index)}",
+                delay=10,
+            )
+            return
+
+        await interaction.response.send_modal(AddAdminCamModal(server_index))
 
 class ServerSelectionView(discord.ui.View):
     def __init__(self):

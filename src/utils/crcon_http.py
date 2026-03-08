@@ -273,6 +273,104 @@ class CRCONHttpClient:
             raise CRCONHTTPError(f"set_dynamic_weather_enabled reported failure: {payload.get('error')}")
         return payload
 
+    def add_admin(self, player_id: str, role: str = "spectator", description: str = "") -> bool:
+        """Grant admin role to a player via CRCON."""
+        if not self._token:
+            self.login()
+
+        url = f"{self.credentials.base_url}/add_admin"
+        payload = {
+            "player_id": player_id,
+            "role": role,
+            "description": description,
+        }
+
+        response = self.session.post(
+            url,
+            headers=self._auth_headers(),
+            json=payload,
+            timeout=self.timeout,
+        )
+
+        if response.status_code == 401:
+            self._token = None
+            self.login()
+            response = self.session.post(
+                url,
+                headers=self._auth_headers(),
+                json=payload,
+                timeout=self.timeout,
+            )
+
+        if response.status_code != 200:
+            raise CRCONHTTPError(f"add_admin failed with status {response.status_code}: {response.text}")
+
+        result = self._parse_json(response)
+        if isinstance(result, dict) and result.get("failed"):
+            return False
+
+        return bool(result.get("result"))
+
+    def get_admin_ids(self) -> List[Dict[str, Any]]:
+        """Fetch all configured admin users and their roles."""
+        if not self._token:
+            self.login()
+
+        url = f"{self.credentials.base_url}/get_admin_ids"
+        response = self.session.get(url, headers=self._auth_headers(), timeout=self.timeout)
+
+        if response.status_code == 401:
+            self._token = None
+            self.login()
+            response = self.session.get(url, headers=self._auth_headers(), timeout=self.timeout)
+
+        if response.status_code != 200:
+            raise CRCONHTTPError(f"get_admin_ids failed with status {response.status_code}: {response.text}")
+
+        payload = self._parse_json(response)
+        if payload.get("failed"):
+            raise CRCONHTTPError(f"get_admin_ids reported failure: {payload.get('error')}")
+
+        result = payload.get("result")
+        if not isinstance(result, list):
+            raise CRCONHTTPError("Unexpected data returned from get_admin_ids.")
+
+        return [row for row in result if isinstance(row, dict)]
+
+    def remove_admin(self, player_id: str) -> bool:
+        """Remove admin role from a player via CRCON."""
+        if not self._token:
+            self.login()
+
+        url = f"{self.credentials.base_url}/remove_admin"
+        payload = {"player_id": player_id}
+
+        response = self.session.post(
+            url,
+            headers=self._auth_headers(),
+            json=payload,
+            timeout=self.timeout,
+        )
+
+        if response.status_code == 401:
+            self._token = None
+            self.login()
+            response = self.session.post(
+                url,
+                headers=self._auth_headers(),
+                json=payload,
+                timeout=self.timeout,
+            )
+
+        if response.status_code != 200:
+            raise CRCONHTTPError(f"remove_admin failed with status {response.status_code}: {response.text}")
+
+        result = self._parse_json(response)
+        if isinstance(result, dict) and result.get("failed"):
+            return False
+
+        return bool(result.get("result"))
+
     def _auth_headers(self) -> Dict[str, str]:
         if not self._token:
             raise CRCONHTTPError("Missing bearer token; call login() first.")
