@@ -112,6 +112,41 @@ def _format_current_objectives(objectives: list[str]) -> str:
     return " -> ".join(objectives)
 
 
+def _get_server_env_value(name: str, server_index: Optional[int] = None) -> Optional[str]:
+    server_number = _server_number(server_index)
+    if server_number is not None:
+        server_key = f"SERVER{server_number}_{name}"
+        if server_key in os.environ:
+            return os.environ[server_key]
+    return os.getenv(name)
+
+
+def _get_timer_minutes(name: str, default: int, server_index: Optional[int] = None) -> int:
+    raw_value = (_get_server_env_value(name, server_index) or "").strip()
+    if not raw_value:
+        return default
+
+    try:
+        value = int(raw_value)
+    except ValueError:
+        return default
+
+    return value if value > 0 else default
+
+
+def _get_focused_or_single_server(interaction: discord.Interaction) -> Optional[int]:
+    servers = api_client.get_servers()
+    focused_server = _get_channel_focused_server(interaction.channel)
+
+    if focused_server is not None and any(index == focused_server for index, _ in servers):
+        return focused_server
+
+    if len(servers) == 1:
+        return servers[0][0]
+
+    return None
+
+
 
 
 
@@ -478,6 +513,63 @@ class GameModeView(PersistentView):
     def __init__(self):
         super().__init__()
 
+    async def _apply_warfare_timer(
+        self,
+        interaction: discord.Interaction,
+        *,
+        timer_name: str,
+        env_name: str,
+        default_minutes: int,
+    ) -> None:
+        servers = api_client.get_servers()
+        if not servers:
+            await send_temporary_response(
+                interaction,
+                content=f"No servers are configured; cannot set the warfare {timer_name}.",
+                delay=20,
+            )
+            return
+
+        server_index = _get_focused_or_single_server(interaction)
+        if server_index is None:
+            await send_temporary_response(
+                interaction,
+                content="Please set a focused server first using Change Server.",
+                delay=10,
+            )
+            return
+
+        client = _get_http_client(server_index)
+        if not client:
+            await send_temporary_response(
+                interaction,
+                content=f"CRCON HTTP unavailable for this server: {_http_error_message(server_index)}",
+                delay=20,
+            )
+            return
+
+        minutes = _get_timer_minutes(env_name, default_minutes, server_index)
+        server_name = api_client.get_server_name(server_index)
+
+        try:
+            if timer_name == "match timer":
+                client.set_match_timer("warfare", minutes)
+            else:
+                client.set_warmup_timer("warfare", minutes)
+        except CRCONHTTPError as exc:
+            await send_temporary_response(
+                interaction,
+                content=f"Failed to set warfare {timer_name} for {server_name}: {exc}",
+                delay=20,
+            )
+            return
+
+        await send_temporary_response(
+            interaction,
+            content=f"Set warfare {timer_name} to {minutes} minute(s) on {server_name}.",
+            delay=20,
+        )
+
     @discord.ui.button(label='🔁 Change Server', style=discord.ButtonStyle.secondary, custom_id='persistent:change_server', row=0)
     async def change_server(self, interaction: discord.Interaction, button: discord.ui.Button):
         servers = api_client.get_servers()
@@ -615,6 +707,34 @@ class GameModeView(PersistentView):
         )
         view = DynamicWeatherServerSelectionView()
         await send_temporary_response(interaction, embed=embed, view=view, delay=None)
+
+    @discord.ui.button(
+        label='⏱ Warfare Match Timer',
+        style=discord.ButtonStyle.primary,
+        custom_id='persistent:set_warfare_match_timer',
+        row=2,
+    )
+    async def set_warfare_match_timer(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._apply_warfare_timer(
+            interaction,
+            timer_name="match timer",
+            env_name="WARFARE_MATCH_TIMER_MINUTES",
+            default_minutes=90,
+        )
+
+    @discord.ui.button(
+        label='🔥 Warfare Warm Up Timer',
+        style=discord.ButtonStyle.primary,
+        custom_id='persistent:set_warfare_warmup_timer',
+        row=2,
+    )
+    async def set_warfare_warmup_timer(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._apply_warfare_timer(
+            interaction,
+            timer_name="warmup timer",
+            env_name="WARFARE_WARMUP_TIMER_MINUTES",
+            default_minutes=3,
+        )
 
     @discord.ui.button(
         label='🗑️ REMOVE ADMIN CAM USER',

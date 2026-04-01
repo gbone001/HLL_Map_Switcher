@@ -8,8 +8,9 @@ A simple Discord bot that allows users to change Hell Let Loose server maps thro
 - Supports Warfare, Offensive, and Skirmish game modes
 - Works with multiple RCON v2 servers
 - Lets admins lock objective layouts for the current match via the CRCON HTTP API
- - Works with the CRCON HTTP API (token-based) and multiple servers
- - Lets admins lock objective layouts for the current match via the CRCON HTTP API
+- Works with the CRCON HTTP API (token-based) and multiple servers
+- Lets admins lock objective layouts for the current match via the CRCON HTTP API
+- Adds panel buttons for the default Warfare match timer and Warfare warmup timer
 - Shows the current map in real-time
 - No slash commands needed; just click the buttons
 
@@ -40,6 +41,7 @@ A simple Discord bot that allows users to change Hell Let Loose server maps thro
    - CRCON API base URL (e.g. `https://your-crcon-host/api`) — set `CRCON_BASE_URL` or per-server `SERVER{N}_CRCON_BASE_URL`
    - API token (Django token) — set `CRCON_TOKEN` or per-server `SERVER{N}_CRCON_TOKEN`
    - Optional server display names for Discord
+   - Optional timer defaults: `WARFARE_MATCH_TIMER_MINUTES` (default `90`) and `WARFARE_WARMUP_TIMER_MINUTES` (default `3`)
 
 2. **Obtain an API token:**
    - Log into your CRCON web admin (usually at `{CRCON_BASE_URL}/admin`), create a service user, and generate a Django API token for that user.
@@ -91,7 +93,7 @@ If you change environment variables, run `railway variables set KEY=value` (or u
 
 ## Usage
 
-The bot automatically posts a persistent button in your configured Discord channel. Users simply click the button and follow the prompts to change maps!
+The bot automatically posts a persistent button panel in your configured Discord channel. Users can change maps, set objectives, toggle dynamic weather, and apply the configured default Warfare timers from the panel.
 
 ## Troubleshooting
 
