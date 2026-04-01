@@ -740,7 +740,7 @@ class GameModeView(PersistentView):
         label='🗑️ REMOVE ADMIN CAM USER',
         style=discord.ButtonStyle.secondary,
         custom_id='persistent:remove_admin_cam_access',
-        row=2,
+        row=3,
     )
     async def remove_admin_cam_access(self, interaction: discord.Interaction, button: discord.ui.Button):
         servers = api_client.get_servers()
@@ -800,7 +800,7 @@ class GameModeView(PersistentView):
         label='🎥 ADD ADMIN CAM ACCESS',
         style=discord.ButtonStyle.danger,
         custom_id='persistent:add_admin_cam_access',
-        row=2,
+        row=3,
     )
     async def add_admin_cam_access(self, interaction: discord.Interaction, button: discord.ui.Button):
         servers = api_client.get_servers()
