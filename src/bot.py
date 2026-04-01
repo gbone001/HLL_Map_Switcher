@@ -375,6 +375,30 @@ async def _delete_message_after(message: discord.Message, delay: float = 10.0) -
     except (discord.NotFound, discord.HTTPException):
         pass
 
+
+async def defer_interaction(
+    interaction: discord.Interaction,
+    *,
+    ephemeral: bool = False,
+    thinking: bool = False,
+) -> None:
+    if interaction.response.is_done():
+        return
+    await interaction.response.defer(ephemeral=ephemeral, thinking=thinking)
+
+
+async def update_interaction_message(
+    interaction: discord.Interaction,
+    *,
+    content: Optional[str] = None,
+    embed: Optional[discord.Embed] = None,
+    view: Optional[discord.ui.View] = None,
+) -> None:
+    if interaction.response.is_done():
+        await interaction.edit_original_response(content=content, embed=embed, view=view)
+    else:
+        await interaction.response.edit_message(content=content, embed=embed, view=view)
+
 class PersistentView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)  # Persistent view
@@ -427,9 +451,11 @@ class RemoveAdminCamConfirmView(discord.ui.View):
 
     @discord.ui.button(label="Yes", style=discord.ButtonStyle.danger)
     async def confirm_yes(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await defer_interaction(interaction)
         client = _get_http_client(self.server_index)
         if not client:
-            await interaction.response.edit_message(
+            await update_interaction_message(
+                interaction,
                 content=f"CRCON HTTP unavailable for this server: {_http_error_message(self.server_index)}",
                 embed=None,
                 view=None,
@@ -447,7 +473,7 @@ class RemoveAdminCamConfirmView(discord.ui.View):
         else:
             message = "Player NOT FOUND"
 
-        await interaction.response.edit_message(content=message, embed=None, view=None)
+        await update_interaction_message(interaction, content=message, embed=None, view=None)
         asyncio.create_task(_delete_interaction_after(interaction, 10.0))
 
     @discord.ui.button(label="No", style=discord.ButtonStyle.secondary)
@@ -521,6 +547,7 @@ class GameModeView(PersistentView):
         env_name: str,
         default_minutes: int,
     ) -> None:
+        await defer_interaction(interaction, ephemeral=True)
         servers = api_client.get_servers()
         if not servers:
             await send_temporary_response(
@@ -591,11 +618,13 @@ class GameModeView(PersistentView):
 
     @discord.ui.button(label='🔄 Refresh Status', style=discord.ButtonStyle.success, custom_id='persistent:refresh_status', row=0)
     async def refresh_status(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await defer_interaction(interaction, ephemeral=True)
         await refresh_main_embed()
         await send_temporary_response(interaction, content="Status refreshed.", delay=20)
 
     @discord.ui.button(label='🗺️ Change Map', style=discord.ButtonStyle.primary, custom_id='persistent:open_map_changer', row=1)
     async def open_map_changer(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await defer_interaction(interaction, ephemeral=True)
         servers = api_client.get_servers()
         focused_server = _get_channel_focused_server(interaction.channel)
 
@@ -743,6 +772,7 @@ class GameModeView(PersistentView):
         row=3,
     )
     async def remove_admin_cam_access(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await defer_interaction(interaction, ephemeral=True)
         servers = api_client.get_servers()
         if not servers:
             await send_temporary_response(interaction, content="No servers are configured; cannot remove admin cam access.", delay=10)
@@ -864,6 +894,7 @@ class ChangeServerDropdown(discord.ui.Select):
 
     async def callback(self, interaction: discord.Interaction):
         try:
+            await defer_interaction(interaction)
             channel = interaction.channel
             if channel is None:
                 await send_temporary_response(interaction, content="Unable to determine channel to update.", delay=20)
@@ -890,7 +921,8 @@ class ChangeServerDropdown(discord.ui.Select):
                     if isinstance(channel, (discord.TextChannel, discord.Thread)):
                         await ensure_persistent_message(channel)
 
-            await interaction.response.edit_message(
+            await update_interaction_message(
+                interaction,
                 content=(
                     f"Selected server set to {api_client.get_server_name(selected)}. "
                     "Change Map, Set Objectives, and Dynamic Weather now target this server."
@@ -921,6 +953,7 @@ class ServerDropdown(discord.ui.Select):
         )
     
     async def callback(self, interaction: discord.Interaction):
+        await defer_interaction(interaction)
         selected_server_index = int(self.values[0])
         server_name = api_client.get_server_name(selected_server_index)
         current_map = api_client.get_current_map(selected_server_index)
@@ -932,7 +965,7 @@ class ServerDropdown(discord.ui.Select):
         )
         
         view = GameModeSelectionView(selected_server_index)
-        await interaction.response.edit_message(embed=embed, view=view)
+        await update_interaction_message(interaction, embed=embed, view=view)
 
 
 
@@ -946,7 +979,8 @@ async def send_objective_selection(
     if not client:
         message = _http_error_message(server_index)
         if edit_message:
-            await interaction.response.edit_message(
+            await update_interaction_message(
+                interaction,
                 embed=discord.Embed(title="?? Objective Controls Disabled", description=message, color=0xffa500),
                 view=None,
             )
@@ -960,7 +994,8 @@ async def send_objective_selection(
     except CRCONHTTPError as exc:
         message = f"Failed to load objectives: {exc}"
         if edit_message:
-            await interaction.response.edit_message(
+            await update_interaction_message(
+                interaction,
                 embed=discord.Embed(title="?? Objective Fetch Failed", description=message, color=0xffa500),
                 view=None,
             )
@@ -975,7 +1010,7 @@ async def send_objective_selection(
     embed = view.build_embed()
 
     if edit_message:
-        await interaction.response.edit_message(embed=embed, view=view)
+        await update_interaction_message(interaction, embed=embed, view=view)
     else:
         await send_temporary_response(interaction, embed=embed, view=view, delay=None)
 
@@ -991,7 +1026,8 @@ async def send_dynamic_weather_controls(
     if not client:
         message = _http_error_message(server_index)
         if edit_message:
-            await interaction.response.edit_message(
+            await update_interaction_message(
+                interaction,
                 embed=discord.Embed(title="?? Dynamic Weather Disabled", description=message, color=0xffa500),
                 view=None,
             )
@@ -1006,7 +1042,8 @@ async def send_dynamic_weather_controls(
     except CRCONHTTPError as exc:
         message = f"Failed to load gamestate: {exc}"
         if edit_message:
-            await interaction.response.edit_message(
+            await update_interaction_message(
+                interaction,
                 embed=discord.Embed(title="?? Dynamic Weather Unavailable", description=message, color=0xffa500),
                 view=None,
             )
@@ -1022,7 +1059,8 @@ async def send_dynamic_weather_controls(
     if not map_id:
         message = "Could not determine the current map ID from the server."
         if edit_message:
-            await interaction.response.edit_message(
+            await update_interaction_message(
+                interaction,
                 embed=discord.Embed(title="?? Dynamic Weather Unavailable", description=message, color=0xffa500),
                 view=None,
             )
@@ -1035,7 +1073,7 @@ async def send_dynamic_weather_controls(
     embed = view.build_embed()
 
     if edit_message:
-        await interaction.response.edit_message(embed=embed, view=view)
+        await update_interaction_message(interaction, embed=embed, view=view)
     else:
         await send_temporary_response(interaction, embed=embed, view=view, delay=None)
 
@@ -1063,6 +1101,7 @@ class DynamicWeatherServerDropdown(discord.ui.Select):
 
     async def callback(self, interaction: discord.Interaction):
         server_index = int(self.values[0])
+        await defer_interaction(interaction)
         await send_dynamic_weather_controls(interaction, server_index, edit_message=True)
 
 
@@ -1161,6 +1200,7 @@ class ObjectiveServerDropdown(discord.ui.Select):
 
     async def callback(self, interaction: discord.Interaction):
         server_index = int(self.values[0])
+        await defer_interaction(interaction)
         await send_objective_selection(interaction, server_index, edit_message=True)
 
 
@@ -1177,10 +1217,9 @@ class ObjectiveSelectionView(discord.ui.View):
             self.add_item(ObjectiveDropdown(slot, options))
 
     def build_embed(self) -> discord.Embed:
-        current_map = api_client.get_current_map(self.server_index)
         description = (
             f"**Server:** {self.server_name}\n"
-            f"**Current Map:** {current_map}\n\n"
+            f"**Current Map:** {self.initial_map}\n\n"
             "Choose one strongpoint for each slot, then lock the layout for this match."
         )
 
@@ -1293,6 +1332,7 @@ class GameModeSelectionView(discord.ui.View):
         await self.show_map_selection(interaction, "skirmish")
     
     async def show_map_selection(self, interaction, game_mode):
+        await defer_interaction(interaction)
         server_name = api_client.get_server_name(self.server_index)
         current_map = api_client.get_current_map(self.server_index)
         
@@ -1303,7 +1343,7 @@ class GameModeSelectionView(discord.ui.View):
         )
         
         view = MapSelectionView(self.server_index, game_mode)
-        await interaction.response.edit_message(embed=embed, view=view)
+        await update_interaction_message(interaction, embed=embed, view=view)
 
 class MapSelectionView(discord.ui.View):
     def __init__(self, server_index, game_mode):
@@ -1345,6 +1385,7 @@ class MapDropdown(discord.ui.Select):
         )
     
     async def callback(self, interaction: discord.Interaction):
+        await defer_interaction(interaction)
         selected_map = self.values[0]
         server_name = api_client.get_server_name(self.server_index)
         current_map = api_client.get_current_map(self.server_index)
@@ -1356,7 +1397,7 @@ class MapDropdown(discord.ui.Select):
         )
         
         view = VariantSelectionView(self.server_index, self.game_mode, selected_map)
-        await interaction.response.edit_message(embed=embed, view=view)
+        await update_interaction_message(interaction, embed=embed, view=view)
 
 class VariantSelectionView(discord.ui.View):
     def __init__(self, server_index, game_mode, map_name):
@@ -1469,6 +1510,7 @@ class BackToServerSelectionButton(discord.ui.Button):
         super().__init__(label="← Back to Servers", style=discord.ButtonStyle.gray)
     
     async def callback(self, interaction: discord.Interaction):
+        await defer_interaction(interaction)
         embed = discord.Embed(
             title="🗺️ Map Change Control",
             description="Select a server:",
@@ -1476,7 +1518,7 @@ class BackToServerSelectionButton(discord.ui.Button):
         )
         
         view = ServerSelectionView()
-        await interaction.response.edit_message(embed=embed, view=view)
+        await update_interaction_message(interaction, embed=embed, view=view)
 
 class BackToGameModeButton(discord.ui.Button):
     def __init__(self, server_index):
@@ -1484,6 +1526,7 @@ class BackToGameModeButton(discord.ui.Button):
         self.server_index = server_index
     
     async def callback(self, interaction: discord.Interaction):
+        await defer_interaction(interaction)
         server_name = api_client.get_server_name(self.server_index)
         current_map = api_client.get_current_map(self.server_index)
         
@@ -1494,7 +1537,7 @@ class BackToGameModeButton(discord.ui.Button):
         )
         
         view = GameModeSelectionView(self.server_index)
-        await interaction.response.edit_message(embed=embed, view=view)
+        await update_interaction_message(interaction, embed=embed, view=view)
 
 class BackToMapSelectionButton(discord.ui.Button):
     def __init__(self, server_index, game_mode):
@@ -1503,6 +1546,7 @@ class BackToMapSelectionButton(discord.ui.Button):
         self.game_mode = game_mode
     
     async def callback(self, interaction: discord.Interaction):
+        await defer_interaction(interaction)
         server_name = api_client.get_server_name(self.server_index)
         current_map = api_client.get_current_map(self.server_index)
         
@@ -1513,7 +1557,7 @@ class BackToMapSelectionButton(discord.ui.Button):
         )
         
         view = MapSelectionView(self.server_index, self.game_mode)
-        await interaction.response.edit_message(embed=embed, view=view)
+        await update_interaction_message(interaction, embed=embed, view=view)
 
 @bot.event
 async def on_ready():
