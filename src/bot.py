@@ -442,6 +442,73 @@ class AddAdminCamModal(discord.ui.Modal, title="ADD ADMIN CAM ACCESS"):
             await send_temporary_response(interaction, content="Player NOT FOUND", delay=10)
 
 
+class TeamSwitchCooldownModal(discord.ui.Modal, title="SET TEAM SWITCH COOLDOWN"):
+    cooldown_minutes = discord.ui.TextInput(
+        label="Cooldown in minutes",
+        placeholder="Enter 0 or a positive whole number",
+        required=True,
+        max_length=6,
+    )
+
+    def __init__(self, server_index: int):
+        super().__init__()
+        self.server_index = server_index
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        client = _get_http_client(self.server_index)
+        if not client:
+            await send_temporary_response(
+                interaction,
+                content=f"CRCON HTTP unavailable for this server: {_http_error_message(self.server_index)}",
+                delay=20,
+            )
+            return
+
+        raw_value = str(self.cooldown_minutes.value).strip()
+        try:
+            cooldown_minutes = int(raw_value)
+        except ValueError:
+            await send_temporary_response(
+                interaction,
+                content="Cooldown must be a whole number of minutes.",
+                delay=20,
+            )
+            return
+
+        if cooldown_minutes < 0:
+            await send_temporary_response(
+                interaction,
+                content="Cooldown must be 0 or greater.",
+                delay=20,
+            )
+            return
+
+        server_name = api_client.get_server_name(self.server_index)
+
+        try:
+            result = client.set_team_switch_cooldown(cooldown_minutes)
+        except CRCONHTTPError as exc:
+            await send_temporary_response(
+                interaction,
+                content=f"Failed to set team switch cooldown for {server_name}: {exc}",
+                delay=20,
+            )
+            return
+
+        warning = ""
+        if isinstance(result, dict) and result.get("warning"):
+            warning = f" Note: {result['warning']}"
+
+        await send_temporary_response(
+            interaction,
+            content=(
+                f"Set team switch cooldown to {cooldown_minutes} minute(s) on {server_name}."
+                f"{warning}"
+            ),
+            delay=20,
+        )
+
+
 class RemoveAdminCamConfirmView(discord.ui.View):
     def __init__(self, server_index: int, player_id: str, player_name: str):
         super().__init__(timeout=300)
@@ -764,6 +831,41 @@ class GameModeView(PersistentView):
             env_name="WARFARE_WARMUP_TIMER_MINUTES",
             default_minutes=3,
         )
+
+    @discord.ui.button(
+        label='↔️ Team Switch Cooldown',
+        style=discord.ButtonStyle.primary,
+        custom_id='persistent:set_team_switch_cooldown',
+        row=2,
+    )
+    async def set_team_switch_cooldown(self, interaction: discord.Interaction, button: discord.ui.Button):
+        servers = api_client.get_servers()
+        if not servers:
+            await send_temporary_response(
+                interaction,
+                content="No servers are configured; cannot set the team switch cooldown.",
+                delay=20,
+            )
+            return
+
+        server_index = _get_focused_or_single_server(interaction)
+        if server_index is None:
+            await send_temporary_response(
+                interaction,
+                content="Please set a focused server first using Change Server.",
+                delay=10,
+            )
+            return
+
+        if not _get_http_client(server_index):
+            await send_temporary_response(
+                interaction,
+                content=f"CRCON HTTP unavailable for this server: {_http_error_message(server_index)}",
+                delay=20,
+            )
+            return
+
+        await interaction.response.send_modal(TeamSwitchCooldownModal(server_index))
 
     @discord.ui.button(
         label='🗑️ REMOVE ADMIN CAM USER',
