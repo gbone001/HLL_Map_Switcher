@@ -11,6 +11,7 @@ A simple Discord bot that allows users to change Hell Let Loose server maps thro
 - Works with the CRCON HTTP API (token-based) and multiple servers
 - Lets admins lock objective layouts for the current match via the CRCON HTTP API
 - Adds panel buttons for the default Warfare match timer and Warfare warmup timer
+- Exposes a live HTTP kill feed and OBS browser overlay powered by CRCON recent logs
 - Shows the current map in real-time
 - No slash commands needed; just click the buttons
 
@@ -42,6 +43,7 @@ A simple Discord bot that allows users to change Hell Let Loose server maps thro
    - API token (Django token) — set `CRCON_TOKEN` or per-server `SERVER{N}_CRCON_TOKEN`
    - Optional server display names for Discord
    - Optional timer defaults: `WARFARE_MATCH_TIMER_MINUTES` (default `90`) and `WARFARE_WARMUP_TIMER_MINUTES` (default `3`)
+   - The API token must also have log permissions if you want to use the kill feed overlay
 
 2. **Obtain an API token:**
    - Log into your CRCON web admin (usually at `{CRCON_BASE_URL}/admin`), create a service user, and generate a Django API token for that user.
@@ -94,6 +96,16 @@ If you change environment variables, run `railway variables set KEY=value` (or u
 ## Usage
 
 The bot automatically posts a persistent button panel in your configured Discord channel. Users can change maps, set objectives, toggle dynamic weather, and apply the configured default Warfare timers from the panel.
+
+The same process also exposes an OBS-ready kill feed overlay:
+
+- JSON feed: `/api/kill-feed`
+- OBS overlay page: `/overlay`
+- Optional query params:
+  - `server=1` to show only server 1
+  - `limit=6` to control how many recent kills are rendered
+
+On Railway the web server will bind to `PORT` automatically. Locally you can set `KILL_FEED_PORT` (default `8080`).
 
 ## Troubleshooting
 
