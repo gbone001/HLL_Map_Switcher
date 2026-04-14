@@ -9,6 +9,7 @@ from discord.ext import commands
 from dotenv import load_dotenv
 from services.kill_feed import KillFeedService, build_kill_feed_service
 from services.overlay_web import KillFeedWebServer, build_kill_feed_web_server
+from services.server_control import GameStatus, ServerControlService
 from utils.map_data import (
     get_maps_for_mode,
     get_variants_for_map,
@@ -36,6 +37,9 @@ _http_client_errors: Dict[Optional[int], str] = {}
 def _server_number(server_index: Optional[int]) -> Optional[int]:
     if server_index is None:
         return None
+    resolved_server_number = api_client.get_server_number(server_index)
+    if resolved_server_number is not None:
+        return resolved_server_number
     return server_index + 1
 
 
@@ -64,6 +68,12 @@ def _get_http_client(server_index: Optional[int] = None) -> Optional[CRCONHttpCl
 
 def _http_error_message(server_index: Optional[int]) -> str:
     return _http_client_errors.get(server_index) or "HTTP API credentials are not configured for this server."
+
+
+server_control = ServerControlService(
+    server_number_resolver=api_client.get_server_number,
+    http_client_factory=_get_http_client,
+)
 
 
 def _get_channel_focused_server(channel: Optional[object]) -> Optional[int]:
@@ -120,6 +130,12 @@ def _format_current_objectives(objectives: list[str]) -> str:
     return " -> ".join(objectives)
 
 
+def _status_badge(status: GameStatus) -> str:
+    if status.transport == "direct_rcon":
+        return "Direct RCON Fallback"
+    return "CRCON HTTP"
+
+
 def _get_server_env_value(name: str, server_index: Optional[int] = None) -> Optional[str]:
     server_number = _server_number(server_index)
     if server_number is not None:
@@ -172,54 +188,46 @@ def build_main_embed(focused_server_index: Optional[int] = None) -> discord.Embe
             selected_server_label = f"Unknown ({focused_server_index})"
 
         for position, (index, server_name) in enumerate(servers, start=1):
-            client = _get_http_client(index)
             selected_prefix = "**[SELECTED]** " if focused_server_index == index else ""
+            status_result = server_control.get_status(index)
+            server_lines.append(f"{position}. {selected_prefix}{server_name}")
 
-            if not client:
-                server_lines.append(f"{position}. {selected_prefix}{server_name}")
-                server_lines.append(f"   Status: ⚠️ {_http_error_message(index)}")
+            if not status_result.success:
+                server_lines.append(f"   Status: ⚠️ {status_result.message}")
                 continue
 
-            try:
-                gamestate_resp = client.get_gamestate()
-            except CRCONHTTPError as exc:
-                server_lines.append(f"{position}. {selected_prefix}{server_name}")
-                server_lines.append(f"   Status: ⚠️ {exc}")
+            status = (status_result.data or {}).get("status")
+            if not isinstance(status, GameStatus):
+                server_lines.append("   Status: ⚠️ Status payload unavailable.")
                 continue
 
-            gamestate_data = gamestate_resp.get("result") if isinstance(gamestate_resp, dict) else None
-            if gamestate_data:
-                current_map = gamestate_data.get("current_map", {}) or {}
-                map_id = str(current_map.get("id") or "")
-                pretty_name = current_map.get("pretty_name") or current_map.get("id") or "Unknown"
-                allied = gamestate_data.get("num_allied_players", "??")
-                axis = gamestate_data.get("num_axis_players", "??")
-                time_remaining = _format_time_remaining(
-                    gamestate_data.get("time_remaining"),
-                    gamestate_data.get("raw_time_remaining"),
-                )
+            pretty_name = status.current_map or "Unknown"
+            allied = status.allied_players if status.allied_players is not None else "??"
+            axis = status.axis_players if status.axis_players is not None else "??"
+            time_remaining = _format_time_remaining(
+                status.time_remaining_seconds,
+                status.raw_time_remaining,
+            )
 
-                objective_rows_text = "Unknown"
-                known_objectives = _current_objectives_state.get((index, str(pretty_name)))
-                if known_objectives is not None:
-                    objective_rows_text = _format_current_objectives(known_objectives)
+            objective_rows_text = "Unknown"
+            known_objectives = _current_objectives_state.get((index, str(pretty_name)))
+            if known_objectives is not None:
+                objective_rows_text = _format_current_objectives(known_objectives)
 
-                dynamic_weather_text = "Unknown"
-                if map_id:
-                    known_state = _dynamic_weather_state.get((index, map_id))
-                    if known_state is not None:
-                        dynamic_weather_text = "Enabled" if known_state else "Disabled"
+            dynamic_weather_text = "Unknown"
+            known_state = _dynamic_weather_state.get((index, pretty_name))
+            if known_state is not None:
+                dynamic_weather_text = "Enabled" if known_state else "Disabled"
 
-                server_lines.append(f"{position}. {selected_prefix}{server_name}")
-                server_lines.append(f"   Map: {pretty_name}")
-                server_lines.append(f"   Allied: {allied} | Axis: {axis} | Time Remaining: {time_remaining}")
-                server_lines.append(f"   Dynamic Weather: {dynamic_weather_text}")
-                aest = timezone(timedelta(hours=10), name="AEST")
-                updated_at = datetime.now(aest)
-                updated_at_text = f"Updated as at {updated_at.strftime('%d %B %Y - %H:%M:%S')} AEST"
-            else:
-                server_lines.append(f"{position}. {selected_prefix}{server_name}")
-                server_lines.append("   Status: ⚠️ Gamestate unavailable.")
+            server_lines.append(f"   Map: {pretty_name}")
+            server_lines.append(f"   Allied: {allied} | Axis: {axis} | Time Remaining: {time_remaining}")
+            server_lines.append(f"   Dynamic Weather: {dynamic_weather_text}")
+            server_lines.append(f"   Status Source: {_status_badge(status)}")
+            if status_result.warning:
+                server_lines.append(f"   Warning: {status_result.warning}")
+            aest = timezone(timedelta(hours=10), name="AEST")
+            updated_at = datetime.now(aest)
+            updated_at_text = f"Updated as at {updated_at.strftime('%d %B %Y - %H:%M:%S')} AEST"
     else:
         server_lines.append("- No servers configured.")
 
@@ -463,15 +471,6 @@ class TeamSwitchCooldownModal(discord.ui.Modal, title="SET TEAM SWITCH COOLDOWN"
         self.server_index = server_index
 
     async def on_submit(self, interaction: discord.Interaction) -> None:
-        client = _get_http_client(self.server_index)
-        if not client:
-            await send_temporary_response(
-                interaction,
-                content=f"CRCON HTTP unavailable for this server: {_http_error_message(self.server_index)}",
-                delay=20,
-            )
-            return
-
         raw_value = str(self.cooldown_minutes.value).strip()
         try:
             cooldown_minutes = int(raw_value)
@@ -493,24 +492,24 @@ class TeamSwitchCooldownModal(discord.ui.Modal, title="SET TEAM SWITCH COOLDOWN"
 
         server_name = api_client.get_server_name(self.server_index)
 
-        try:
-            result = client.set_team_switch_cooldown(cooldown_minutes)
-        except CRCONHTTPError as exc:
+        result = server_control.set_team_switch_cooldown(self.server_index, cooldown_minutes)
+        if not result.success:
             await send_temporary_response(
                 interaction,
-                content=f"Failed to set team switch cooldown for {server_name}: {exc}",
+                content=f"Failed to set team switch cooldown for {server_name}: {result.message}",
                 delay=20,
             )
             return
 
         warning = ""
-        if isinstance(result, dict) and result.get("warning"):
-            warning = f" Note: {result['warning']}"
+        if result.warning:
+            warning = f" Note: {result.warning}"
 
         await send_temporary_response(
             interaction,
             content=(
                 f"Set team switch cooldown to {cooldown_minutes} minute(s) on {server_name}."
+                f" Transport: {'Direct RCON fallback' if result.transport == 'direct_rcon' else 'CRCON HTTP'}."
                 f"{warning}"
             ),
             delay=20,
@@ -641,34 +640,28 @@ class GameModeView(PersistentView):
             )
             return
 
-        client = _get_http_client(server_index)
-        if not client:
-            await send_temporary_response(
-                interaction,
-                content=f"CRCON HTTP unavailable for this server: {_http_error_message(server_index)}",
-                delay=20,
-            )
-            return
-
         minutes = _get_timer_minutes(env_name, default_minutes, server_index)
         server_name = api_client.get_server_name(server_index)
 
-        try:
-            if timer_name == "match timer":
-                client.set_match_timer("warfare", minutes)
-            else:
-                client.set_warmup_timer("warfare", minutes)
-        except CRCONHTTPError as exc:
+        if timer_name == "match timer":
+            result = server_control.set_match_timer(server_index, "warfare", minutes)
+        else:
+            result = server_control.set_warmup_timer(server_index, "warfare", minutes)
+
+        if not result.success:
             await send_temporary_response(
                 interaction,
-                content=f"Failed to set warfare {timer_name} for {server_name}: {exc}",
+                content=f"Failed to set warfare {timer_name} for {server_name}: {result.message}",
                 delay=20,
             )
             return
 
         await send_temporary_response(
             interaction,
-            content=f"Set warfare {timer_name} to {minutes} minute(s) on {server_name}.",
+            content=(
+                f"Set warfare {timer_name} to {minutes} minute(s) on {server_name}. "
+                f"Transport: {'Direct RCON fallback' if result.transport == 'direct_rcon' else 'CRCON HTTP'}."
+            ),
             delay=20,
         )
 
@@ -1241,22 +1234,10 @@ class DynamicWeatherToggleView(discord.ui.View):
         if not interaction.response.is_done():
             await interaction.response.defer(ephemeral=True)
 
-        client = _get_http_client(self.server_index)
-        if not client:
+        result = server_control.set_dynamic_weather_enabled(self.server_index, self.map_id, enabled)
+        if not result.success:
             followup = await interaction.followup.send(
-                f"CRCON HTTP unavailable for this server: {_http_error_message(self.server_index)}",
-                ephemeral=True,
-                wait=True,
-            )
-            if followup is not None:
-                asyncio.create_task(_delete_message_after(followup, 20.0))
-            return
-
-        try:
-            client.set_dynamic_weather_enabled(self.map_id, enabled)
-        except CRCONHTTPError as exc:
-            followup = await interaction.followup.send(
-                f"Failed to update dynamic weather: {exc}",
+                f"Failed to update dynamic weather: {result.message}",
                 ephemeral=True,
                 wait=True,
             )
@@ -1265,11 +1246,15 @@ class DynamicWeatherToggleView(discord.ui.View):
             return
 
         _dynamic_weather_state[(self.server_index, self.map_id)] = enabled
+        _dynamic_weather_state[(self.server_index, self.map_pretty)] = enabled
 
         state = "enabled" if enabled else "disabled"
         success_embed = discord.Embed(
             title="🌦 Dynamic Weather Updated",
-            description=f"Dynamic weather {state} for **{self.map_pretty}**.",
+            description=(
+                f"Dynamic weather {state} for **{self.map_pretty}**.\n"
+                f"Transport: {'Direct RCON fallback' if result.transport == 'direct_rcon' else 'CRCON HTTP'}."
+            ),
             color=0x1abc9c,
         )
 
@@ -1351,14 +1336,6 @@ class ObjectiveSelectionView(discord.ui.View):
         return embed
 
     async def lock_objectives(self, interaction: discord.Interaction) -> None:
-        client = _get_http_client(self.server_index)
-        if not client:
-            await interaction.followup.send(
-                f"HTTP API unavailable for this server: {_http_error_message(self.server_index)}",
-                ephemeral=True,
-            )
-            return
-
         objective_list = [self.selected.get(slot) for slot in range(1, len(self.rows) + 1)]
         if any(choice is None for choice in objective_list):
             await interaction.followup.send(
@@ -1369,11 +1346,10 @@ class ObjectiveSelectionView(discord.ui.View):
 
         objective_list = [choice for choice in objective_list if choice]
 
-        try:
-            client.set_game_layout(objective_list)
-        except CRCONHTTPError as exc:
+        result = server_control.set_sector_layout(self.server_index, objective_list)
+        if not result.success:
             await interaction.followup.send(
-                f"Failed to lock objectives: {exc}",
+                f"Failed to lock objectives: {result.message}",
                 ephemeral=True,
             )
             return
@@ -1388,7 +1364,8 @@ class ObjectiveSelectionView(discord.ui.View):
             title="🔒 Objectives Locked",
             description=(
                 f"**Server:** {self.server_name}\n"
-                f"**Map:** {latest_map}\n\n"
+                f"**Map:** {latest_map}\n"
+                f"**Transport:** {'Direct RCON fallback' if result.transport == 'direct_rcon' else 'CRCON HTTP'}\n\n"
                 f"{summary}"
             ),
             color=0x2ecc71,
@@ -1568,16 +1545,19 @@ class VariantDropdown(discord.ui.Select):
         status_lines = []
         overall_success = False
 
-        client = _get_http_client(self.server_index)
-        if client:
-            try:
-                client.set_map(selected_variant_id)
-                status_lines.append("? HTTP API change_map succeeded.")
-                overall_success = True
-            except CRCONHTTPError as exc:
-                status_lines.append(f"?? HTTP API change_map failed: {exc}")
+        result = server_control.change_map(self.server_index, selected_variant_id)
+        if result.success:
+            if result.transport == "direct_rcon":
+                status_lines.append("Direct RCON fallback change_map succeeded.")
+                if result.warning:
+                    status_lines.append(f"CRCON HTTP issue: {result.warning}")
+            else:
+                status_lines.append("CRCON HTTP change_map succeeded.")
+                if result.warning:
+                    status_lines.append(f"Note: {result.warning}")
+            overall_success = True
         else:
-            status_lines.append(f"?? HTTP API unavailable: {_http_error_message(self.server_index)}")
+            status_lines.append(result.message)
 
         status_summary = "\n".join(f"• {line}" for line in status_lines)
         

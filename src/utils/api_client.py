@@ -3,6 +3,7 @@ from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
 from .crcon_http import CRCONCredentials, CRCONHTTPError, CRCONHttpClient
+from .hll_rcon import HLLRCONCredentials, HLLRCONError, HLLRCONClient
 
 
 @dataclass
@@ -12,7 +13,7 @@ class ServerConfig:
 
 
 class HLLAPIClient:
-    """CRCON HTTP-only helper for server metadata and map actions."""
+    """Server metadata helper with CRCON HTTP primary access and direct RCON fallback."""
 
     def __init__(self, timeout: float = 10.0):
         self.timeout = timeout
@@ -32,6 +33,9 @@ class HLLAPIClient:
                 f"SERVER{index}_NAME",
                 f"SERVER{index}_CRCON_BASE_URL",
                 f"SERVER{index}_CRCON_TOKEN",
+                f"SERVER{index}_RCON_HOST",
+                f"SERVER{index}_RCON_PORT",
+                f"SERVER{index}_RCON_PASSWORD",
             )
             if any(key in os.environ for key in keys):
                 numbers.append(index)
@@ -43,9 +47,22 @@ class HLLAPIClient:
 
         if numbers:
             for number in numbers:
+                has_http = False
+                has_rcon = False
+
                 try:
                     CRCONCredentials.from_env(server_number=number)
+                    has_http = True
                 except CRCONHTTPError:
+                    pass
+
+                try:
+                    HLLRCONCredentials.from_env(server_number=number)
+                    has_rcon = True
+                except HLLRCONError:
+                    pass
+
+                if not has_http and not has_rcon:
                     # Leave partially configured slots out of active controls.
                     continue
 
@@ -53,8 +70,27 @@ class HLLAPIClient:
                 servers.append(ServerConfig(name=server_name, server_number=number))
             return servers
 
-        # Fall back to shared single-server CRCON configuration.
-        CRCONCredentials.from_env()
+        has_shared_http = False
+        has_shared_rcon = False
+
+        try:
+            CRCONCredentials.from_env()
+            has_shared_http = True
+        except CRCONHTTPError:
+            pass
+
+        try:
+            HLLRCONCredentials.from_env()
+            has_shared_rcon = True
+        except HLLRCONError:
+            pass
+
+        if not has_shared_http and not has_shared_rcon:
+            raise ValueError(
+                "No servers are configured. Set CRCON_BASE_URL and CRCON_TOKEN, "
+                "or RCON_HOST, RCON_PORT, and RCON_PASSWORD, or per-server SERVER{N}_* variables."
+            )
+
         server_name = os.getenv("SERVER_NAME") or "HLL Server"
         return [ServerConfig(name=server_name, server_number=None)]
 
@@ -78,16 +114,32 @@ class HLLAPIClient:
             return self.servers[server_index].name
         return "Unknown Server"
 
+    def get_server_number(self, server_index: int) -> Optional[int]:
+        if 0 <= server_index < len(self.servers):
+            return self.servers[server_index].server_number
+        return None
+
     def get_current_map(self, server_index: int) -> str:
         try:
             client = self._client_for_index(server_index)
             response = client.get_gamestate()
+            gamestate = response.get("result") if isinstance(response, dict) else None
+            current_map = gamestate.get("current_map", {}) if isinstance(gamestate, dict) else {}
+            return current_map.get("pretty_name") or current_map.get("id") or "Unknown"
+        except Exception:
+            pass
+
+        server_number = self.get_server_number(server_index)
+        try:
+            rcon_client = HLLRCONClient.from_env(server_number=server_number, timeout=self.timeout)
+            session_info = rcon_client.get_session_info()
         except Exception:
             return "Unknown"
 
-        gamestate = response.get("result") if isinstance(response, dict) else None
-        current_map = gamestate.get("current_map", {}) if isinstance(gamestate, dict) else {}
-        return current_map.get("pretty_name") or current_map.get("id") or "Unknown"
+        session = session_info.get("session") if isinstance(session_info.get("session"), dict) else session_info
+        if not isinstance(session, dict):
+            return "Unknown"
+        return str(session.get("MapName") or "Unknown")
 
     def set_map(self, server_index: int, map_id: str) -> Tuple[bool, str]:
         try:
