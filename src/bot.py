@@ -93,6 +93,27 @@ _current_objectives_state: Dict[Tuple[int, str], list[str]] = {}
 # Map (server_index, map_id) -> dynamic weather state last set through this bot
 _dynamic_weather_state: Dict[Tuple[int, str], bool] = {}
 
+CRCON_PANEL_DEPENDENT_BUTTONS = {
+    "persistent:set_objectives",
+    "persistent:set_dynamic_weather",
+    "persistent:remove_admin_cam_access",
+    "persistent:add_admin_cam_access",
+}
+
+CRCON_PANEL_DEFAULT_BUTTON_STYLES = {
+    "persistent:set_objectives": discord.ButtonStyle.secondary,
+    "persistent:set_dynamic_weather": discord.ButtonStyle.secondary,
+    "persistent:remove_admin_cam_access": discord.ButtonStyle.secondary,
+    "persistent:add_admin_cam_access": discord.ButtonStyle.danger,
+}
+
+CRCON_PANEL_DEFAULT_BUTTON_LABELS = {
+    "persistent:set_objectives": "🎯 Set Objectives",
+    "persistent:set_dynamic_weather": "🌦 Dynamic Weather",
+    "persistent:remove_admin_cam_access": "🗑️ REMOVE ADMIN CAM USER",
+    "persistent:add_admin_cam_access": "🎥 ADD ADMIN CAM ACCESS",
+}
+
 
 def _format_time_remaining(time_remaining: Optional[float], raw_time: Optional[str]) -> str:
     if time_remaining is None:
@@ -163,6 +184,42 @@ def _get_focused_or_single_server(interaction: discord.Interaction) -> Optional[
     return None
 
 
+def _server_has_crcon_http(server_index: int) -> bool:
+    status_result = server_control.get_status(server_index)
+    return status_result.success and status_result.transport == "crcon_http"
+
+
+def _panel_crcon_outage_state(focused_server_index: Optional[int] = None) -> tuple[bool, list[str]]:
+    servers = api_client.get_servers()
+    if not servers:
+        return False, []
+
+    target_indices: list[int]
+    if focused_server_index is not None and any(index == focused_server_index for index, _ in servers):
+        target_indices = [focused_server_index]
+    elif len(servers) == 1:
+        target_indices = [servers[0][0]]
+    else:
+        target_indices = [index for index, _ in servers]
+
+    unavailable_server_names: list[str] = []
+    healthy_count = 0
+
+    for server_index in target_indices:
+        if _server_has_crcon_http(server_index):
+            healthy_count += 1
+            continue
+        unavailable_server_names.append(api_client.get_server_name(server_index))
+
+    if not target_indices:
+        return False, []
+
+    if focused_server_index is not None or len(servers) == 1:
+        return healthy_count == 0, unavailable_server_names
+
+    return healthy_count == 0, unavailable_server_names
+
+
 
 
 
@@ -171,6 +228,7 @@ def build_main_embed(focused_server_index: Optional[int] = None) -> discord.Embe
     server_lines: list[str] = []
     updated_at_text = ""
     selected_server_label = "None"
+    crcon_http_degraded_servers: list[str] = []
 
     if servers:
         selected_name = next((name for index, name in servers if index == focused_server_index), None)
@@ -186,6 +244,7 @@ def build_main_embed(focused_server_index: Optional[int] = None) -> discord.Embe
 
             if not status_result.success:
                 server_lines.append(f"   Status: ⚠️ {status_result.message}")
+                crcon_http_degraded_servers.append(server_name)
                 continue
 
             status = (status_result.data or {}).get("status")
@@ -217,6 +276,8 @@ def build_main_embed(focused_server_index: Optional[int] = None) -> discord.Embe
             server_lines.append(f"   Status Source: {_status_badge(status)}")
             if status_result.warning:
                 server_lines.append(f"   Warning: {status_result.warning}")
+            if status.transport != "crcon_http":
+                crcon_http_degraded_servers.append(server_name)
             aest = timezone(timedelta(hours=10), name="AEST")
             updated_at = datetime.now(aest)
             updated_at_text = f"Updated as at {updated_at.strftime('%d %B %Y - %H:%M:%S')} AEST"
@@ -225,6 +286,14 @@ def build_main_embed(focused_server_index: Optional[int] = None) -> discord.Embe
 
     description = "Click the buttons below to manage the server.\n\n"
     description += f"**Currently Selected Server:** {selected_server_label}\n\n"
+    if crcon_http_degraded_servers:
+        affected_servers = ", ".join(sorted(set(crcon_http_degraded_servers)))
+        description += (
+            "**CRCON API Status:** ⚠️ Issues detected\n"
+            f"Affected server(s): {affected_servers}\n"
+            "Panel controls disabled while CRCON is down: Set Objectives, Dynamic Weather, "
+            "Remove Admin Cam User, Add Admin Cam Access.\n\n"
+        )
     description += "**Available Servers:**\n" + "\n".join(server_lines)
 
     if updated_at_text:
@@ -246,7 +315,7 @@ async def ensure_persistent_message(channel: discord.abc.Messageable) -> Optiona
     if channel_id is not None:
         focused = _persistent_focused_server.get(channel_id)
     embed = build_main_embed(focused_server_index=focused)
-    view = GameModeView()
+    view = GameModeView(focused_server_index=focused)
     
 
     if persistent_message_ref and channel_id is not None:
@@ -602,8 +671,31 @@ class RemoveAdminCamSelectionView(discord.ui.View):
 
 
 class GameModeView(PersistentView):
-    def __init__(self):
+    def __init__(self, focused_server_index: Optional[int] = None):
         super().__init__()
+        self.focused_server_index = focused_server_index
+        self._apply_crcon_panel_state()
+
+    def _apply_crcon_panel_state(self) -> None:
+        disable_crcon_controls, _ = _panel_crcon_outage_state(self.focused_server_index)
+
+        for child in self.children:
+            if not isinstance(child, discord.ui.Button):
+                continue
+            custom_id = child.custom_id
+            if custom_id not in CRCON_PANEL_DEPENDENT_BUTTONS:
+                continue
+
+            default_style = CRCON_PANEL_DEFAULT_BUTTON_STYLES.get(custom_id, child.style)
+            default_label = CRCON_PANEL_DEFAULT_BUTTON_LABELS.get(custom_id, child.label)
+            child.disabled = disable_crcon_controls
+
+            if disable_crcon_controls:
+                child.style = discord.ButtonStyle.danger
+                child.label = f"OFFLINE - {default_label}"
+            else:
+                child.style = default_style
+                child.label = default_label
 
     async def _apply_warfare_timer(
         self,
@@ -1010,7 +1102,7 @@ class ChangeServerDropdown(discord.ui.Select):
                 try:
                     msg = await channel.fetch_message(message_id)  # type: ignore[attr-defined]
                     embed = build_main_embed(focused_server_index=selected)
-                    await msg.edit(embed=embed)
+                    await msg.edit(embed=embed, view=GameModeView(focused_server_index=selected))
                 except (discord.NotFound, discord.HTTPException):
                     # recreate persistent message
                     if isinstance(channel, (discord.TextChannel, discord.Thread)):
