@@ -1,6 +1,8 @@
 import asyncio
 import logging
 import os
+import re
+import time
 from collections import deque
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
@@ -32,6 +34,13 @@ class KillFeedEvent:
         return asdict(self)
 
 
+@dataclass
+class PollFailureState:
+    consecutive_failures: int = 0
+    current_backoff_seconds: float = 0.0
+    next_poll_after_monotonic: float = 0.0
+
+
 class KillFeedService:
     """Poll CRCON recent logs and retain a deduplicated window of kill events."""
 
@@ -42,15 +51,23 @@ class KillFeedService:
         poll_interval_seconds: float = 1.0,
         max_events: int = 25,
         recent_log_window: int = 50,
+        failure_backoff_initial_seconds: float = 5.0,
+        failure_backoff_max_seconds: float = 60.0,
     ) -> None:
         self.api_client = api_client
         self.http_client_factory = http_client_factory
         self.poll_interval_seconds = poll_interval_seconds
         self.max_events = max_events
         self.recent_log_window = recent_log_window
+        self.failure_backoff_initial_seconds = max(failure_backoff_initial_seconds, poll_interval_seconds)
+        self.failure_backoff_max_seconds = max(
+            failure_backoff_max_seconds,
+            self.failure_backoff_initial_seconds,
+        )
         self._events: Deque[KillFeedEvent] = deque(maxlen=max_events)
         self._seen_event_keys: Set[Tuple[int, int, str]] = set()
         self._seen_event_order: Deque[Tuple[int, int, str]] = deque(maxlen=max_events * 20)
+        self._failure_states: Dict[int, PollFailureState] = {}
         self._lock = asyncio.Lock()
         self._task: Optional[asyncio.Task] = None
         self._started = False
@@ -122,6 +139,9 @@ class KillFeedService:
         if client is None:
             return
 
+        if self._is_server_in_failure_backoff(server_index):
+            return
+
         try:
             payload = await asyncio.to_thread(
                 client.get_recent_logs,
@@ -129,11 +149,13 @@ class KillFeedService:
                 self.recent_log_window,
             )
         except CRCONHTTPError as exc:
-            logger.warning("Kill feed poll failed for server '%s': %s", server_name, exc)
+            self._record_poll_failure(server_index=server_index, server_name=server_name, exc=exc)
             return
         except Exception:
             logger.exception("Kill feed poll crashed for server '%s'", server_name)
             return
+
+        self._record_poll_success(server_index=server_index, server_name=server_name)
 
         if not isinstance(payload, dict):
             logger.warning("Kill feed poll returned unexpected payload for server '%s'", server_name)
@@ -222,6 +244,65 @@ class KillFeedService:
         self._seen_event_keys.add(event_key)
         self._seen_event_order.append(event_key)
 
+    def _is_server_in_failure_backoff(self, server_index: int) -> bool:
+        failure_state = self._failure_states.get(server_index)
+        if failure_state is None:
+            return False
+
+        return time.monotonic() < failure_state.next_poll_after_monotonic
+
+    def _record_poll_failure(self, server_index: int, server_name: str, exc: CRCONHTTPError) -> None:
+        failure_state = self._failure_states.setdefault(server_index, PollFailureState())
+        failure_state.consecutive_failures += 1
+
+        if failure_state.current_backoff_seconds <= 0:
+            next_backoff_seconds = self.failure_backoff_initial_seconds
+        else:
+            next_backoff_seconds = min(
+                self.failure_backoff_max_seconds,
+                failure_state.current_backoff_seconds * 2,
+            )
+
+        failure_state.current_backoff_seconds = next_backoff_seconds
+        failure_state.next_poll_after_monotonic = time.monotonic() + next_backoff_seconds
+
+        logger.warning(
+            "Kill feed poll failed for server '%s' after %s consecutive failure(s); "
+            "pausing this server's kill-feed polling for %.1f seconds: %s",
+            server_name,
+            failure_state.consecutive_failures,
+            next_backoff_seconds,
+            self._summarize_exception(exc),
+        )
+
+    def _record_poll_success(self, server_index: int, server_name: str) -> None:
+        failure_state = self._failure_states.pop(server_index, None)
+        if failure_state is None:
+            return
+
+        logger.info(
+            "Kill feed polling recovered for server '%s' after %s consecutive failure(s)",
+            server_name,
+            failure_state.consecutive_failures,
+        )
+
+    @staticmethod
+    def _summarize_exception(exc: Exception) -> str:
+        message = re.sub(r"\s+", " ", str(exc)).strip()
+        if "<html" not in message.lower():
+            return message
+
+        title_match = re.search(r"<title>\s*(.*?)\s*</title>", message, flags=re.IGNORECASE)
+        heading_match = re.search(r"<h1>\s*(.*?)\s*</h1>", message, flags=re.IGNORECASE)
+        page_summary = title_match or heading_match
+        if page_summary:
+            html_summary = page_summary.group(1).strip()
+            prefix = message.split("<", 1)[0].strip()
+            return f"{prefix} HTML error page: {html_summary}" if prefix else f"HTML error page: {html_summary}"
+
+        prefix = message.split("<", 1)[0].strip()
+        return f"{prefix} HTML error page returned" if prefix else "HTML error page returned"
+
     @staticmethod
     def _optional_string(value: object) -> Optional[str]:
         if value is None:
@@ -235,6 +316,8 @@ def build_kill_feed_service(api_client: HLLAPIClient, http_client_factory) -> Ki
     poll_interval_seconds = float(os.getenv("KILL_FEED_POLL_INTERVAL_SECONDS", "1.0"))
     max_events = int(os.getenv("KILL_FEED_MAX_EVENTS", "25"))
     recent_log_window = int(os.getenv("KILL_FEED_RECENT_LOG_WINDOW", "50"))
+    failure_backoff_initial_seconds = float(os.getenv("KILL_FEED_FAILURE_BACKOFF_INITIAL_SECONDS", "5.0"))
+    failure_backoff_max_seconds = float(os.getenv("KILL_FEED_FAILURE_BACKOFF_MAX_SECONDS", "60.0"))
 
     return KillFeedService(
         api_client=api_client,
@@ -242,4 +325,6 @@ def build_kill_feed_service(api_client: HLLAPIClient, http_client_factory) -> Ki
         poll_interval_seconds=poll_interval_seconds,
         max_events=max_events,
         recent_log_window=recent_log_window,
+        failure_backoff_initial_seconds=failure_backoff_initial_seconds,
+        failure_backoff_max_seconds=failure_backoff_max_seconds,
     )

@@ -107,6 +107,8 @@ The same process also exposes an OBS-ready kill feed overlay:
 
 On Railway the web server will bind to `PORT` automatically. Locally you can set `KILL_FEED_PORT` (default `8080`).
 
+If CRCON returns repeated `get_recent_logs` 500 errors, the kill-feed poller backs off per server instead of retrying every second. Tune this with `KILL_FEED_FAILURE_BACKOFF_INITIAL_SECONDS` and `KILL_FEED_FAILURE_BACKOFF_MAX_SECONDS`.
+
 ## Troubleshooting
 
 - **Bot offline:** Check tmux session with `tmux attach-session -t hll-bot`
