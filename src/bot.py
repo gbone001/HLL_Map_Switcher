@@ -1,5 +1,4 @@
 import asyncio
-import logging
 import os
 from datetime import datetime, timedelta, timezone
 from typing import Dict, Optional, Tuple
@@ -7,8 +6,6 @@ from typing import Dict, Optional, Tuple
 import discord
 from discord.ext import commands
 from dotenv import load_dotenv
-from services.kill_feed import KillFeedService, build_kill_feed_service
-from services.overlay_web import KillFeedWebServer, build_kill_feed_web_server
 from services.server_control import GameStatus, ServerControlService
 from utils.map_data import (
     get_maps_for_mode,
@@ -20,8 +17,6 @@ from utils.crcon_http import CRCONHttpClient, CRCONHTTPError
 
 # Load environment variables
 load_dotenv()
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
 
 # Bot configuration
 intents = discord.Intents.default()
@@ -97,9 +92,6 @@ _persistent_focused_server: Dict[int, Optional[int]] = {}
 _current_objectives_state: Dict[Tuple[int, str], list[str]] = {}
 # Map (server_index, map_id) -> dynamic weather state last set through this bot
 _dynamic_weather_state: Dict[Tuple[int, str], bool] = {}
-kill_feed_service: Optional[KillFeedService] = None
-kill_feed_web_server: Optional[KillFeedWebServer] = None
-_kill_feed_started = False
 
 
 def _format_time_remaining(time_remaining: Optional[float], raw_time: Optional[str]) -> str:
@@ -1651,23 +1643,11 @@ class BackToMapSelectionButton(discord.ui.Button):
 
 @bot.event
 async def on_ready():
-    global kill_feed_service
-    global kill_feed_web_server
-    global _kill_feed_started
-
     print(f'{bot.user} has connected to Discord!')
     print(f'Bot is in {len(bot.guilds)} guilds')
 
     # Warm cache when available, but avoid noisy startup warnings if CRCON isn't reachable yet.
     refresh_map_cache(force=False)
-
-    if not _kill_feed_started:
-        kill_feed_service = build_kill_feed_service(api_client, _get_http_client)
-        kill_feed_web_server = build_kill_feed_web_server(kill_feed_service)
-        await kill_feed_service.start()
-        await kill_feed_web_server.start()
-        _kill_feed_started = True
-        logger.info("Kill feed available at /overlay and /api/kill-feed")
     
     # Add the persistent view
     bot.add_view(GameModeView())
