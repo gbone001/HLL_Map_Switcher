@@ -1,4 +1,5 @@
 import os
+import re
 from dataclasses import dataclass
 import time
 from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
@@ -109,7 +110,7 @@ class CRCONHttpClient:
             response = self.session.get(url, headers=self._auth_headers(), timeout=self.timeout)
 
         if response.status_code != 200:
-            raise CRCONHTTPError(f"get_maps failed with status {response.status_code}: {response.text}")
+            raise CRCONHTTPError(self._status_error_message("get_maps", response))
 
         return self._parse_json(response)
 
@@ -127,7 +128,7 @@ class CRCONHttpClient:
             response = self.session.get(url, headers=self._auth_headers(), timeout=self.timeout)
 
         if response.status_code != 200:
-            raise CRCONHTTPError(f"get_objective_rows failed with status {response.status_code}: {response.text}")
+            raise CRCONHTTPError(self._status_error_message("get_objective_rows", response))
 
         payload = self._parse_json(response)
         rows = payload.get("result")
@@ -157,7 +158,7 @@ class CRCONHttpClient:
             response = self.session.get(url, headers=self._auth_headers(), timeout=self.timeout)
 
         if response.status_code != 200:
-            raise CRCONHTTPError(f"get_gamestate failed with status {response.status_code}: {response.text}")
+            raise CRCONHTTPError(self._status_error_message("get_gamestate", response))
 
         payload = self._parse_json(response)
         if isinstance(payload, dict) and payload.get("failed"):
@@ -191,7 +192,7 @@ class CRCONHttpClient:
             )
 
         if response.status_code != 200:
-            raise CRCONHTTPError(f"set_map failed with status {response.status_code}: {response.text}")
+            raise CRCONHTTPError(self._status_error_message("set_map", response))
 
         return self._parse_json(response)
 
@@ -228,7 +229,7 @@ class CRCONHttpClient:
             )
 
         if response.status_code != 200:
-            raise CRCONHTTPError(f"set_game_layout failed with status {response.status_code}: {response.text}")
+            raise CRCONHTTPError(self._status_error_message("set_game_layout", response))
 
         payload = self._parse_json(response)
         if payload.get("failed"):
@@ -264,9 +265,7 @@ class CRCONHttpClient:
             )
 
         if response.status_code != 200:
-            raise CRCONHTTPError(
-                f"set_dynamic_weather_enabled failed with status {response.status_code}: {response.text}"
-            )
+            raise CRCONHTTPError(self._status_error_message("set_dynamic_weather_enabled", response))
 
         payload = self._parse_json(response)
         if isinstance(payload, dict) and payload.get("failed"):
@@ -287,9 +286,7 @@ class CRCONHttpClient:
             response = self.session.get(url, headers=self._auth_headers(), timeout=self.timeout)
 
         if response.status_code != 200:
-            raise CRCONHTTPError(
-                f"get_team_switch_cooldown failed with status {response.status_code}: {response.text}"
-            )
+            raise CRCONHTTPError(self._status_error_message("get_team_switch_cooldown", response))
 
         payload = self._parse_json(response)
         if isinstance(payload, dict) and payload.get("failed"):
@@ -339,9 +336,7 @@ class CRCONHttpClient:
                 }
 
         if response.status_code != 200:
-            raise CRCONHTTPError(
-                f"set_team_switch_cooldown failed with status {response.status_code}: {response.text}"
-            )
+            raise CRCONHTTPError(self._status_error_message("set_team_switch_cooldown", response))
 
         result = self._parse_json(response)
         if isinstance(result, dict) and result.get("failed"):
@@ -377,7 +372,7 @@ class CRCONHttpClient:
             )
 
         if response.status_code != 200:
-            raise CRCONHTTPError(f"set_match_timer failed with status {response.status_code}: {response.text}")
+            raise CRCONHTTPError(self._status_error_message("set_match_timer", response))
 
         result = self._parse_json(response)
         if isinstance(result, dict) and result.get("failed"):
@@ -413,7 +408,7 @@ class CRCONHttpClient:
             )
 
         if response.status_code != 200:
-            raise CRCONHTTPError(f"set_warmup_timer failed with status {response.status_code}: {response.text}")
+            raise CRCONHTTPError(self._status_error_message("set_warmup_timer", response))
 
         result = self._parse_json(response)
         if isinstance(result, dict) and result.get("failed"):
@@ -450,7 +445,7 @@ class CRCONHttpClient:
             )
 
         if response.status_code != 200:
-            raise CRCONHTTPError(f"add_admin failed with status {response.status_code}: {response.text}")
+            raise CRCONHTTPError(self._status_error_message("add_admin", response))
 
         result = self._parse_json(response)
         if isinstance(result, dict) and result.get("failed"):
@@ -472,7 +467,7 @@ class CRCONHttpClient:
             response = self.session.get(url, headers=self._auth_headers(), timeout=self.timeout)
 
         if response.status_code != 200:
-            raise CRCONHTTPError(f"get_admin_ids failed with status {response.status_code}: {response.text}")
+            raise CRCONHTTPError(self._status_error_message("get_admin_ids", response))
 
         payload = self._parse_json(response)
         if payload.get("failed"):
@@ -510,7 +505,7 @@ class CRCONHttpClient:
             )
 
         if response.status_code != 200:
-            raise CRCONHTTPError(f"remove_admin failed with status {response.status_code}: {response.text}")
+            raise CRCONHTTPError(self._status_error_message("remove_admin", response))
 
         result = self._parse_json(response)
         if isinstance(result, dict) and result.get("failed"):
@@ -531,9 +526,32 @@ class CRCONHttpClient:
         try:
             data = response.json()
         except ValueError as exc:
-            raise CRCONHTTPError(f"Failed to parse JSON response: {response.text}") from exc
+            response_summary = CRCONHttpClient._summarize_response_text(response.text)
+            raise CRCONHTTPError(f"Failed to parse JSON response: {response_summary}") from exc
 
         if isinstance(data, dict):
             return data
 
         raise CRCONHTTPError("Unexpected response format; expected JSON object.")
+
+    @staticmethod
+    def _status_error_message(operation: str, response: requests.Response) -> str:
+        response_summary = CRCONHttpClient._summarize_response_text(response.text)
+        return f"{operation} failed with status {response.status_code}: {response_summary}"
+
+    @staticmethod
+    def _summarize_response_text(response_text: str) -> str:
+        text = re.sub(r"\s+", " ", response_text or "").strip()
+        if not text:
+            return "empty response body"
+
+        if "<html" not in text.lower():
+            return text
+
+        title_match = re.search(r"<title>\s*(.*?)\s*</title>", text, flags=re.IGNORECASE)
+        heading_match = re.search(r"<h1>\s*(.*?)\s*</h1>", text, flags=re.IGNORECASE)
+        html_summary_match = title_match or heading_match
+        if html_summary_match:
+            return f"HTML error page: {html_summary_match.group(1).strip()}"
+
+        return "HTML error page returned"
