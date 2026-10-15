@@ -11,7 +11,7 @@
 ## Live Service Modules
 - `src/utils/crcon_http.py` -> authoritative CRCON HTTP client. Handles token auth, gamestate, map changes, objective layout changes, dynamic weather, timer updates, and admin access operations.
 - `src/utils/hll_rcon.py` -> direct Hell Let Loose RCON v2 client for TCP fallback when CRCON HTTP is unavailable.
-- `src/utils/api_client.py` -> server discovery and lightweight CRCON-backed server metadata wrapper used by the Discord layer.
+- `src/utils/api_client.py` -> server discovery and lightweight CRCON-backed server metadata wrapper used by the Discord layer, including the stable server key (`get_server_key`) bookings are stored against.
 - `src/utils/map_data.py` -> CRCON map catalog loading, normalization, cache file persistence, and fallback map data.
 - `src/services/server_control.py` -> HTTP-first control service with direct RCON fallback for status reads, map changes, sector layout changes, dynamic weather, and timer updates.
 - `src/services/booking.py` -> server booking store (SQLite in `data/bookings.db`), overlap checks, time parsing, and the booking-lock decision (`blocking_booking`). No Discord or CRCON dependencies.
@@ -26,7 +26,7 @@
 ## Discord Controls In Production
 - Slash commands:
 - `/repost_button` -> reposts the persistent control panel for admins.
-- `/book`, `/bookings`, `/cancel_booking` -> server booking (enabled only when `BOOKING_ROLE_ID` is set). See `docs/booking-shaping.md`.
+- `/book`, `/bookings`, `/cancel_booking` -> server booking (enabled only when `BOOKING_ROLE_ID` and `DISCORD_GUILD_ID` are set; roles and admin rights count only inside `DISCORD_GUILD_ID`). See `docs/booking-shaping.md`.
 - Persistent panel actions:
 - `Change Server`
 - `Refresh Status`

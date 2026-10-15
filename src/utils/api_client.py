@@ -119,6 +119,21 @@ class HLLAPIClient:
             return self.servers[server_index].server_number
         return None
 
+    def get_server_key(self, server_index: int) -> str:
+        """Stable identity for a configured server: 'server{N}' from SERVER{N}_*, or 'default'.
+
+        Unlike server_index (a position in the configured list), this survives reordering and
+        is what bookings are stored against.
+        """
+        server_number = self.get_server_number(server_index)
+        return f"server{server_number}" if server_number is not None else "default"
+
+    def get_server_name_for_key(self, server_key: str) -> str:
+        for index, server in enumerate(self.servers):
+            if self.get_server_key(index) == server_key:
+                return server.name
+        return server_key
+
     def get_current_map(self, server_index: int) -> str:
             try:
                 client = self._client_for_index(server_index)

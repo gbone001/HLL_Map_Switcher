@@ -75,6 +75,19 @@ class CreateAndListTests(BookingServiceTestCase):
         self.assertEqual([b.id for b in live], [kept.id])
         self.assertNotIn(ended.id, [b.id for b in live])
 
+    def test_max_duration_and_horizon(self):
+        limited = BookingService(self.db_path, clock=self.clock, max_duration_seconds=4 * HOUR,
+                                 max_lead_seconds=7 * 86400)
+
+        with self.assertRaises(BookingError) as too_long:
+            limited.create("server1", 1, "u", T0 + HOUR, T0 + 6 * HOUR)
+        with self.assertRaises(BookingError) as too_far:
+            limited.create("server1", 1, "u", T0 + 8 * 86400, T0 + 8 * 86400 + HOUR)
+        limited.create("server1", 1, "u", T0 + HOUR, T0 + 5 * HOUR)  # exactly the limit is allowed
+
+        self.assertIn("4 hours", str(too_long.exception))
+        self.assertIn("7 days", str(too_far.exception))
+
     def test_rejects_past_start_and_non_positive_length(self):
         with self.assertRaises(BookingError):
             self.service.create("server1", 1, "u", T0 - 2 * HOUR, T0 - HOUR)
@@ -142,6 +155,18 @@ class ActiveAndLockTests(BookingServiceTestCase):
         self.clock.ts = T0 + HOUR  # end is exclusive
         self.assertIsNone(self.service.active_for("server1"))
 
+    def test_summary_by_server_returns_active_and_next(self):
+        current = self.book(0, 1, user_id=1, server_key="server1")
+        upcoming = self.book(2, 1, user_id=2, server_key="server1")
+        later = self.book(5, 1, user_id=3, server_key="server1")
+        other = self.book(3, 1, user_id=4, server_key="server2")
+
+        summary = self.service.summary_by_server()
+
+        self.assertEqual((summary["server1"][0].id, summary["server1"][1].id), (current.id, upcoming.id))
+        self.assertEqual((summary["server2"][0], summary["server2"][1].id), (None, other.id))
+        self.assertNotIn(later.id, [b.id for pair in summary.values() for b in pair if b])
+
     def test_blocking_booking_rules(self):
         booking = self.book(0, 1, user_id=1)
 
@@ -204,6 +229,17 @@ class ParsingTests(unittest.TestCase):
         self.assertEqual(datetime.fromtimestamp(winter, timezone.utc).hour, 9)
         self.assertEqual(datetime.fromtimestamp(summer, timezone.utc).hour, 8)
 
+    def test_parse_start_rejects_dst_gap_and_ambiguous_times(self):
+        sydney = ZoneInfo("Australia/Sydney")
+        with self.assertRaises(BookingError) as gap:
+            parse_start("2026-10-04 02:30", sydney)  # clocks jump 02:00 -> 03:00
+        with self.assertRaises(BookingError) as overlap:
+            parse_start("2026-04-05 02:30", sydney)  # 02:00-03:00 happens twice
+
+        self.assertIn("doesn't exist", str(gap.exception))
+        self.assertIn("happens twice", str(overlap.exception))
+        parse_start("2026-10-04 03:30", sydney)  # just after the gap is fine
+
     def test_parse_start_rejects_bad_format(self):
         for text in ("tomorrow 7pm", "2026-13-01 19:00", "19:00"):
             with self.assertRaises(BookingError):
@@ -221,25 +257,40 @@ class ParsingTests(unittest.TestCase):
 
 class ConfigTests(unittest.TestCase):
     def test_disabled_without_role(self):
-        config = BookingConfig.from_env({})
+        config = BookingConfig.from_env({"DISCORD_GUILD_ID": "1"})
 
         self.assertFalse(config.enabled)
         self.assertIn("BOOKING_ROLE_ID", config.disabled_reason)
 
     def test_disabled_with_invalid_time_zone(self):
-        config = BookingConfig.from_env({"BOOKING_ROLE_ID": "123", "BOOKING_TIMEZONE": "Mars/Base"})
+        config = BookingConfig.from_env(
+            {"BOOKING_ROLE_ID": "123", "BOOKING_TIMEZONE": "Mars/Base", "DISCORD_GUILD_ID": "1"}
+        )
 
         self.assertFalse(config.enabled)
         self.assertIn("BOOKING_TIMEZONE", config.disabled_reason)
 
+    def test_disabled_without_guild(self):
+        config = BookingConfig.from_env({"BOOKING_ROLE_ID": "123"})
+
+        self.assertFalse(config.enabled)
+        self.assertIn("DISCORD_GUILD_ID", config.disabled_reason)
+
     def test_enabled_config(self):
-        config = BookingConfig.from_env(
-            {"BOOKING_ROLE_ID": "123", "BOOKING_ADMIN_ROLE_ID": "456", "BOOKING_TIMEZONE": "Australia/Sydney"}
-        )
+        config = BookingConfig.from_env({
+            "BOOKING_ROLE_ID": "123", "BOOKING_ADMIN_ROLE_ID": "456", "BOOKING_TIMEZONE": "Australia/Sydney",
+            "DISCORD_GUILD_ID": "999", "BOOKING_MAX_HOURS": "6", "BOOKING_MAX_DAYS_AHEAD": "14",
+        })
 
         self.assertTrue(config.enabled)
-        self.assertEqual((config.role_id, config.admin_role_id), (123, 456))
+        self.assertEqual((config.role_id, config.admin_role_id, config.guild_id), (123, 456, 999))
         self.assertEqual(config.timezone.key, "Australia/Sydney")
+        self.assertEqual((config.max_duration_seconds, config.max_lead_seconds), (6 * HOUR, 14 * 86400))
+
+    def test_limit_defaults_and_bad_values(self):
+        config = BookingConfig.from_env({"BOOKING_ROLE_ID": "1", "DISCORD_GUILD_ID": "1", "BOOKING_MAX_HOURS": "-3"})
+
+        self.assertEqual((config.max_duration_seconds, config.max_lead_seconds), (24 * HOUR, 90 * 86400))
 
 
 if __name__ == "__main__":

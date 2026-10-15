@@ -25,7 +25,9 @@ from services.booking import (
 )
 
 NOT_CONFIGURED_MESSAGE = "Server booking is not configured on this bot."
-MAX_LISTED_BOOKINGS = 20
+WRONG_GUILD_MESSAGE = "Server booking is only available in this bot's home Discord."
+# Discord rejects messages over 2000 characters; leave room for the "…and N more." line.
+MAX_REPLY_CHARS = 1900
 
 
 @dataclass
@@ -38,9 +40,17 @@ class BookingCommandDeps:
     on_change: Callable[[], Awaitable[None]]
 
 
+def _member_of_booking_guild(user: object, config: BookingConfig) -> bool:
+    return (
+        isinstance(user, discord.Member)
+        and config.guild_id is not None
+        and getattr(user.guild, "id", None) == config.guild_id
+    )
+
+
 def is_booking_admin(user: object, config: BookingConfig) -> bool:
-    """Discord Administrator permission, or the configured BOOKING_ADMIN_ROLE_ID."""
-    if not isinstance(user, discord.Member):
+    """Administrator permission or BOOKING_ADMIN_ROLE_ID, counted only inside DISCORD_GUILD_ID."""
+    if not _member_of_booking_guild(user, config):
         return False
     if user.guild_permissions.administrator:
         return True
@@ -50,9 +60,23 @@ def is_booking_admin(user: object, config: BookingConfig) -> bool:
 def can_book(user: object, config: BookingConfig) -> bool:
     if is_booking_admin(user, config):
         return True
-    if not isinstance(user, discord.Member) or config.role_id is None:
+    if not _member_of_booking_guild(user, config) or config.role_id is None:
         return False
     return any(role.id == config.role_id for role in user.roles)
+
+
+def fit_lines(lines: list[str], limit: int = MAX_REPLY_CHARS) -> str:
+    """Join lines, stopping before the Discord message limit and noting how many were left out."""
+    kept: list[str] = []
+    used = 0
+    for line in lines:
+        if used + len(line) + 1 > limit:
+            break
+        kept.append(line)
+        used += len(line) + 1
+    if len(kept) < len(lines):
+        kept.append(f"…and {len(lines) - len(kept)} more.")
+    return "\n".join(kept)
 
 
 def timestamp(ts: int, style: str = "F") -> str:
@@ -70,6 +94,17 @@ async def _reply(interaction: discord.Interaction, content: str) -> None:
     await interaction.response.send_message(content, ephemeral=True, allowed_mentions=discord.AllowedMentions.none())
 
 
+async def _refuse_unavailable(interaction: discord.Interaction, deps: "BookingCommandDeps") -> bool:
+    """Reply and return True when booking is off or the command came from another guild or a DM."""
+    if deps.service is None or not deps.config.enabled:
+        await _reply(interaction, NOT_CONFIGURED_MESSAGE)
+        return True
+    if interaction.guild_id != deps.config.guild_id:
+        await _reply(interaction, WRONG_GUILD_MESSAGE)
+        return True
+    return False
+
+
 def register_booking_commands(tree: app_commands.CommandTree, deps: BookingCommandDeps) -> None:
     server_choices = [
         app_commands.Choice(name=name[:100], value=str(index)) for index, name in deps.servers()[:25]
@@ -83,8 +118,7 @@ def register_booking_commands(tree: app_commands.CommandTree, deps: BookingComma
     )
     @app_commands.choices(server=server_choices)
     async def book(interaction: discord.Interaction, server: app_commands.Choice[str], start: str, duration: str):
-        if deps.service is None or not deps.config.enabled:
-            await _reply(interaction, NOT_CONFIGURED_MESSAGE)
+        if await _refuse_unavailable(interaction, deps):
             return
         if not can_book(interaction.user, deps.config):
             role = f"<@&{deps.config.role_id}>" if deps.config.role_id else "the booking"
@@ -129,24 +163,20 @@ def register_booking_commands(tree: app_commands.CommandTree, deps: BookingComma
     @app_commands.describe(server="Only show bookings for this server")
     @app_commands.choices(server=server_choices)
     async def bookings(interaction: discord.Interaction, server: Optional[app_commands.Choice[str]] = None):
-        if deps.service is None or not deps.config.enabled:
-            await _reply(interaction, NOT_CONFIGURED_MESSAGE)
+        if await _refuse_unavailable(interaction, deps):
             return
         server_key = deps.server_key(int(server.value)) if server else None
         live = deps.service.list_live(server_key)
         if not live:
             await _reply(interaction, "No active or upcoming bookings.")
             return
-        lines = [describe_booking(b, deps.server_name_for_key(b.server_key)) for b in live[:MAX_LISTED_BOOKINGS]]
-        if len(live) > MAX_LISTED_BOOKINGS:
-            lines.append(f"…and {len(live) - MAX_LISTED_BOOKINGS} more.")
-        await _reply(interaction, "\n".join(lines))
+        lines = [describe_booking(b, deps.server_name_for_key(b.server_key)) for b in live]
+        await _reply(interaction, fit_lines(lines))
 
     @tree.command(name="cancel_booking", description="Cancel one of your bookings (admins can cancel any)")
     @app_commands.describe(booking_id="Booking to cancel")
     async def cancel_booking(interaction: discord.Interaction, booking_id: int):
-        if deps.service is None or not deps.config.enabled:
-            await _reply(interaction, NOT_CONFIGURED_MESSAGE)
+        if await _refuse_unavailable(interaction, deps):
             return
         try:
             booking = deps.service.cancel(
@@ -163,7 +193,7 @@ def register_booking_commands(tree: app_commands.CommandTree, deps: BookingComma
 
     @cancel_booking.autocomplete("booking_id")
     async def cancel_booking_autocomplete(interaction: discord.Interaction, current: str):
-        if deps.service is None or not deps.config.enabled:
+        if deps.service is None or not deps.config.enabled or interaction.guild_id != deps.config.guild_id:
             return []
         admin = is_booking_admin(interaction.user, deps.config)
         choices = []

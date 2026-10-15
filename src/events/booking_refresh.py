@@ -7,7 +7,7 @@ tick, so an idle bot does not edit the panel every minute.
 from __future__ import annotations
 
 import logging
-from typing import Awaitable, Callable, Optional
+from typing import Awaitable, Callable
 
 from discord.ext import tasks
 
@@ -29,21 +29,25 @@ class BookingBoundaryRefresher:
         self._loop = tasks.loop(seconds=interval_seconds)(self.tick)
 
     async def tick(self) -> bool:
-        """Refresh the panel if a booking started or ended since the previous tick."""
+        """Refresh the panel if a booking started or ended since the last successful tick.
+
+        The window only advances once the check (and any refresh) succeeds, so a transient
+        database or Discord error is retried on the next tick instead of losing the boundary.
+        """
         now = self.service.now_ts()
-        since, self._last_tick_ts = self._last_tick_ts, now
         try:
-            crossed = self.service.has_boundary_between(since, now)
+            crossed = self.service.has_boundary_between(self._last_tick_ts, now)
         except Exception:
-            logger.exception("Booking boundary check failed")
+            logger.exception("Booking boundary check failed; will retry")
             return False
-        if not crossed:
-            return False
-        try:
-            await self.refresh()
-        except Exception:
-            logger.exception("Panel refresh after booking boundary failed")
-        return True
+        if crossed:
+            try:
+                await self.refresh()
+            except Exception:
+                logger.exception("Panel refresh after booking boundary failed; will retry")
+                return False
+        self._last_tick_ts = now
+        return crossed
 
     def start(self) -> None:
         if not self._loop.is_running():
@@ -55,9 +59,3 @@ class BookingBoundaryRefresher:
         if self._loop.is_running():
             self._loop.cancel()
 
-
-def create_refresher(
-    service: Optional[BookingService],
-    refresh: Callable[[], Awaitable[None]],
-) -> Optional[BookingBoundaryRefresher]:
-    return BookingBoundaryRefresher(service, refresh) if service is not None else None

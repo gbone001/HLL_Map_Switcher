@@ -8,7 +8,7 @@ import discord
 from discord.ext import commands
 from dotenv import load_dotenv
 from commands.booking import BookingCommandDeps, is_booking_admin, register_booking_commands
-from events.booking_refresh import create_refresher
+from events.booking_refresh import BookingBoundaryRefresher
 from services.booking import Booking, BookingConfig, BookingService
 from services.server_control import ControlResult, GameStatus, ServerControlService
 from utils.map_data import (
@@ -130,7 +130,11 @@ booking_config = BookingConfig.from_env()
 booking_service: Optional[BookingService] = None
 if booking_config.enabled:
     try:
-        booking_service = BookingService(booking_config.db_path)
+        booking_service = BookingService(
+            booking_config.db_path,
+            max_duration_seconds=booking_config.max_duration_seconds,
+            max_lead_seconds=booking_config.max_lead_seconds,
+        )
         print(f"Server booking enabled (store: {booking_config.db_path}, time zone: {booking_config.timezone.key}).")
     except Exception as exc:
         print(f"Server booking disabled: could not open {booking_config.db_path}: {exc}")
@@ -138,24 +142,12 @@ else:
     print(f"Server booking disabled: {booking_config.disabled_reason}")
 
 
-def _booking_server_key(server_index: int) -> str:
-    """Stable booking key: the SERVER{N} number, not the position-based server_index."""
-    server_number = api_client.get_server_number(server_index)
-    return f"server{server_number}" if server_number is not None else "default"
-
-
-def _server_name_for_booking_key(server_key: str) -> str:
-    for index, name in api_client.get_servers():
-        if _booking_server_key(index) == server_key:
-            return name
-    return server_key
-
-
-def _booking_blocking_user(interaction: discord.Interaction, server_index: int) -> Optional[Booking]:
+async def _booking_blocking_user(interaction: discord.Interaction, server_index: int) -> Optional[Booking]:
     if booking_service is None:
         return None
-    return booking_service.blocking_booking(
-        _booking_server_key(server_index),
+    return await asyncio.to_thread(
+        booking_service.blocking_booking,
+        api_client.get_server_key(server_index),
         interaction.user.id,
         is_booking_admin(interaction.user, booking_config),
     )
@@ -167,7 +159,7 @@ async def _deny_if_booked(interaction: discord.Interaction, server_index: int, *
     Called right before each write rather than when a flow opens, so a flow opened before a
     booking starts cannot finish during it.
     """
-    blocking = _booking_blocking_user(interaction, server_index)
+    blocking = await _booking_blocking_user(interaction, server_index)
     if blocking is None:
         return False
 
@@ -517,15 +509,14 @@ def _panel_booking_lines() -> Dict[int, list[str]]:
         return {}
     lines: Dict[int, list[str]] = {}
     try:
+        summary = booking_service.summary_by_server()
         for index, _ in api_client.get_servers():
-            key = _booking_server_key(index)
-            active = booking_service.active_for(key)
+            active, upcoming = summary.get(api_client.get_server_key(index), (None, None))
             if active is not None:
                 lines[index] = [
                     f"   🔒 Booked by <@{active.user_id}> until <t:{active.end_utc}:t> (<t:{active.end_utc}:R>)"
                 ]
                 continue
-            upcoming = booking_service.next_for(key)
             if upcoming is not None:
                 lines[index] = [
                     f"   📅 Next booking: <@{upcoming.user_id}> <t:{upcoming.start_utc}:f> (<t:{upcoming.start_utc}:R>)"
@@ -537,8 +528,11 @@ def _panel_booking_lines() -> Dict[int, list[str]]:
 
 
 async def build_panel(focused_server_index: Optional[int] = None) -> Tuple[discord.Embed, "GameModeView"]:
-    statuses = await fetch_server_statuses()
-    embed = build_main_embed(focused_server_index, statuses, _panel_booking_lines())
+    statuses, booking_lines = await asyncio.gather(
+        fetch_server_statuses(),
+        asyncio.to_thread(_panel_booking_lines),
+    )
+    embed = build_main_embed(focused_server_index, statuses, booking_lines)
     crcon_outage, _ = _panel_crcon_outage_state(statuses, focused_server_index)
     view = GameModeView(focused_server_index=focused_server_index, crcon_outage=crcon_outage)
     return embed, view
@@ -2154,12 +2148,14 @@ register_booking_commands(
         service=booking_service,
         config=booking_config,
         servers=api_client.get_servers,
-        server_key=_booking_server_key,
-        server_name_for_key=_server_name_for_booking_key,
+        server_key=api_client.get_server_key,
+        server_name_for_key=api_client.get_server_name_for_key,
         on_change=lambda: refresh_main_embed(),
     ),
 )
-booking_refresher = create_refresher(booking_service, lambda: refresh_main_embed())
+booking_refresher = (
+    BookingBoundaryRefresher(booking_service, lambda: refresh_main_embed()) if booking_service else None
+)
 
 
 if __name__ == '__main__':

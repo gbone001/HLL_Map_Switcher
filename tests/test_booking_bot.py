@@ -31,15 +31,21 @@ with mock.patch.dict(
 
 BOOKER_ID, OTHER_ID, ADMIN_ID = 1001, 1002, 1003
 BOOKING_ROLE, ADMIN_ROLE = 555, 777
-ENABLED_CONFIG = BookingConfig.from_env({"BOOKING_ROLE_ID": str(BOOKING_ROLE), "BOOKING_ADMIN_ROLE_ID": str(ADMIN_ROLE)})
+HOME_GUILD, OTHER_GUILD = 4242, 9999
+ENABLED_CONFIG = BookingConfig.from_env({
+    "BOOKING_ROLE_ID": str(BOOKING_ROLE),
+    "BOOKING_ADMIN_ROLE_ID": str(ADMIN_ROLE),
+    "DISCORD_GUILD_ID": str(HOME_GUILD),
+})
 
 
-def member(user_id: int, *, role_ids=(), administrator=False):
+def member(user_id: int, *, role_ids=(), administrator=False, guild_id=HOME_GUILD):
     user = mock.MagicMock(spec=discord.Member)
     user.id = user_id
     user.display_name = f"user{user_id}"
     user.roles = [SimpleNamespace(id=role_id) for role_id in role_ids]
     user.guild_permissions = SimpleNamespace(administrator=administrator)
+    user.guild = SimpleNamespace(id=guild_id)
     return user
 
 
@@ -67,6 +73,7 @@ class FakeResponse:
 def interaction_for(user):
     interaction = mock.MagicMock()
     interaction.user = user
+    interaction.guild_id = getattr(getattr(user, "guild", None), "id", None)
     interaction.response = FakeResponse()
     interaction.followup.send = mock.AsyncMock(return_value=None)
     interaction.edit_original_response = mock.AsyncMock()
@@ -86,7 +93,7 @@ class BookingBotTestCase(unittest.IsolatedAsyncioTestCase):
         for patcher in patches:
             patcher.start()
             self.addCleanup(patcher.stop)
-        self.server_key = bot._booking_server_key(0)
+        self.server_key = bot.api_client.get_server_key(0)
 
     def tearDown(self):
         self._tmp.cleanup()
@@ -124,6 +131,15 @@ class GuardAtWriteSiteTests(BookingBotTestCase):
         ):
             _, write = await self.submit_cooldown(user)
             write.assert_called_once()
+
+    async def test_other_guild_administrator_does_not_bypass_lock(self):
+        self.book_now()
+
+        _, write = await self.submit_cooldown(
+            member(ADMIN_ID, administrator=True, role_ids=[ADMIN_ROLE], guild_id=OTHER_GUILD)
+        )
+
+        write.assert_not_called()
 
     async def test_no_active_booking_allows_anyone(self):
         self.service.create(self.server_key, BOOKER_ID, "booker", T0 + HOUR, T0 + 2 * HOUR)
@@ -222,6 +238,34 @@ class CommandTests(BookingBotTestCase):
         await self.tree.get_command("bookings").callback(listing, server=None)
         self.assertIn("<t:", listing.response.sent[-1])
 
+    async def test_commands_refused_from_other_guild_or_dm(self):
+        foreign_admin = member(ADMIN_ID, administrator=True, guild_id=OTHER_GUILD)
+        reply = await self.run_book(foreign_admin)
+        self.assertIn("home Discord", reply)
+
+        booking = self.service.create("server1", BOOKER_ID, "booker", T0 + HOUR, T0 + 2 * HOUR)
+        cancel = interaction_for(foreign_admin)
+        await self.tree.get_command("cancel_booking").callback(cancel, booking_id=booking.id)
+        self.assertIn("home Discord", cancel.response.sent[-1])
+        self.assertEqual(len(self.service.list_live()), 1)
+
+        dm = interaction_for(mock.MagicMock(spec=discord.User))
+        dm.guild_id = None
+        await self.tree.get_command("bookings").callback(dm, server=None)
+        self.assertIn("home Discord", dm.response.sent[-1])
+
+    async def test_bookings_reply_stays_under_discord_limit(self):
+        for hour in range(30):
+            self.service.create(f"server{hour}", 123456789012345678, "booker",
+                                T0 + hour * HOUR, T0 + (hour + 1) * HOUR)
+        listing = interaction_for(member(OTHER_ID))
+
+        await self.tree.get_command("bookings").callback(listing, server=None)
+
+        reply = listing.response.sent[-1]
+        self.assertLessEqual(len(reply), 2000)
+        self.assertRegex(reply, r"…and \d+ more\.$")
+
     async def test_book_requires_role(self):
         reply = await self.run_book(member(OTHER_ID))
 
@@ -284,6 +328,21 @@ class PanelAndRefreshTests(BookingBotTestCase):
         embed = bot.build_main_embed(None, statuses, bot._panel_booking_lines())
 
         self.assertIn("Booked by", embed.description)
+
+    async def test_refresher_retries_after_failed_check_or_refresh(self):
+        refresh = mock.AsyncMock(side_effect=[RuntimeError("discord 503"), None])
+        self.service.create("server1", BOOKER_ID, "booker", T0 + 90, T0 + HOUR)
+        refresher = BookingBoundaryRefresher(self.service, refresh)
+
+        self.clock.ts = T0 + 120
+        with mock.patch.object(self.service, "has_boundary_between", side_effect=RuntimeError("db locked")):
+            self.assertFalse(await refresher.tick())  # check failed: window kept
+        self.assertFalse(await refresher.tick())      # refresh failed: window kept
+        self.clock.ts = T0 + 180
+        self.assertTrue(await refresher.tick())       # same boundary retried and refreshed
+        self.assertFalse(await refresher.tick())
+
+        self.assertEqual(refresh.await_count, 2)
 
     async def test_refresher_only_refreshes_when_a_boundary_passes(self):
         refresh = mock.AsyncMock()
