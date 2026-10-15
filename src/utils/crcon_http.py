@@ -551,8 +551,28 @@ class CRCONHttpClient:
 
     @staticmethod
     def _status_error_message(operation: str, response: requests.Response) -> str:
-        response_summary = CRCONHttpClient._summarize_response_text(response.text)
+        crcon_error = CRCONHttpClient._crcon_envelope_error(response)
+        response_summary = crcon_error or CRCONHttpClient._summarize_response_text(response.text)
         return f"{operation} failed with status {response.status_code}: {response_summary}"
+
+    @staticmethod
+    def _crcon_envelope_error(response: requests.Response) -> Optional[str]:
+        """Pull the `error` field out of CRCON's JSON envelope.
+
+        CRCON answers failed commands (and 401/403 auth failures) with
+        {"result", "command", "arguments", "failed", "error", ...}; only the
+        error text is useful to an admin.
+        """
+        try:
+            data = response.json()
+        except ValueError:
+            return None
+        if not isinstance(data, dict):
+            return None
+        error = data.get("error")
+        if error in (None, "", [], {}):
+            return None
+        return error if isinstance(error, str) else str(error)
 
     @staticmethod
     def _summarize_response_text(response_text: str) -> str:

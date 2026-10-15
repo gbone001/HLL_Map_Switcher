@@ -62,6 +62,33 @@ class CRCONHttpClientTests(unittest.TestCase):
         self.assertEqual(str(context.exception), "Failed to parse JSON response: HTML error page: Login Required")
 
 
+class CRCONEnvelopeErrorTests(unittest.TestCase):
+    """CRCON v12 returns HTTP 400 + {"failed": true, "error": ...} when a command fails."""
+
+    def test_status_error_uses_crcon_error_field(self):
+        body = (
+            '{"result": null, "command": "set_map", "arguments": {"map_name": "nope"}, '
+            '"failed": true, "error": "Unknown map nope", "forward_results": null, "version": "v12.3.0"}'
+        )
+
+        message = CRCONHttpClient._status_error_message("set_map", build_response(400, body))
+
+        self.assertEqual(message, "set_map failed with status 400: Unknown map nope")
+
+    def test_permission_denied_surfaces_crcon_message(self):
+        body = '{"command": "/api/add_admin", "failed": true, "error": "You do not have the required permissions to use this"}'
+
+        message = CRCONHttpClient._status_error_message("add_admin", build_response(403, body))
+
+        self.assertIn("required permissions", message)
+        self.assertNotIn("command", message)
+
+    def test_json_without_error_falls_back_to_body(self):
+        message = CRCONHttpClient._status_error_message("get_maps", build_response(500, '{"failed": true, "error": null}'))
+
+        self.assertIn('"failed": true', message)
+
+
 class RaisingSession:
     def __init__(self, exception: Exception):
         self.exception = exception
