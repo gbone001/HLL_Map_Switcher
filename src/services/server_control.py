@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import threading
 from dataclasses import dataclass
 from typing import Any, Callable, Optional
 
@@ -38,6 +39,17 @@ class ServerControlService:
         self.server_number_resolver = server_number_resolver
         self.http_client_factory = http_client_factory
         self.timeout = timeout
+        # Control-plane writes run in worker threads (asyncio.to_thread); serialize them per
+        # server so duplicate clicks or two admins apply in arrival order instead of racing.
+        self._mutation_locks: dict[int, threading.Lock] = {}
+        self._mutation_locks_guard = threading.Lock()
+
+    def mutation_lock(self, server_index: int) -> threading.Lock:
+        with self._mutation_locks_guard:
+            lock = self._mutation_locks.get(server_index)
+            if lock is None:
+                lock = self._mutation_locks[server_index] = threading.Lock()
+            return lock
 
     def get_status(self, server_index: int) -> ControlResult:
         http_client = self.http_client_factory(server_index)
@@ -146,6 +158,26 @@ class ServerControlService:
         )
 
     def _run_with_fallback(
+        self,
+        *,
+        server_index: int,
+        action_name: str,
+        http_action: Optional[Callable[[CRCONHttpClient], dict[str, Any]]],
+        rcon_action: Callable[[HLLRCONClient], dict[str, Any]],
+        success_http_message: str,
+        success_rcon_message: str,
+    ) -> ControlResult:
+        with self.mutation_lock(server_index):
+            return self._run_with_fallback_unlocked(
+                server_index=server_index,
+                action_name=action_name,
+                http_action=http_action,
+                rcon_action=rcon_action,
+                success_http_message=success_http_message,
+                success_rcon_message=success_rcon_message,
+            )
+
+    def _run_with_fallback_unlocked(
         self,
         *,
         server_index: int,

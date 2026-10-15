@@ -112,6 +112,16 @@ server_control = ServerControlService(
 )
 
 
+async def _run_server_write(server_index: int, func, *args, **kwargs):
+    """Run a direct CRCON write in a thread, serialized with the server's other control writes."""
+
+    def locked_call():
+        with server_control.mutation_lock(server_index):
+            return func(*args, **kwargs)
+
+    return await asyncio.to_thread(locked_call)
+
+
 def _get_channel_focused_server(channel: Optional[object]) -> Optional[int]:
     if channel is None:
         return None
@@ -578,8 +588,8 @@ class AddAdminCamModal(discord.ui.Modal, title="ADD ADMIN CAM ACCESS"):
             return
 
         try:
-            added = await asyncio.to_thread(
-                client.add_admin, player_id=player_id, role="spectator", description="Admin cam access"
+            added = await _run_server_write(
+                self.server_index, client.add_admin, player_id=player_id, role="spectator", description="Admin cam access"
             )
         except CRCONHTTPError:
             added = False
@@ -671,7 +681,7 @@ class RemoveAdminCamConfirmView(discord.ui.View):
             return
 
         try:
-            removed = await asyncio.to_thread(client.remove_admin, self.player_id)
+            removed = await _run_server_write(self.server_index, client.remove_admin, self.player_id)
         except CRCONHTTPError:
             removed = False
 

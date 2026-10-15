@@ -1,5 +1,8 @@
 import socket
+import threading
+import time
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 import sys
 
@@ -224,6 +227,71 @@ class NetworkFailureFallbackTests(unittest.TestCase):
         self.assertFalse(result.success)
         self.assertIn("CRCON HTTP", result.message)
         self.assertIn("Direct RCON", result.message)
+
+
+class OverlapTrackingHTTPClient(FakeHTTPClient):
+    """Records how many set_map calls are in flight at once."""
+
+    def __init__(self, delay: float = 0.2):
+        super().__init__()
+        self.delay = delay
+        self.in_flight = 0
+        self.max_in_flight = 0
+        self.order = []
+        self._guard = threading.Lock()
+
+    def set_map(self, map_id):
+        with self._guard:
+            self.in_flight += 1
+            self.max_in_flight = max(self.max_in_flight, self.in_flight)
+        time.sleep(self.delay)
+        with self._guard:
+            self.in_flight -= 1
+            self.order.append(map_id)
+        return {"result": True, "map_id": map_id}
+
+
+class MutationSerializationTests(unittest.TestCase):
+    def test_same_server_mutations_do_not_overlap(self):
+        http_client = OverlapTrackingHTTPClient()
+        service = TestableServerControlService(http_client=http_client, rcon_client=FakeRCONClient())
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            first = pool.submit(service.change_map, 0, "carentan_warfare")
+            time.sleep(0.05)
+            second = pool.submit(service.change_map, 0, "foy_warfare")
+            results = [first.result(), second.result()]
+
+        self.assertTrue(all(result.success for result in results))
+        self.assertEqual(http_client.max_in_flight, 1)
+        self.assertEqual(http_client.order, ["carentan_warfare", "foy_warfare"])
+
+    def test_different_servers_still_run_concurrently(self):
+        http_client = OverlapTrackingHTTPClient()
+        service = TestableServerControlService(http_client=http_client, rcon_client=FakeRCONClient())
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            futures = [pool.submit(service.change_map, index, "carentan_warfare") for index in (0, 1)]
+            for future in futures:
+                future.result()
+
+        self.assertEqual(http_client.max_in_flight, 2)
+
+    def test_status_reads_are_not_blocked_by_a_mutation(self):
+        http_client = OverlapTrackingHTTPClient(delay=0.5)
+        http_client._gamestate = {"result": {"current_map": {"pretty_name": "Carentan"}}}
+        service = TestableServerControlService(http_client=http_client, rcon_client=FakeRCONClient())
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            mutation = pool.submit(service.change_map, 0, "foy_warfare")
+            time.sleep(0.05)
+            started = time.monotonic()
+            status = service.get_status(0)
+            elapsed = time.monotonic() - started
+            mutation.result()
+
+        self.assertTrue(status.success)
+        self.assertLess(elapsed, 0.25)
 
 
 if __name__ == "__main__":
