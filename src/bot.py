@@ -61,7 +61,9 @@ class MapSwitcherBot(commands.Bot):
 
 
 # Bot configuration
-intents = discord.Intents.default()
+intents = discord.Intents.none()
+intents.guilds = True
+intents.guild_messages = True
 intents.message_content = True
 bot = MapSwitcherBot(command_prefix='!', intents=intents)
 
