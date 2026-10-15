@@ -18,6 +18,7 @@ COPY data/ ./data/
 
 RUN mkdir -p /app/data && chmod 755 /app/data
 
+ENV PYTHONPATH=/app
 ENV MAP_CACHE_DIR=/app/data
 
 CMD ["python", "src/bot.py"]
