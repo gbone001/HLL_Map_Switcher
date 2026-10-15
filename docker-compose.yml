@@ -1,0 +1,17 @@
+version: '3.8'
+
+services:
+  hll-map-switcher:
+    build: .
+    container_name: hll-map-switcher
+    restart: unless-stopped
+    environment:
+      - DISCORD_TOKEN=${DISCORD_TOKEN}
+      - API_ENDPOINT=${API_ENDPOINT}
+      - MAPS_API_KEY=${MAPS_API_KEY}
+      - DISCORD_CHANNEL_ID=${DISCORD_CHANNEL_ID}
+      - DISCORD_GUILD_ID=${DISCORD_GUILD_ID}
+    volumes:
+      - ./data:/app/data
+    env_file:
+      - .env
