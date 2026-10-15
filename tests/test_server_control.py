@@ -1,12 +1,15 @@
+import socket
 import unittest
 from pathlib import Path
 import sys
 
+import requests
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from services.server_control import GameStatus, ServerControlService
-from utils.crcon_http import CRCONHTTPError
-from utils.hll_rcon import HLLRCONError
+from utils.crcon_http import CRCONCredentials, CRCONHTTPError, CRCONHttpClient
+from utils.hll_rcon import HLLRCONClient, HLLRCONCredentials, HLLRCONError
 
 
 class FakeHTTPClient:
@@ -164,6 +167,63 @@ class ServerControlServiceTests(unittest.TestCase):
         self.assertFalse(result.success)
         self.assertIn("http down", result.message)
         self.assertIn("rcon down", result.message)
+
+
+class UnreachableSession:
+    def get(self, url, **kwargs):
+        raise requests.ConnectionError("connection refused")
+
+    post = get
+
+
+def unreachable_http_client() -> CRCONHttpClient:
+    client = CRCONHttpClient(CRCONCredentials(base_url="http://crcon.invalid/api", token="token"))
+    client.session = UnreachableSession()
+    return client
+
+
+def closed_local_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+        probe.bind(("127.0.0.1", 0))
+        return probe.getsockname()[1]
+
+
+class NetworkFailureFallbackTests(unittest.TestCase):
+    def test_unreachable_crcon_falls_back_to_direct_rcon(self):
+        service = TestableServerControlService(
+            http_client=unreachable_http_client(),
+            rcon_client=FakeRCONClient(session={"session": {"MapName": "carentan_warfare"}}),
+        )
+
+        result = service.get_status(0)
+
+        self.assertTrue(result.success)
+        self.assertEqual(result.transport, "direct_rcon")
+
+    def test_change_map_falls_back_when_crcon_unreachable(self):
+        service = TestableServerControlService(
+            http_client=unreachable_http_client(),
+            rcon_client=FakeRCONClient(),
+        )
+
+        result = service.change_map(0, "carentan_warfare")
+
+        self.assertTrue(result.success)
+        self.assertEqual(result.transport, "direct_rcon")
+        self.assertIn("connection refused", result.warning)
+
+    def test_both_transports_unreachable_reports_failure_instead_of_raising(self):
+        rcon_client = HLLRCONClient(
+            HLLRCONCredentials(host="127.0.0.1", port=closed_local_port(), password="secret"),
+            timeout=1.0,
+        )
+        service = TestableServerControlService(http_client=unreachable_http_client(), rcon_client=rcon_client)
+
+        result = service.get_status(0)
+
+        self.assertFalse(result.success)
+        self.assertIn("CRCON HTTP", result.message)
+        self.assertIn("Direct RCON", result.message)
 
 
 if __name__ == "__main__":

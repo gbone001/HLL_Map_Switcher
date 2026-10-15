@@ -127,6 +127,16 @@ class HLLRCONClient:
         return self.execute("SetWarmupTimer", {"GameMode": game_mode, "WarmupLength": minutes})
 
     def execute(self, command: str, content_body: Any) -> Dict[str, Any]:
+        """Run one command on a fresh connection; socket failures surface as HLLRCONError."""
+        endpoint = f"{self.credentials.host}:{self.credentials.port}"
+        try:
+            return self._execute(command, content_body)
+        except socket.timeout as exc:
+            raise HLLRCONError(f"Direct RCON {command} to {endpoint} timed out after {self.timeout}s.") from exc
+        except OSError as exc:
+            raise HLLRCONError(f"Direct RCON {command} to {endpoint} failed: {exc.__class__.__name__}: {exc}") from exc
+
+    def _execute(self, command: str, content_body: Any) -> Dict[str, Any]:
         with socket.create_connection((self.credentials.host, self.credentials.port), timeout=self.timeout) as connection:
             connection.settimeout(self.timeout)
 

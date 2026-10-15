@@ -101,13 +101,13 @@ class CRCONHttpClient:
             self.login()
 
         url = f"{self.credentials.base_url}/get_maps"
-        response = self.session.get(url, headers=self._auth_headers(), timeout=self.timeout)
+        response = self._get(url, headers=self._auth_headers(), timeout=self.timeout)
 
         if response.status_code == 401:
             # Token expired or invalid; try once more after refreshing.
             self._token = None
             self.login()
-            response = self.session.get(url, headers=self._auth_headers(), timeout=self.timeout)
+            response = self._get(url, headers=self._auth_headers(), timeout=self.timeout)
 
         if response.status_code != 200:
             raise CRCONHTTPError(self._status_error_message("get_maps", response))
@@ -120,12 +120,12 @@ class CRCONHttpClient:
             self.login()
 
         url = f"{self.credentials.base_url}/get_objective_rows"
-        response = self.session.get(url, headers=self._auth_headers(), timeout=self.timeout)
+        response = self._get(url, headers=self._auth_headers(), timeout=self.timeout)
 
         if response.status_code == 401:
             self._token = None
             self.login()
-            response = self.session.get(url, headers=self._auth_headers(), timeout=self.timeout)
+            response = self._get(url, headers=self._auth_headers(), timeout=self.timeout)
 
         if response.status_code != 200:
             raise CRCONHTTPError(self._status_error_message("get_objective_rows", response))
@@ -150,12 +150,12 @@ class CRCONHttpClient:
             self.login()
 
         url = f"{self.credentials.base_url}/get_gamestate"
-        response = self.session.get(url, headers=self._auth_headers(), timeout=self.timeout)
+        response = self._get(url, headers=self._auth_headers(), timeout=self.timeout)
 
         if response.status_code == 401:
             self._token = None
             self.login()
-            response = self.session.get(url, headers=self._auth_headers(), timeout=self.timeout)
+            response = self._get(url, headers=self._auth_headers(), timeout=self.timeout)
 
         if response.status_code != 200:
             raise CRCONHTTPError(self._status_error_message("get_gamestate", response))
@@ -174,7 +174,7 @@ class CRCONHttpClient:
 
         url = f"{self.credentials.base_url}/set_map"
         payload = {"map_name": map_id}
-        response = self.session.post(
+        response = self._post(
             url,
             headers=self._auth_headers(),
             json=payload,
@@ -184,7 +184,7 @@ class CRCONHttpClient:
         if response.status_code == 401:
             self._token = None
             self.login()
-            response = self.session.post(
+            response = self._post(
                 url,
                 headers=self._auth_headers(),
                 json=payload,
@@ -211,7 +211,7 @@ class CRCONHttpClient:
             "random_constraints": random_constraints,
         }
 
-        response = self.session.post(
+        response = self._post(
             url,
             headers=self._auth_headers(),
             json=payload,
@@ -221,7 +221,7 @@ class CRCONHttpClient:
         if response.status_code == 401:
             self._token = None
             self.login()
-            response = self.session.post(
+            response = self._post(
                 url,
                 headers=self._auth_headers(),
                 json=payload,
@@ -247,7 +247,7 @@ class CRCONHttpClient:
             "enabled": bool(enabled),
         }
 
-        response = self.session.post(
+        response = self._post(
             url,
             headers=self._auth_headers(),
             json=payload,
@@ -257,7 +257,7 @@ class CRCONHttpClient:
         if response.status_code == 401:
             self._token = None
             self.login()
-            response = self.session.post(
+            response = self._post(
                 url,
                 headers=self._auth_headers(),
                 json=payload,
@@ -278,12 +278,12 @@ class CRCONHttpClient:
             self.login()
 
         url = f"{self.credentials.base_url}/get_team_switch_cooldown"
-        response = self.session.get(url, headers=self._auth_headers(), timeout=self.timeout)
+        response = self._get(url, headers=self._auth_headers(), timeout=self.timeout)
 
         if response.status_code == 401:
             self._token = None
             self.login()
-            response = self.session.get(url, headers=self._auth_headers(), timeout=self.timeout)
+            response = self._get(url, headers=self._auth_headers(), timeout=self.timeout)
 
         if response.status_code != 200:
             raise CRCONHTTPError(self._status_error_message("get_team_switch_cooldown", response))
@@ -310,7 +310,7 @@ class CRCONHttpClient:
 
         url = f"{self.credentials.base_url}/set_team_switch_cooldown"
         payload = {"minutes": int(cooldown_minutes)}
-        response = self.session.post(
+        response = self._post(
             url,
             headers=self._auth_headers(),
             json=payload,
@@ -320,7 +320,7 @@ class CRCONHttpClient:
         if response.status_code == 401:
             self._token = None
             self.login()
-            response = self.session.post(
+            response = self._post(
                 url,
                 headers=self._auth_headers(),
                 json=payload,
@@ -354,7 +354,7 @@ class CRCONHttpClient:
             "length": int(length),
         }
 
-        response = self.session.post(
+        response = self._post(
             url,
             headers=self._auth_headers(),
             json=payload,
@@ -364,7 +364,7 @@ class CRCONHttpClient:
         if response.status_code == 401:
             self._token = None
             self.login()
-            response = self.session.post(
+            response = self._post(
                 url,
                 headers=self._auth_headers(),
                 json=payload,
@@ -390,7 +390,7 @@ class CRCONHttpClient:
             "length": int(length),
         }
 
-        response = self.session.post(
+        response = self._post(
             url,
             headers=self._auth_headers(),
             json=payload,
@@ -400,7 +400,7 @@ class CRCONHttpClient:
         if response.status_code == 401:
             self._token = None
             self.login()
-            response = self.session.post(
+            response = self._post(
                 url,
                 headers=self._auth_headers(),
                 json=payload,
@@ -427,7 +427,7 @@ class CRCONHttpClient:
             "description": description,
         }
 
-        response = self.session.post(
+        response = self._post(
             url,
             headers=self._auth_headers(),
             json=payload,
@@ -437,7 +437,7 @@ class CRCONHttpClient:
         if response.status_code == 401:
             self._token = None
             self.login()
-            response = self.session.post(
+            response = self._post(
                 url,
                 headers=self._auth_headers(),
                 json=payload,
@@ -459,12 +459,12 @@ class CRCONHttpClient:
             self.login()
 
         url = f"{self.credentials.base_url}/get_admin_ids"
-        response = self.session.get(url, headers=self._auth_headers(), timeout=self.timeout)
+        response = self._get(url, headers=self._auth_headers(), timeout=self.timeout)
 
         if response.status_code == 401:
             self._token = None
             self.login()
-            response = self.session.get(url, headers=self._auth_headers(), timeout=self.timeout)
+            response = self._get(url, headers=self._auth_headers(), timeout=self.timeout)
 
         if response.status_code != 200:
             raise CRCONHTTPError(self._status_error_message("get_admin_ids", response))
@@ -487,7 +487,7 @@ class CRCONHttpClient:
         url = f"{self.credentials.base_url}/remove_admin"
         payload = {"player_id": player_id}
 
-        response = self.session.post(
+        response = self._post(
             url,
             headers=self._auth_headers(),
             json=payload,
@@ -497,7 +497,7 @@ class CRCONHttpClient:
         if response.status_code == 401:
             self._token = None
             self.login()
-            response = self.session.post(
+            response = self._post(
                 url,
                 headers=self._auth_headers(),
                 json=payload,
@@ -512,6 +512,21 @@ class CRCONHttpClient:
             return False
 
         return bool(result.get("result"))
+
+    def _get(self, url: str, **kwargs: Any) -> requests.Response:
+        return self._send("get", url, **kwargs)
+
+    def _post(self, url: str, **kwargs: Any) -> requests.Response:
+        return self._send("post", url, **kwargs)
+
+    def _send(self, method: str, url: str, **kwargs: Any) -> requests.Response:
+        """Issue a request, surfacing network failures as CRCONHTTPError so callers can fall back."""
+        try:
+            return getattr(self.session, method)(url, **kwargs)
+        except requests.Timeout as exc:
+            raise CRCONHTTPError(f"CRCON request to {url} timed out after {self.timeout}s.") from exc
+        except requests.RequestException as exc:
+            raise CRCONHTTPError(f"CRCON request to {url} failed: {exc.__class__.__name__}: {exc}") from exc
 
     def _auth_headers(self) -> Dict[str, str]:
         if not self._token:

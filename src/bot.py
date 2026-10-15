@@ -1,12 +1,13 @@
 import asyncio
 import os
+import threading
 from datetime import datetime, timedelta, timezone
 from typing import Dict, Optional, Tuple
 
 import discord
 from discord.ext import commands
 from dotenv import load_dotenv
-from services.server_control import GameStatus, ServerControlService
+from services.server_control import ControlResult, GameStatus, ServerControlService
 from utils.map_data import (
     get_maps_for_mode,
     get_variants_for_map,
@@ -18,15 +19,54 @@ from utils.crcon_http import CRCONHttpClient, CRCONHTTPError
 # Load environment variables
 load_dotenv()
 
+
+async def sync_app_commands(tree: discord.app_commands.CommandTree, guild_id_raw: Optional[str] = None) -> list:
+    """Register slash commands with Discord.
+
+    With DISCORD_GUILD_ID set, commands are copied to that guild so they appear
+    immediately; otherwise they are synced globally (can take up to an hour).
+    """
+    if guild_id_raw is None:
+        guild_id_raw = os.getenv("DISCORD_GUILD_ID")
+    guild_id_raw = (guild_id_raw or "").strip()
+
+    guild: Optional[discord.Object] = None
+    if guild_id_raw:
+        try:
+            guild = discord.Object(id=int(guild_id_raw))
+        except ValueError:
+            print(f"Invalid DISCORD_GUILD_ID value: {guild_id_raw}; syncing slash commands globally.")
+
+    try:
+        if guild is not None:
+            tree.copy_global_to(guild=guild)
+            synced = await tree.sync(guild=guild)
+            print(f"Synced {len(synced)} slash command(s) to guild {guild.id}.")
+        else:
+            synced = await tree.sync()
+            print(f"Synced {len(synced)} slash command(s) globally.")
+    except discord.HTTPException as exc:
+        print(f"Failed to sync slash commands: {exc}")
+        return []
+    return synced
+
+
+class MapSwitcherBot(commands.Bot):
+    async def setup_hook(self) -> None:
+        await sync_app_commands(self.tree)
+
+
 # Bot configuration
 intents = discord.Intents.default()
 intents.message_content = True
-bot = commands.Bot(command_prefix='!', intents=intents)
+bot = MapSwitcherBot(command_prefix='!', intents=intents)
 
 # API client
 api_client = HLLAPIClient()
 _http_clients: Dict[Optional[int], CRCONHttpClient] = {}
 _http_client_errors: Dict[Optional[int], str] = {}
+# Clients are created lazily from worker threads (see asyncio.to_thread call sites).
+_http_clients_lock = threading.Lock()
 
 
 def _server_number(server_index: Optional[int]) -> Optional[int]:
@@ -39,26 +79,27 @@ def _server_number(server_index: Optional[int]) -> Optional[int]:
 
 
 def _get_http_client(server_index: Optional[int] = None) -> Optional[CRCONHttpClient]:
-    if server_index in _http_clients:
-        return _http_clients[server_index]
-    if server_index in _http_client_errors:
-        return None
+    with _http_clients_lock:
+        if server_index in _http_clients:
+            return _http_clients[server_index]
+        if server_index in _http_client_errors:
+            return None
 
-    server_number = _server_number(server_index)
-    try:
-        client = CRCONHttpClient.from_env(server_number=server_number)
-    except CRCONHTTPError as exc:
-        context = (
-            f"server slot #{server_number}"
-            if server_number is not None
-            else "shared CRCON credentials"
-        )
-        print(f"CRCON HTTP client disabled for {context}: {exc}")
-        _http_client_errors[server_index] = str(exc)
-        return None
+        server_number = _server_number(server_index)
+        try:
+            client = CRCONHttpClient.from_env(server_number=server_number)
+        except CRCONHTTPError as exc:
+            context = (
+                f"server slot #{server_number}"
+                if server_number is not None
+                else "shared CRCON credentials"
+            )
+            print(f"CRCON HTTP client disabled for {context}: {exc}")
+            _http_client_errors[server_index] = str(exc)
+            return None
 
-    _http_clients[server_index] = client
-    return client
+        _http_clients[server_index] = client
+        return client
 
 
 def _http_error_message(server_index: Optional[int]) -> str:
@@ -184,12 +225,32 @@ def _get_focused_or_single_server(interaction: discord.Interaction) -> Optional[
     return None
 
 
-def _server_has_crcon_http(server_index: int) -> bool:
-    status_result = server_control.get_status(server_index)
-    return status_result.success and status_result.transport == "crcon_http"
+async def fetch_server_statuses() -> Dict[int, ControlResult]:
+    """Read status for every configured server concurrently, off the event loop."""
+    indices = [index for index, _ in api_client.get_servers()]
+    results = await asyncio.gather(
+        *(asyncio.to_thread(server_control.get_status, index) for index in indices)
+    )
+    return dict(zip(indices, results))
 
 
-def _panel_crcon_outage_state(focused_server_index: Optional[int] = None) -> tuple[bool, list[str]]:
+async def build_panel(focused_server_index: Optional[int] = None) -> Tuple[discord.Embed, "GameModeView"]:
+    statuses = await fetch_server_statuses()
+    embed = build_main_embed(focused_server_index, statuses)
+    crcon_outage, _ = _panel_crcon_outage_state(statuses, focused_server_index)
+    view = GameModeView(focused_server_index=focused_server_index, crcon_outage=crcon_outage)
+    return embed, view
+
+
+def _server_has_crcon_http(statuses: Dict[int, ControlResult], server_index: int) -> bool:
+    status_result = statuses.get(server_index)
+    return status_result is not None and status_result.success and status_result.transport == "crcon_http"
+
+
+def _panel_crcon_outage_state(
+    statuses: Dict[int, ControlResult],
+    focused_server_index: Optional[int] = None,
+) -> tuple[bool, list[str]]:
     servers = api_client.get_servers()
     if not servers:
         return False, []
@@ -206,7 +267,7 @@ def _panel_crcon_outage_state(focused_server_index: Optional[int] = None) -> tup
     healthy_count = 0
 
     for server_index in target_indices:
-        if _server_has_crcon_http(server_index):
+        if _server_has_crcon_http(statuses, server_index):
             healthy_count += 1
             continue
         unavailable_server_names.append(api_client.get_server_name(server_index))
@@ -223,7 +284,11 @@ def _panel_crcon_outage_state(focused_server_index: Optional[int] = None) -> tup
 
 
 
-def build_main_embed(focused_server_index: Optional[int] = None) -> discord.Embed:
+def build_main_embed(
+    focused_server_index: Optional[int],
+    statuses: Dict[int, ControlResult],
+) -> discord.Embed:
+    """Render the panel embed from statuses already fetched by fetch_server_statuses()."""
     servers = api_client.get_servers()
     server_lines: list[str] = []
     updated_at_text = ""
@@ -239,8 +304,13 @@ def build_main_embed(focused_server_index: Optional[int] = None) -> discord.Embe
 
         for position, (index, server_name) in enumerate(servers, start=1):
             selected_prefix = "**[SELECTED]** " if focused_server_index == index else ""
-            status_result = server_control.get_status(index)
+            status_result = statuses.get(index)
             server_lines.append(f"{position}. {selected_prefix}{server_name}")
+
+            if status_result is None:
+                server_lines.append("   Status: ⚠️ Status not loaded.")
+                crcon_http_degraded_servers.append(server_name)
+                continue
 
             if not status_result.success:
                 server_lines.append(f"   Status: ⚠️ {status_result.message}")
@@ -314,9 +384,7 @@ async def ensure_persistent_message(channel: discord.abc.Messageable) -> Optiona
     focused = None
     if channel_id is not None:
         focused = _persistent_focused_server.get(channel_id)
-    embed = build_main_embed(focused_server_index=focused)
-    view = GameModeView(focused_server_index=focused)
-    
+    embed, view = await build_panel(focused)
 
     if persistent_message_ref and channel_id is not None:
         ref_channel_id, message_id = persistent_message_ref
@@ -494,6 +562,7 @@ class AddAdminCamModal(discord.ui.Modal, title="ADD ADMIN CAM ACCESS"):
         self.server_index = server_index
 
     async def on_submit(self, interaction: discord.Interaction) -> None:
+        await defer_interaction(interaction, ephemeral=True)
         client = _get_http_client(self.server_index)
         if not client:
             await send_temporary_response(
@@ -509,7 +578,9 @@ class AddAdminCamModal(discord.ui.Modal, title="ADD ADMIN CAM ACCESS"):
             return
 
         try:
-            added = client.add_admin(player_id=player_id, role="spectator", description="Admin cam access")
+            added = await asyncio.to_thread(
+                client.add_admin, player_id=player_id, role="spectator", description="Admin cam access"
+            )
         except CRCONHTTPError:
             added = False
 
@@ -553,7 +624,8 @@ class TeamSwitchCooldownModal(discord.ui.Modal, title="SET TEAM SWITCH COOLDOWN"
 
         server_name = api_client.get_server_name(self.server_index)
 
-        result = server_control.set_team_switch_cooldown(self.server_index, cooldown_minutes)
+        await defer_interaction(interaction, ephemeral=True)
+        result = await asyncio.to_thread(server_control.set_team_switch_cooldown, self.server_index, cooldown_minutes)
         if not result.success:
             await send_temporary_response(
                 interaction,
@@ -599,7 +671,7 @@ class RemoveAdminCamConfirmView(discord.ui.View):
             return
 
         try:
-            removed = client.remove_admin(self.player_id)
+            removed = await asyncio.to_thread(client.remove_admin, self.player_id)
         except CRCONHTTPError:
             removed = False
 
@@ -671,14 +743,12 @@ class RemoveAdminCamSelectionView(discord.ui.View):
 
 
 class GameModeView(PersistentView):
-    def __init__(self, focused_server_index: Optional[int] = None):
+    def __init__(self, focused_server_index: Optional[int] = None, crcon_outage: bool = False):
         super().__init__()
         self.focused_server_index = focused_server_index
-        self._apply_crcon_panel_state()
+        self._apply_crcon_panel_state(crcon_outage)
 
-    def _apply_crcon_panel_state(self) -> None:
-        disable_crcon_controls, _ = _panel_crcon_outage_state(self.focused_server_index)
-
+    def _apply_crcon_panel_state(self, disable_crcon_controls: bool) -> None:
         for child in self.children:
             if not isinstance(child, discord.ui.Button):
                 continue
@@ -728,9 +798,9 @@ class GameModeView(PersistentView):
         server_name = api_client.get_server_name(server_index)
 
         if timer_name == "match timer":
-            result = server_control.set_match_timer(server_index, "warfare", minutes)
+            result = await asyncio.to_thread(server_control.set_match_timer, server_index, "warfare", minutes)
         else:
-            result = server_control.set_warmup_timer(server_index, "warfare", minutes)
+            result = await asyncio.to_thread(server_control.set_warmup_timer, server_index, "warfare", minutes)
 
         if not result.success:
             await send_temporary_response(
@@ -783,7 +853,7 @@ class GameModeView(PersistentView):
         if focused_server is not None and any(index == focused_server for index, _ in servers):
             server_index = focused_server
             server_name = api_client.get_server_name(server_index)
-            current_map = api_client.get_current_map(server_index)
+            current_map = await asyncio.to_thread(api_client.get_current_map, server_index)
 
             embed = discord.Embed(
                 title="??? Map Change Control",
@@ -797,7 +867,7 @@ class GameModeView(PersistentView):
         if len(servers) == 1:
             server_index = servers[0][0]
             server_name = servers[0][1]
-            current_map = api_client.get_current_map(server_index)
+            current_map = await asyncio.to_thread(api_client.get_current_map, server_index)
 
             embed = discord.Embed(
                 title="??? Map Change Control",
@@ -988,7 +1058,7 @@ class GameModeView(PersistentView):
             return
 
         try:
-            admins = client.get_admin_ids()
+            admins = await asyncio.to_thread(client.get_admin_ids)
         except CRCONHTTPError as exc:
             await send_temporary_response(
                 interaction,
@@ -1101,8 +1171,8 @@ class ChangeServerDropdown(discord.ui.Select):
                 _, message_id = persistent_message_ref
                 try:
                     msg = await channel.fetch_message(message_id)  # type: ignore[attr-defined]
-                    embed = build_main_embed(focused_server_index=selected)
-                    await msg.edit(embed=embed, view=GameModeView(focused_server_index=selected))
+                    embed, view = await build_panel(selected)
+                    await msg.edit(embed=embed, view=view)
                 except (discord.NotFound, discord.HTTPException):
                     # recreate persistent message
                     if isinstance(channel, (discord.TextChannel, discord.Thread)):
@@ -1143,7 +1213,7 @@ class ServerDropdown(discord.ui.Select):
         await defer_interaction(interaction)
         selected_server_index = int(self.values[0])
         server_name = api_client.get_server_name(selected_server_index)
-        current_map = api_client.get_current_map(selected_server_index)
+        current_map = await asyncio.to_thread(api_client.get_current_map, selected_server_index)
         
         embed = discord.Embed(
             title="🗺️ Map Change Control",
@@ -1177,7 +1247,7 @@ async def send_objective_selection(
         return
 
     try:
-        rows = client.get_objective_rows()
+        rows = await asyncio.to_thread(client.get_objective_rows)
     except CRCONHTTPError as exc:
         message = f"Failed to load objectives: {exc}"
         if edit_message:
@@ -1192,7 +1262,7 @@ async def send_objective_selection(
         return
 
     server_name = api_client.get_server_name(server_index)
-    current_map = api_client.get_current_map(server_index)
+    current_map = await asyncio.to_thread(api_client.get_current_map, server_index)
     view = ObjectiveSelectionView(server_index, rows, server_name, current_map)
     embed = view.build_embed()
 
@@ -1224,7 +1294,7 @@ async def send_dynamic_weather_controls(
         return
 
     try:
-        gamestate_resp = client.get_gamestate()
+        gamestate_resp = await asyncio.to_thread(client.get_gamestate)
         gamestate = gamestate_resp.get("result") if isinstance(gamestate_resp, dict) else None
     except CRCONHTTPError as exc:
         message = f"Failed to load gamestate: {exc}"
@@ -1318,7 +1388,7 @@ class DynamicWeatherToggleView(discord.ui.View):
         if not interaction.response.is_done():
             await interaction.response.defer(ephemeral=True)
 
-        result = server_control.set_dynamic_weather_enabled(self.server_index, self.map_id, enabled)
+        result = await asyncio.to_thread(server_control.set_dynamic_weather_enabled, self.server_index, self.map_id, enabled)
         if not result.success:
             followup = await interaction.followup.send(
                 f"Failed to update dynamic weather: {result.message}",
@@ -1430,7 +1500,7 @@ class ObjectiveSelectionView(discord.ui.View):
 
         objective_list = [choice for choice in objective_list if choice]
 
-        result = server_control.set_sector_layout(self.server_index, objective_list)
+        result = await asyncio.to_thread(server_control.set_sector_layout, self.server_index, objective_list)
         if not result.success:
             await interaction.followup.send(
                 f"Failed to lock objectives: {result.message}",
@@ -1438,7 +1508,7 @@ class ObjectiveSelectionView(discord.ui.View):
             )
             return
 
-        latest_map = api_client.get_current_map(self.server_index)
+        latest_map = await asyncio.to_thread(api_client.get_current_map, self.server_index)
         _current_objectives_state[(self.server_index, latest_map)] = list(objective_list)
         summary = "\n".join(
             f"{idx}. **{name}**" for idx, name in enumerate(objective_list, start=1)
@@ -1505,7 +1575,7 @@ class GameModeSelectionView(discord.ui.View):
     async def show_map_selection(self, interaction, game_mode):
         await defer_interaction(interaction)
         server_name = api_client.get_server_name(self.server_index)
-        current_map = api_client.get_current_map(self.server_index)
+        current_map = await asyncio.to_thread(api_client.get_current_map, self.server_index)
         
         embed = discord.Embed(
             title=f"🗺️ {game_mode.title()} Maps",
@@ -1513,17 +1583,17 @@ class GameModeSelectionView(discord.ui.View):
             color=0x0099ff
         )
         
-        view = MapSelectionView(self.server_index, game_mode)
+        maps = await asyncio.to_thread(get_maps_for_mode, game_mode)
+        view = MapSelectionView(self.server_index, game_mode, maps)
         await update_interaction_message(interaction, embed=embed, view=view)
 
 class MapSelectionView(discord.ui.View):
-    def __init__(self, server_index, game_mode):
+    def __init__(self, server_index, game_mode, maps):
         super().__init__(timeout=300)
         self.server_index = server_index
         self.game_mode = game_mode
         
         # Create dropdown with maps
-        maps = get_maps_for_mode(game_mode)
         if maps:
             self.add_item(MapDropdown(server_index, game_mode, maps))
         
@@ -1559,7 +1629,7 @@ class MapDropdown(discord.ui.Select):
         await defer_interaction(interaction)
         selected_map = self.values[0]
         server_name = api_client.get_server_name(self.server_index)
-        current_map = api_client.get_current_map(self.server_index)
+        current_map = await asyncio.to_thread(api_client.get_current_map, self.server_index)
         
         embed = discord.Embed(
             title=f"🗺️ {selected_map} - {self.game_mode.title()}",
@@ -1567,18 +1637,18 @@ class MapDropdown(discord.ui.Select):
             color=0xff9900
         )
         
-        view = VariantSelectionView(self.server_index, self.game_mode, selected_map)
+        variants = await asyncio.to_thread(get_variants_for_map, self.game_mode, selected_map)
+        view = VariantSelectionView(self.server_index, self.game_mode, selected_map, variants)
         await update_interaction_message(interaction, embed=embed, view=view)
 
 class VariantSelectionView(discord.ui.View):
-    def __init__(self, server_index, game_mode, map_name):
+    def __init__(self, server_index, game_mode, map_name, variants):
         super().__init__(timeout=300)
         self.server_index = server_index
         self.game_mode = game_mode
         self.map_name = map_name
         
         # Create dropdown with variants
-        variants = get_variants_for_map(game_mode, map_name)
         if variants:
             self.add_item(VariantDropdown(server_index, game_mode, map_name, variants))
         
@@ -1590,7 +1660,8 @@ class VariantDropdown(discord.ui.Select):
         self.server_index = server_index
         self.game_mode = game_mode
         self.map_name = map_name
-        
+        self.variants = variants
+
         options = [
             discord.SelectOption(
                 label=variant["variant"],
@@ -1612,8 +1683,7 @@ class VariantDropdown(discord.ui.Select):
         server_name = api_client.get_server_name(self.server_index)
         
         # Find the variant name for display
-        variants = get_variants_for_map(self.game_mode, self.map_name)
-        variant_entry = next((v for v in variants if v["id"] == selected_variant_id), None)
+        variant_entry = next((v for v in self.variants if v["id"] == selected_variant_id), None)
         variant_name = variant_entry["variant"] if variant_entry else selected_variant_id
         
         embed = discord.Embed(
@@ -1629,7 +1699,7 @@ class VariantDropdown(discord.ui.Select):
         status_lines = []
         overall_success = False
 
-        result = server_control.change_map(self.server_index, selected_variant_id)
+        result = await asyncio.to_thread(server_control.change_map, self.server_index, selected_variant_id)
         if result.success:
             if result.transport == "direct_rcon":
                 status_lines.append("Direct RCON fallback change_map succeeded.")
@@ -1646,7 +1716,7 @@ class VariantDropdown(discord.ui.Select):
         status_summary = "\n".join(f"• {line}" for line in status_lines)
         
         if overall_success:
-            new_current_map = api_client.get_current_map(self.server_index)
+            new_current_map = await asyncio.to_thread(api_client.get_current_map, self.server_index)
             stale_objective_keys = [
                 key for key in _current_objectives_state if key[0] == self.server_index
             ]
@@ -1702,7 +1772,7 @@ class BackToGameModeButton(discord.ui.Button):
     async def callback(self, interaction: discord.Interaction):
         await defer_interaction(interaction)
         server_name = api_client.get_server_name(self.server_index)
-        current_map = api_client.get_current_map(self.server_index)
+        current_map = await asyncio.to_thread(api_client.get_current_map, self.server_index)
         
         embed = discord.Embed(
             title="🗺️ Map Change Control",
@@ -1722,7 +1792,7 @@ class BackToMapSelectionButton(discord.ui.Button):
     async def callback(self, interaction: discord.Interaction):
         await defer_interaction(interaction)
         server_name = api_client.get_server_name(self.server_index)
-        current_map = api_client.get_current_map(self.server_index)
+        current_map = await asyncio.to_thread(api_client.get_current_map, self.server_index)
         
         embed = discord.Embed(
             title=f"🗺️ {self.game_mode.title()} Maps",
@@ -1730,7 +1800,8 @@ class BackToMapSelectionButton(discord.ui.Button):
             color=0x0099ff
         )
         
-        view = MapSelectionView(self.server_index, self.game_mode)
+        maps = await asyncio.to_thread(get_maps_for_mode, self.game_mode)
+        view = MapSelectionView(self.server_index, self.game_mode, maps)
         await update_interaction_message(interaction, embed=embed, view=view)
 
 @bot.event
@@ -1739,8 +1810,8 @@ async def on_ready():
     print(f'Bot is in {len(bot.guilds)} guilds')
 
     # Warm cache when available, but avoid noisy startup warnings if CRCON isn't reachable yet.
-    refresh_map_cache(force=False)
-    
+    await asyncio.to_thread(refresh_map_cache, force=False)
+
     # Add the persistent view
     bot.add_view(GameModeView())
     
@@ -1792,8 +1863,8 @@ async def repost_button(interaction: discord.Interaction):
     channel = bot.get_channel(channel_id)
 
     if isinstance(channel, (discord.TextChannel, discord.Thread)):
-        embed = build_main_embed()
-        view = GameModeView()
+        await defer_interaction(interaction, ephemeral=True)
+        embed, view = await build_panel()
         message = await channel.send(embed=embed, view=view)
         global persistent_message_ref
         persistent_message_ref = (channel.id, message.id)

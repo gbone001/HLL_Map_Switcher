@@ -9,7 +9,9 @@ import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from utils.hll_rcon import HEADER_MAGIC, HEADER_SIZE, HLLRCONClient, HLLRCONCredentials
+from unittest import mock
+
+from utils.hll_rcon import HEADER_MAGIC, HEADER_SIZE, HLLRCONClient, HLLRCONCredentials, HLLRCONError
 
 
 class FakeRCONServer:
@@ -135,6 +137,26 @@ class HLLRCONClientTests(unittest.TestCase):
         self.assertNotIn("AuthToken", server.requests[0])
         self.assertEqual(server.requests[2]["name"], "GetServerInformation")
         self.assertEqual(server.requests[2]["contentBody"], "{\"Name\":\"session\",\"Value\":\"\"}")
+
+
+class HLLRCONNetworkErrorTests(unittest.TestCase):
+    def build_client(self) -> HLLRCONClient:
+        return HLLRCONClient(HLLRCONCredentials(host="127.0.0.1", port=7779, password="secret"), timeout=0.5)
+
+    def test_connection_refused_is_wrapped(self):
+        with mock.patch("utils.hll_rcon.socket.create_connection", side_effect=ConnectionRefusedError("refused")):
+            with self.assertRaises(HLLRCONError) as ctx:
+                self.build_client().get_session_info()
+
+        self.assertIn("127.0.0.1:7779", str(ctx.exception))
+        self.assertIsInstance(ctx.exception.__cause__, ConnectionRefusedError)
+
+    def test_timeout_is_wrapped_with_timeout_message(self):
+        with mock.patch("utils.hll_rcon.socket.create_connection", side_effect=socket.timeout("timed out")):
+            with self.assertRaises(HLLRCONError) as ctx:
+                self.build_client().change_map("carentan_warfare")
+
+        self.assertIn("timed out", str(ctx.exception))
 
 
 if __name__ == "__main__":

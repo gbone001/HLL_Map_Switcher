@@ -62,5 +62,39 @@ class CRCONHttpClientTests(unittest.TestCase):
         self.assertEqual(str(context.exception), "Failed to parse JSON response: HTML error page: Login Required")
 
 
+class RaisingSession:
+    def __init__(self, exception: Exception):
+        self.exception = exception
+
+    def get(self, url, **kwargs):
+        raise self.exception
+
+    post = get
+
+
+class CRCONHttpNetworkErrorTests(unittest.TestCase):
+    def build_client(self, exception: Exception) -> CRCONHttpClient:
+        client = CRCONHttpClient(CRCONCredentials(base_url="https://crcon.example/api", token="token"))
+        client.session = RaisingSession(exception)
+        return client
+
+    def test_connection_error_is_wrapped(self):
+        client = self.build_client(requests.ConnectionError("connection refused"))
+
+        with self.assertRaises(CRCONHTTPError) as ctx:
+            client.get_gamestate()
+
+        self.assertIn("ConnectionError", str(ctx.exception))
+        self.assertIsInstance(ctx.exception.__cause__, requests.ConnectionError)
+
+    def test_timeout_is_wrapped_with_timeout_message(self):
+        client = self.build_client(requests.ReadTimeout("read timed out"))
+
+        with self.assertRaises(CRCONHTTPError) as ctx:
+            client.set_map("carentan_warfare")
+
+        self.assertIn("timed out", str(ctx.exception))
+
+
 if __name__ == "__main__":
     unittest.main()
