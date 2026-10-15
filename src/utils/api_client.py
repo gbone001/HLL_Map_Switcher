@@ -120,26 +120,34 @@ class HLLAPIClient:
         return None
 
     def get_current_map(self, server_index: int) -> str:
-        try:
-            client = self._client_for_index(server_index)
-            response = client.get_gamestate()
-            gamestate = response.get("result") if isinstance(response, dict) else None
-            current_map = gamestate.get("current_map", {}) if isinstance(gamestate, dict) else {}
-            return current_map.get("pretty_name") or current_map.get("id") or "Unknown"
-        except Exception:
-            pass
+            try:
+                client = self._client_for_index(server_index)
+                response = client.get_gamestate()
+                gamestate = response.get("result") if isinstance(response, dict) else None
+                current_map = gamestate.get("current_map", {}) if isinstance(gamestate, dict) else {}
+                return current_map.get("pretty_name") or current_map.get("id") or "Unknown"
+            except CRCONHTTPError as exc:
+                # Log CRCON HTTP errors but don't swallow them - fall through to RCON
+                import logging
+                logging.getLogger(__name__).warning("CRCON HTTP get_gamestate failed for server %s: %s", server_index, exc)
+            except Exception as exc:
+                # Log unexpected errors for debugging
+                import logging
+                logging.getLogger(__name__).exception("Unexpected error in get_current_map for server %s", server_index)
 
-        server_number = self.get_server_number(server_index)
-        try:
-            rcon_client = HLLRCONClient.from_env(server_number=server_number, timeout=self.timeout)
-            session_info = rcon_client.get_session_info()
-        except Exception:
-            return "Unknown"
+            server_number = self.get_server_number(server_index)
+            try:
+                rcon_client = HLLRCONClient.from_env(server_number=server_number, timeout=self.timeout)
+                session_info = rcon_client.get_session_info()
+            except Exception as exc:
+                import logging
+                logging.getLogger(__name__).warning("Direct RCON get_session_info failed for server %s: %s", server_index, exc)
+                return "Unknown"
 
-        session = session_info.get("session") if isinstance(session_info.get("session"), dict) else session_info
-        if not isinstance(session, dict):
-            return "Unknown"
-        return str(session.get("MapName") or "Unknown")
+            session = session_info.get("session") if isinstance(session_info.get("session"), dict) else session_info
+            if not isinstance(session, dict):
+                return "Unknown"
+            return str(session.get("MapName") or "Unknown")
 
     def set_map(self, server_index: int, map_id: str) -> Tuple[bool, str]:
         try:

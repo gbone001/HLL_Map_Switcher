@@ -299,27 +299,12 @@ class CRCONHttpClient:
             raise CRCONHTTPError("Unexpected data returned from get_team_switch_cooldown.") from exc
 
     def set_team_switch_cooldown(self, cooldown_minutes: int) -> Dict[str, Any]:
-        """Set the team switch cooldown in minutes.
+            """Set the team switch cooldown in minutes."""
+            if not self._token:
+                self.login()
 
-        CRCON's RCONv2 command is known to return HTTP 400 even when the
-        cooldown change succeeds. Verify the applied value before treating that
-        response as a hard failure.
-        """
-        if not self._token:
-            self.login()
-
-        url = f"{self.credentials.base_url}/set_team_switch_cooldown"
-        payload = {"minutes": int(cooldown_minutes)}
-        response = self._post(
-            url,
-            headers=self._auth_headers(),
-            json=payload,
-            timeout=self.timeout,
-        )
-
-        if response.status_code == 401:
-            self._token = None
-            self.login()
+            url = f"{self.credentials.base_url}/set_team_switch_cooldown"
+            payload = {"minutes": int(cooldown_minutes)}
             response = self._post(
                 url,
                 headers=self._auth_headers(),
@@ -327,21 +312,23 @@ class CRCONHttpClient:
                 timeout=self.timeout,
             )
 
-        if response.status_code == 400:
-            applied_cooldown = self.get_team_switch_cooldown()
-            if applied_cooldown == int(cooldown_minutes):
-                return {
-                    "result": True,
-                    "warning": "CRCON returned HTTP 400, but the cooldown value was applied successfully.",
-                }
+            if response.status_code == 401:
+                self._token = None
+                self.login()
+                response = self._post(
+                    url,
+                    headers=self._auth_headers(),
+                    json=payload,
+                    timeout=self.timeout,
+                )
 
-        if response.status_code != 200:
-            raise CRCONHTTPError(self._status_error_message("set_team_switch_cooldown", response))
+            if response.status_code != 200:
+                raise CRCONHTTPError(self._status_error_message("set_team_switch_cooldown", response))
 
-        result = self._parse_json(response)
-        if isinstance(result, dict) and result.get("failed"):
-            raise CRCONHTTPError(f"set_team_switch_cooldown reported failure: {result.get('error')}")
-        return result
+            result = self._parse_json(response)
+            if isinstance(result, dict) and result.get("failed"):
+                raise CRCONHTTPError(f"set_team_switch_cooldown reported failure: {result.get('error')}")
+            return result
 
     def set_match_timer(self, game_mode: str, length: int) -> Dict[str, Any]:
         """Set the configured match timer for a game mode."""

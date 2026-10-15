@@ -178,57 +178,63 @@ class ServerControlService:
             )
 
     def _run_with_fallback_unlocked(
-        self,
-        *,
-        server_index: int,
-        action_name: str,
-        http_action: Optional[Callable[[CRCONHttpClient], dict[str, Any]]],
-        rcon_action: Callable[[HLLRCONClient], dict[str, Any]],
-        success_http_message: str,
-        success_rcon_message: str,
-    ) -> ControlResult:
-        errors: list[str] = []
-        http_warning: Optional[str] = None
+            self,
+            *,
+            server_index: int,
+            action_name: str,
+            http_action: Optional[Callable[[CRCONHttpClient], dict[str, Any]]],
+            rcon_action: Callable[[HLLRCONClient], dict[str, Any]],
+            success_http_message: str,
+            success_rcon_message: str,
+        ) -> ControlResult:
+            errors: list[str] = []
+            http_warning: Optional[str] = None
 
-        if http_action is not None:
-            http_client = self.http_client_factory(server_index)
-            if http_client is not None:
-                try:
-                    payload = http_action(http_client)
-                    warning = self._extract_warning(payload)
-                    return ControlResult(
-                        success=True,
-                        transport="crcon_http",
-                        message=success_http_message,
-                        warning=warning,
-                        data=payload if isinstance(payload, dict) else None,
-                    )
-                except CRCONHTTPError as exc:
-                    http_warning = str(exc)
-                    errors.append(f"CRCON HTTP: {exc}")
-            else:
-                http_warning = "CRCON HTTP is not configured for this server."
-                errors.append(f"CRCON HTTP: {http_warning}")
+            if http_action is not None:
+                http_client = self.http_client_factory(server_index)
+                if http_client is not None:
+                    try:
+                        payload = http_action(http_client)
+                        warning = self._extract_warning(payload)
+                        return ControlResult(
+                            success=True,
+                            transport="crcon_http",
+                            message=success_http_message,
+                            warning=warning,
+                            data=payload if isinstance(payload, dict) else None,
+                        )
+                    except CRCONHTTPError as exc:
+                        http_warning = str(exc)
+                        errors.append(f"CRCON HTTP: {exc}")
+                        # Log the HTTP failure before falling back to RCON
+                        import logging
+                        logging.getLogger(__name__).warning(
+                            "CRCON HTTP %s failed for server %s, falling back to direct RCON: %s",
+                            action_name, server_index, exc
+                        )
+                else:
+                    http_warning = "CRCON HTTP is not configured for this server."
+                    errors.append(f"CRCON HTTP: {http_warning}")
 
-        try:
-            rcon_client = self._rcon_client(server_index)
-            payload = rcon_action(rcon_client)
-            warning = http_warning or None
+            try:
+                rcon_client = self._rcon_client(server_index)
+                payload = rcon_action(rcon_client)
+                warning = http_warning or None
+                return ControlResult(
+                    success=True,
+                    transport="direct_rcon",
+                    message=success_rcon_message,
+                    warning=warning,
+                    data=payload if isinstance(payload, dict) else None,
+                )
+            except HLLRCONError as exc:
+                errors.append(f"Direct RCON: {exc}")
+
             return ControlResult(
-                success=True,
-                transport="direct_rcon",
-                message=success_rcon_message,
-                warning=warning,
-                data=payload if isinstance(payload, dict) else None,
+                success=False,
+                transport=None,
+                message=f"{action_name} failed. " + " ; ".join(errors),
             )
-        except HLLRCONError as exc:
-            errors.append(f"Direct RCON: {exc}")
-
-        return ControlResult(
-            success=False,
-            transport=None,
-            message=f"{action_name} failed. " + " ; ".join(errors),
-        )
 
     def _rcon_client(self, server_index: int) -> HLLRCONClient:
         server_number = self.server_number_resolver(server_index)
