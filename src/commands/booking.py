@@ -5,6 +5,9 @@ timestamps, which each viewer's client renders in their own time zone.
 """
 from __future__ import annotations
 
+import asyncio
+import logging
+import sqlite3
 from dataclasses import dataclass
 from typing import Awaitable, Callable, Optional
 
@@ -26,8 +29,11 @@ from services.booking import (
 
 NOT_CONFIGURED_MESSAGE = "Server booking is not configured on this bot."
 WRONG_GUILD_MESSAGE = "Server booking is only available in this bot's home Discord."
+STORE_ERROR_MESSAGE = "❌ Could not reach the booking store. Nothing was changed; try again shortly."
 # Discord rejects messages over 2000 characters; leave room for the "…and N more." line.
 MAX_REPLY_CHARS = 1900
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -129,7 +135,8 @@ def register_booking_commands(tree: app_commands.CommandTree, deps: BookingComma
             start_utc = parse_start(start, deps.config.timezone)
             end_utc = start_utc + parse_duration(duration)
             server_key = deps.server_key(int(server.value))
-            booking = deps.service.create(
+            booking = await asyncio.to_thread(
+                deps.service.create,
                 server_key=server_key,
                 user_id=interaction.user.id,
                 user_name=interaction.user.display_name,
@@ -143,6 +150,10 @@ def register_booking_commands(tree: app_commands.CommandTree, deps: BookingComma
                 f"❌ That overlaps <@{conflict.user_id}>'s booking #{conflict.id}: "
                 f"{timestamp(conflict.start_utc)} → {timestamp(conflict.end_utc, 't')}.",
             )
+            return
+        except sqlite3.Error:
+            logger.exception("Booking store failed during /book")
+            await _reply(interaction, STORE_ERROR_MESSAGE)
             return
         except BookingError as exc:
             await _reply(
@@ -166,7 +177,12 @@ def register_booking_commands(tree: app_commands.CommandTree, deps: BookingComma
         if await _refuse_unavailable(interaction, deps):
             return
         server_key = deps.server_key(int(server.value)) if server else None
-        live = deps.service.list_live(server_key)
+        try:
+            live = await asyncio.to_thread(deps.service.list_live, server_key)
+        except sqlite3.Error:
+            logger.exception("Booking store failed during /bookings")
+            await _reply(interaction, STORE_ERROR_MESSAGE)
+            return
         if not live:
             await _reply(interaction, "No active or upcoming bookings.")
             return
@@ -179,9 +195,13 @@ def register_booking_commands(tree: app_commands.CommandTree, deps: BookingComma
         if await _refuse_unavailable(interaction, deps):
             return
         try:
-            booking = deps.service.cancel(
-                booking_id, interaction.user.id, is_booking_admin(interaction.user, deps.config)
+            booking = await asyncio.to_thread(
+                deps.service.cancel, booking_id, interaction.user.id, is_booking_admin(interaction.user, deps.config)
             )
+        except sqlite3.Error:
+            logger.exception("Booking store failed during /cancel_booking")
+            await _reply(interaction, STORE_ERROR_MESSAGE)
+            return
         except BookingError as exc:
             await _reply(interaction, f"❌ {exc}")
             return
@@ -196,15 +216,21 @@ def register_booking_commands(tree: app_commands.CommandTree, deps: BookingComma
         if deps.service is None or not deps.config.enabled or interaction.guild_id != deps.config.guild_id:
             return []
         admin = is_booking_admin(interaction.user, deps.config)
+        try:
+            live = await asyncio.to_thread(deps.service.list_live)
+        except sqlite3.Error:
+            logger.exception("Booking store failed during /cancel_booking autocomplete")
+            return []
+        needle = current.lower()
         choices = []
-        for booking in deps.service.list_live():
+        for booking in live:
             if not admin and booking.user_id != interaction.user.id:
                 continue
             label = (
                 f"#{booking.id} {deps.server_name_for_key(booking.server_key)} "
                 f"{format_local(booking.start_utc, deps.config.timezone)} ({booking.user_name})"
             )
-            if current and current not in label:
+            if needle and needle not in label.lower():
                 continue
             choices.append(app_commands.Choice(name=label[:100], value=booking.id))
         return choices[:25]

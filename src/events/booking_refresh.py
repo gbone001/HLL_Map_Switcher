@@ -6,6 +6,7 @@ tick, so an idle bot does not edit the panel every minute.
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import Awaitable, Callable
 
@@ -36,7 +37,7 @@ class BookingBoundaryRefresher:
         """
         now = self.service.now_ts()
         try:
-            crossed = self.service.has_boundary_between(self._last_tick_ts, now)
+            crossed = await asyncio.to_thread(self.service.has_boundary_between, self._last_tick_ts, now)
         except Exception:
             logger.exception("Booking boundary check failed; will retry")
             return False

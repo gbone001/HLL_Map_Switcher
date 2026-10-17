@@ -145,12 +145,11 @@ class OverlapTests(BookingServiceTestCase):
 
 
 class ActiveAndLockTests(BookingServiceTestCase):
-    def test_active_and_next(self):
+    def test_active_for(self):
         current = self.book(0, 1, user_id=1)
-        upcoming = self.book(2, 1, user_id=2)
+        self.book(2, 1, user_id=2)
 
         self.assertEqual(self.service.active_for("server1").id, current.id)
-        self.assertEqual(self.service.next_for("server1").id, upcoming.id)
 
         self.clock.ts = T0 + HOUR  # end is exclusive
         self.assertIsNone(self.service.active_for("server1"))
@@ -202,6 +201,22 @@ class CancelTests(BookingServiceTestCase):
         self.clock.ts = T0 + 2 * HOUR
         with self.assertRaises(BookingNotFoundError):
             self.service.cancel(booking.id, actor_id=1, is_admin=False)
+
+    def test_losing_a_concurrent_cancel_reports_not_found(self):
+        booking = self.book(1, 1, user_id=1)
+        real_get = self.service.get
+
+        def stale_get(booking_id):
+            # The admin's read happens before the owner's cancel lands.
+            stale = real_get(booking_id)
+            self.service.get = real_get
+            BookingService.cancel(self.service, booking_id, actor_id=1, is_admin=False)
+            return stale
+
+        self.service.get = stale_get
+        with self.assertRaises(BookingNotFoundError):
+            self.service.cancel(booking.id, actor_id=99, is_admin=True)
+        self.assertEqual(self.service.get(booking.id).cancelled_by, 1)
 
 
 class BoundaryTests(BookingServiceTestCase):

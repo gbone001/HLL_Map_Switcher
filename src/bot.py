@@ -142,6 +142,28 @@ else:
     print(f"Server booking disabled: {booking_config.disabled_reason}")
 
 
+def _orphaned_booking_keys() -> set[str]:
+    """Server keys of live bookings that match no configured server (e.g. after SERVER{N}_* changes)."""
+    if booking_service is None:
+        return set()
+    known = {api_client.get_server_key(index) for index, _ in api_client.get_servers()}
+    return {booking.server_key for booking in booking_service.list_live()} - known
+
+
+if booking_service is not None:
+    try:
+        _orphaned = _orphaned_booking_keys()
+    except Exception as exc:
+        print(f"Could not check bookings against configured servers: {exc}")
+    else:
+        if _orphaned:
+            print(
+                "WARNING: live bookings exist for servers that are no longer configured and will not "
+                f"lock anything: {', '.join(sorted(_orphaned))}. Restore the matching SERVER{{N}}_* "
+                "settings or cancel those bookings."
+            )
+
+
 async def _booking_blocking_user(interaction: discord.Interaction, server_index: int) -> Optional[Booking]:
     if booking_service is None:
         return None
@@ -159,18 +181,23 @@ async def _deny_if_booked(interaction: discord.Interaction, server_index: int, *
     Called right before each write rather than when a flow opens, so a flow opened before a
     booking starts cannot finish during it.
     """
-    blocking = await _booking_blocking_user(interaction, server_index)
-    if blocking is None:
-        return False
-
-    message = (
-        f"🔒 **{api_client.get_server_name(server_index)}** is booked by <@{blocking.user_id}> "
-        f"until <t:{blocking.end_utc}:t>. Only they or a booking admin can change it right now."
-    )
-    print(
-        f"Booking guard blocked user {interaction.user.id} on server index {server_index} "
-        f"(booking #{blocking.id})"
-    )
+    try:
+        blocking = await _booking_blocking_user(interaction, server_index)
+    except Exception as exc:
+        # Fail closed: without the booking store we can't tell whether someone holds the server.
+        print(f"Booking guard could not read bookings for server index {server_index}: {exc}")
+        message = "❌ Could not check server bookings, so nothing was changed. Try again shortly."
+    else:
+        if blocking is None:
+            return False
+        message = (
+            f"🔒 **{api_client.get_server_name(server_index)}** is booked by <@{blocking.user_id}> "
+            f"until <t:{blocking.end_utc}:t>. Only they or a booking admin can change it right now."
+        )
+        print(
+            f"Booking guard blocked user {interaction.user.id} on server index {server_index} "
+            f"(booking #{blocking.id})"
+        )
     if edit_flow:
         await update_interaction_message(interaction, content=message, embed=None, view=None)
         asyncio.create_task(_delete_interaction_after(interaction, 20.0))
@@ -1946,9 +1973,6 @@ class VariantDropdown(discord.ui.Select):
         variant_entry = next((v for v in self.variants if v["id"] == selected_variant_id), None)
         variant_name = variant_entry["variant"] if variant_entry else selected_variant_id
 
-        if await _deny_if_booked(interaction, self.server_index, edit_flow=True):
-            return
-
         embed = discord.Embed(
             title="🔄 Changing Map...",
             description=f"**Server:** {server_name}\n\nAttempting to change to **{self.map_name}** ({variant_name})",
@@ -1956,8 +1980,10 @@ class VariantDropdown(discord.ui.Select):
         )
         
         await interaction.response.edit_message(embed=embed, view=None)
-        
 
+        # Acknowledge first, then check the booking lock right before the write.
+        if await _deny_if_booked(interaction, self.server_index, edit_flow=True):
+            return
 
         status_lines = []
         overall_success = False
@@ -2142,20 +2168,20 @@ async def repost_button(interaction: discord.Interaction):
     else:
         await send_temporary_response(interaction, content="❌ Could not find the configured channel.", delay=20)
 
-register_booking_commands(
-    bot.tree,
-    BookingCommandDeps(
-        service=booking_service,
-        config=booking_config,
-        servers=api_client.get_servers,
-        server_key=api_client.get_server_key,
-        server_name_for_key=api_client.get_server_name_for_key,
-        on_change=lambda: refresh_main_embed(),
-    ),
-)
-booking_refresher = (
-    BookingBoundaryRefresher(booking_service, lambda: refresh_main_embed()) if booking_service else None
-)
+booking_refresher: Optional[BookingBoundaryRefresher] = None
+if booking_service is not None:
+    register_booking_commands(
+        bot.tree,
+        BookingCommandDeps(
+            service=booking_service,
+            config=booking_config,
+            servers=api_client.get_servers,
+            server_key=api_client.get_server_key,
+            server_name_for_key=api_client.get_server_name_for_key,
+            on_change=lambda: refresh_main_embed(),
+        ),
+    )
+    booking_refresher = BookingBoundaryRefresher(booking_service, lambda: refresh_main_embed())
 
 
 if __name__ == '__main__':

@@ -248,16 +248,6 @@ class BookingService:
             ).fetchone()
         return _row_to_booking(row) if row else None
 
-    def next_for(self, server_key: str) -> Optional[Booking]:
-        now = self.now_ts()
-        with closing(self._connect()) as conn:
-            row = conn.execute(
-                f"SELECT {_COLUMNS} FROM bookings WHERE server_key = ? AND cancelled_at IS NULL "
-                "AND start_utc > ? ORDER BY start_utc LIMIT 1",
-                (server_key, now),
-            ).fetchone()
-        return _row_to_booking(row) if row else None
-
     def summary_by_server(self) -> dict[str, tuple[Optional[Booking], Optional[Booking]]]:
         """(active, next) booking per server key, from a single query."""
         now = self.now_ts()
@@ -287,10 +277,13 @@ class BookingService:
         if booking.user_id != actor_id and not is_admin:
             raise BookingPermissionError(f"Booking #{booking_id} is not yours.")
         with closing(self._connect()) as conn:
-            conn.execute(
+            cursor = conn.execute(
                 "UPDATE bookings SET cancelled_at = ?, cancelled_by = ? WHERE id = ? AND cancelled_at IS NULL",
                 (self.now_ts(), actor_id, booking_id),
             )
+        if cursor.rowcount == 0:
+            # Someone else cancelled it between the read above and this update.
+            raise BookingNotFoundError(f"Booking #{booking_id} was not found or has already ended.")
         return self.get(booking_id)
 
     def has_boundary_between(self, since_ts: int, until_ts: int) -> bool:

@@ -2,6 +2,7 @@ import ast
 import importlib
 import os
 import re
+import sqlite3
 import sys
 import tempfile
 import unittest
@@ -155,6 +156,30 @@ class GuardAtWriteSiteTests(BookingBotTestCase):
 
         write.assert_called_once()
 
+    async def test_store_error_fails_closed_with_explicit_message(self):
+        with mock.patch.object(
+            self.service, "blocking_booking", side_effect=sqlite3.OperationalError("database is locked")
+        ):
+            interaction, write = await self.submit_cooldown(member(OTHER_ID))
+
+        write.assert_not_called()
+        sent = interaction.followup.send.await_args.kwargs.get("content", "")
+        self.assertIn("Could not check server bookings", sent)
+
+    async def test_map_change_acknowledges_before_checking_the_lock(self):
+        self.book_now()
+        interaction = interaction_for(member(OTHER_ID))
+        dropdown = bot.VariantDropdown(0, "warfare", "Foy", [{"id": "foy_warfare", "variant": "Day"}])
+        change_map = mock.Mock()
+
+        with mock.patch.object(type(dropdown), "values", new_callable=mock.PropertyMock, return_value=["foy_warfare"]),                 mock.patch.object(bot.server_control, "change_map", change_map):
+            await dropdown.callback(interaction)
+
+        change_map.assert_not_called()
+        self.assertIn("Changing Map", interaction.response.edited[0]["embed"].title)
+        denial = interaction.edit_original_response.await_args.kwargs["content"]
+        self.assertIn("is booked by", denial)
+
     async def test_flow_denial_replaces_the_ephemeral_flow_message(self):
         self.book_now()
         interaction = interaction_for(member(OTHER_ID))
@@ -266,6 +291,24 @@ class CommandTests(BookingBotTestCase):
         self.assertLessEqual(len(reply), 2000)
         self.assertRegex(reply, r"…and \d+ more\.$")
 
+    async def test_store_error_is_reported_not_raised(self):
+        listing = interaction_for(member(OTHER_ID))
+        with mock.patch.object(self.service, "list_live", side_effect=sqlite3.OperationalError("disk I/O error")):
+            await self.tree.get_command("bookings").callback(listing, server=None)
+
+        self.assertIn("booking store", listing.response.sent[-1])
+
+    async def test_cancel_autocomplete_matches_case_insensitively(self):
+        self.service.create("server1", BOOKER_ID, "booker", T0 + HOUR, T0 + 2 * HOUR)
+        command = self.tree.get_command("cancel_booking")
+        autocomplete = command._params["booking_id"].autocomplete
+        interaction = interaction_for(member(BOOKER_ID))
+
+        choices = await autocomplete(interaction, "server one")
+
+        self.assertEqual(len(choices), 1)
+        self.assertIn("Server One", choices[0].name)
+
     async def test_book_requires_role(self):
         reply = await self.run_book(member(OTHER_ID))
 
@@ -308,6 +351,20 @@ class CommandTests(BookingBotTestCase):
         await tree.get_command("bookings").callback(interaction, server=None)
 
         self.assertIn("not configured", interaction.response.sent[-1])
+
+
+class BookingWiringTests(BookingBotTestCase):
+    def test_commands_not_registered_when_booking_disabled(self):
+        # bot was imported without BOOKING_ROLE_ID, so booking is off.
+        for name in ("book", "bookings", "cancel_booking"):
+            self.assertIsNone(bot.bot.tree.get_command(name))
+        self.assertIsNone(bot.booking_refresher)
+
+    def test_orphaned_booking_keys_reports_unconfigured_servers(self):
+        self.book_now()
+        self.service.create("server99", BOOKER_ID, "booker", T0 + HOUR, T0 + 2 * HOUR)
+
+        self.assertEqual(bot._orphaned_booking_keys(), {"server99"})
 
 
 class PanelAndRefreshTests(BookingBotTestCase):
