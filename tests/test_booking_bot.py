@@ -76,7 +76,11 @@ def interaction_for(user):
     interaction.user = user
     interaction.guild_id = getattr(getattr(user, "guild", None), "id", None)
     interaction.response = FakeResponse()
-    interaction.followup.send = mock.AsyncMock(return_value=None)
+
+    async def followup_send(content=None, **kwargs):
+        interaction.response.sent.append(content if content is not None else kwargs.get("content"))
+
+    interaction.followup.send = mock.AsyncMock(side_effect=followup_send)
     interaction.edit_original_response = mock.AsyncMock()
     interaction.delete_original_response = mock.AsyncMock()
     return interaction
@@ -290,6 +294,32 @@ class CommandTests(BookingBotTestCase):
         reply = listing.response.sent[-1]
         self.assertLessEqual(len(reply), 2000)
         self.assertRegex(reply, r"…and \d+ more\.$")
+
+    async def test_commands_acknowledge_before_touching_the_store(self):
+        self.clock.ts = T0 - 24 * HOUR
+        booker = member(BOOKER_ID, role_ids=[BOOKING_ROLE])
+        acked_at_store_call = []
+        real_create, real_list, real_cancel = self.service.create, self.service.list_live, self.service.cancel
+
+        def tracking(real):
+            def call(*args, **kwargs):
+                acked_at_store_call.append(current.response.is_done())
+                return real(*args, **kwargs)
+            return call
+
+        with mock.patch.object(self.service, "create", tracking(real_create)),                 mock.patch.object(self.service, "list_live", tracking(real_list)),                 mock.patch.object(self.service, "cancel", tracking(real_cancel)):
+            current = interaction_for(booker)
+            choice = app_commands.Choice(name="Server One", value="0")
+            await self.tree.get_command("book").callback(current, server=choice, start="2027-01-15 09:00", duration="1h")
+            booking_id = self.service.list_live()[0].id
+            current = interaction_for(booker)
+            await self.tree.get_command("bookings").callback(current, server=None)
+            current = interaction_for(booker)
+            await self.tree.get_command("cancel_booking").callback(current, booking_id=booking_id)
+
+        self.assertIn("Cancelled", current.response.sent[-1])
+        self.assertTrue(acked_at_store_call)
+        self.assertTrue(all(acked_at_store_call), acked_at_store_call)
 
     async def test_store_error_is_reported_not_raised(self):
         listing = interaction_for(member(OTHER_ID))

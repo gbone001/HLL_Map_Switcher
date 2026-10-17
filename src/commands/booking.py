@@ -97,7 +97,16 @@ def describe_booking(booking: Booking, server_name: str) -> str:
 
 
 async def _reply(interaction: discord.Interaction, content: str) -> None:
-    await interaction.response.send_message(content, ephemeral=True, allowed_mentions=discord.AllowedMentions.none())
+    mentions = discord.AllowedMentions.none()
+    if interaction.response.is_done():
+        await interaction.followup.send(content, ephemeral=True, allowed_mentions=mentions)
+    else:
+        await interaction.response.send_message(content, ephemeral=True, allowed_mentions=mentions)
+
+
+async def _defer(interaction: discord.Interaction) -> None:
+    """Acknowledge before touching the store: a locked SQLite file can wait longer than Discord's 3s deadline."""
+    await interaction.response.defer(ephemeral=True, thinking=True)
 
 
 async def _refuse_unavailable(interaction: discord.Interaction, deps: "BookingCommandDeps") -> bool:
@@ -131,6 +140,7 @@ def register_booking_commands(tree: app_commands.CommandTree, deps: BookingComma
             await _reply(interaction, f"You need the {role} role to book a server.")
             return
 
+        await _defer(interaction)
         try:
             start_utc = parse_start(start, deps.config.timezone)
             end_utc = start_utc + parse_duration(duration)
@@ -177,6 +187,7 @@ def register_booking_commands(tree: app_commands.CommandTree, deps: BookingComma
         if await _refuse_unavailable(interaction, deps):
             return
         server_key = deps.server_key(int(server.value)) if server else None
+        await _defer(interaction)
         try:
             live = await asyncio.to_thread(deps.service.list_live, server_key)
         except sqlite3.Error:
@@ -194,6 +205,7 @@ def register_booking_commands(tree: app_commands.CommandTree, deps: BookingComma
     async def cancel_booking(interaction: discord.Interaction, booking_id: int):
         if await _refuse_unavailable(interaction, deps):
             return
+        await _defer(interaction)
         try:
             booking = await asyncio.to_thread(
                 deps.service.cancel, booking_id, interaction.user.id, is_booking_admin(interaction.user, deps.config)
