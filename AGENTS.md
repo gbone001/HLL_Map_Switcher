@@ -11,9 +11,12 @@
 ## Live Service Modules
 - `src/utils/crcon_http.py` -> authoritative CRCON HTTP client. Handles token auth, gamestate, map changes, objective layout changes, dynamic weather, timer updates, and admin access operations.
 - `src/utils/hll_rcon.py` -> direct Hell Let Loose RCON v2 client for TCP fallback when CRCON HTTP is unavailable.
-- `src/utils/api_client.py` -> server discovery and lightweight CRCON-backed server metadata wrapper used by the Discord layer.
+- `src/utils/api_client.py` -> server discovery and lightweight CRCON-backed server metadata wrapper used by the Discord layer, including the stable server key (`get_server_key`) bookings are stored against.
 - `src/utils/map_data.py` -> CRCON map catalog loading, normalization, cache file persistence, and fallback map data.
 - `src/services/server_control.py` -> HTTP-first control service with direct RCON fallback for status reads, map changes, sector layout changes, dynamic weather, and timer updates.
+- `src/services/booking.py` -> server booking store (SQLite in `data/bookings.db`), overlap checks, time parsing, and the booking-lock decision (`blocking_booking`). No Discord or CRCON dependencies.
+- `src/commands/booking.py` -> `/book`, `/bookings`, `/cancel_booking` slash commands and the booking role/admin checks.
+- `src/events/booking_refresh.py` -> display-only loops that re-render the panel when a booking starts or ends, and daily at `BOOKING_PANEL_REFRESH_TIME` (default 06:00 in `BOOKING_TIMEZONE`) so the panel's two-week booking schedule rolls forward.
 
 ## Supporting Modules
 - `src/config/settings.py` -> older environment-variable loader; not the main runtime configuration path today.
@@ -23,6 +26,7 @@
 ## Discord Controls In Production
 - Slash commands:
 - `/repost_button` -> reposts the persistent control panel for admins.
+- `/book`, `/bookings`, `/cancel_booking` -> server booking (enabled only when `BOOKING_ROLE_ID` and `DISCORD_GUILD_ID` are set; roles and admin rights count only inside `DISCORD_GUILD_ID`). See `docs/booking-shaping.md`.
 - Persistent panel actions:
 - `Change Server`
 - `Refresh Status`
@@ -61,6 +65,8 @@
 - Keep map catalog parsing and caching inside `src/utils/map_data.py`.
 - Keep server discovery and server-name resolution inside `src/utils/api_client.py` or a future dedicated service module.
 - Keep HTTP-first / direct-RCON-fallback orchestration inside `src/services/server_control.py`.
+- Every new control write in `src/bot.py` must call `_deny_if_booked(...)` immediately before the write so the booking lock covers it.
+- The booking refresh loop must stay display-only; it must never call `ServerControlService`.
 - Keep Discord responses admin-friendly and short. Panel interactions should acknowledge quickly before doing slow network work.
 - Any new networked Discord interaction should be async-safe and avoid the `This interaction failed` pattern by deferring or responding immediately before slow work.
 

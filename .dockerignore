@@ -22,3 +22,6 @@ __pycache__
 # Dockerfile
 # docker-compose.yml
 # .dockerignore
+# Booking database (bind-mounted at runtime; never bake into the image)
+data/*.db
+data/*.db-journal

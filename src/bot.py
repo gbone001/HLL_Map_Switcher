@@ -7,6 +7,9 @@ from typing import Dict, Optional, Tuple
 import discord
 from discord.ext import commands
 from dotenv import load_dotenv
+from commands.booking import BookingCommandDeps, is_booking_admin, register_booking_commands
+from events.booking_refresh import BookingBoundaryRefresher
+from services.booking import SCHEDULE_DAYS, Booking, BookingConfig, BookingService, schedule_window
 from services.server_control import ControlResult, GameStatus, ServerControlService
 from utils.map_data import (
     get_maps_for_mode,
@@ -57,6 +60,8 @@ class MapSwitcherBot(commands.Bot):
 
     async def close(self) -> None:
         _stop_cache_cleanup_task()
+        if booking_refresher is not None:
+            booking_refresher.stop()
         await super().close()
 
 
@@ -118,6 +123,87 @@ server_control = ServerControlService(
     server_number_resolver=api_client.get_server_number,
     http_client_factory=_get_http_client,
 )
+
+
+# Server booking (docs/booking-shaping.md). Disabled unless BOOKING_ROLE_ID is set.
+booking_config = BookingConfig.from_env()
+booking_service: Optional[BookingService] = None
+if booking_config.enabled:
+    try:
+        booking_service = BookingService(
+            booking_config.db_path,
+            max_duration_seconds=booking_config.max_duration_seconds,
+            max_lead_seconds=booking_config.max_lead_seconds,
+        )
+        print(f"Server booking enabled (store: {booking_config.db_path}, time zone: {booking_config.timezone.key}).")
+    except Exception as exc:
+        print(f"Server booking disabled: could not open {booking_config.db_path}: {exc}")
+else:
+    print(f"Server booking disabled: {booking_config.disabled_reason}")
+
+
+def _orphaned_booking_keys() -> set[str]:
+    """Server keys of live bookings that match no configured server (e.g. after SERVER{N}_* changes)."""
+    if booking_service is None:
+        return set()
+    known = {api_client.get_server_key(index) for index, _ in api_client.get_servers()}
+    return {booking.server_key for booking in booking_service.list_live()} - known
+
+
+if booking_service is not None:
+    try:
+        _orphaned = _orphaned_booking_keys()
+    except Exception as exc:
+        print(f"Could not check bookings against configured servers: {exc}")
+    else:
+        if _orphaned:
+            print(
+                "WARNING: live bookings exist for servers that are no longer configured and will not "
+                f"lock anything: {', '.join(sorted(_orphaned))}. Restore the matching SERVER{{N}}_* "
+                "settings or cancel those bookings."
+            )
+
+
+async def _booking_blocking_user(interaction: discord.Interaction, server_index: int) -> Optional[Booking]:
+    if booking_service is None:
+        return None
+    return await asyncio.to_thread(
+        booking_service.blocking_booking,
+        api_client.get_server_key(server_index),
+        interaction.user.id,
+        is_booking_admin(interaction.user, booking_config),
+    )
+
+
+async def _deny_if_booked(interaction: discord.Interaction, server_index: int, *, edit_flow: bool = False) -> bool:
+    """Booking guard for control writes: True (and tell the user) if someone else holds the server.
+
+    Called right before each write rather than when a flow opens, so a flow opened before a
+    booking starts cannot finish during it.
+    """
+    try:
+        blocking = await _booking_blocking_user(interaction, server_index)
+    except Exception as exc:
+        # Fail closed: without the booking store we can't tell whether someone holds the server.
+        print(f"Booking guard could not read bookings for server index {server_index}: {exc}")
+        message = "❌ Could not check server bookings, so nothing was changed. Try again shortly."
+    else:
+        if blocking is None:
+            return False
+        message = (
+            f"🔒 **{api_client.get_server_name(server_index)}** is booked by <@{blocking.user_id}> "
+            f"until <t:{blocking.end_utc}:t>. Only they or a booking admin can change it right now."
+        )
+        print(
+            f"Booking guard blocked user {interaction.user.id} on server index {server_index} "
+            f"(booking #{blocking.id})"
+        )
+    if edit_flow:
+        await update_interaction_message(interaction, content=message, embed=None, view=None)
+        asyncio.create_task(_delete_interaction_after(interaction, 20.0))
+    else:
+        await send_temporary_response(interaction, content=message, delay=20)
+    return True
 
 
 async def _run_server_write(server_index: int, func, *args, **kwargs):
@@ -290,6 +376,7 @@ def _build_server_status_lines(
     focused_server_index: Optional[int],
     current_objectives_state: dict[tuple[int, str], list[str]],
     dynamic_weather_state: dict[tuple[int, str], bool],
+    booking_lines: Optional[dict[int, list[str]]] = None,
 ) -> tuple[list[str], list[str]]:
     """Build server status lines and collect CRCON-degraded server names."""
     server_lines: list[str] = []
@@ -299,6 +386,7 @@ def _build_server_status_lines(
         selected_prefix = "**[SELECTED]** " if focused_server_index == index else ""
         status_result = statuses.get(index)
         server_lines.append(f"{position}. {selected_prefix}{server_name}")
+        server_lines.extend((booking_lines or {}).get(index, []))
 
         if status_result is None:
             server_lines.append("   Status: ⚠️ Status not loaded.")
@@ -442,9 +530,101 @@ async def fetch_server_statuses() -> Dict[int, ControlResult]:
     return processed_results
 
 
+def _panel_booking_lines() -> Dict[int, list[str]]:
+    """Active booking (or the next one) per server, as Discord timestamps."""
+    if booking_service is None:
+        return {}
+    lines: Dict[int, list[str]] = {}
+    try:
+        summary = booking_service.summary_by_server()
+        for index, _ in api_client.get_servers():
+            active, upcoming = summary.get(api_client.get_server_key(index), (None, None))
+            if active is not None:
+                lines[index] = [
+                    f"   🔒 Booked by <@{active.user_id}> until <t:{active.end_utc}:t> (<t:{active.end_utc}:R>)"
+                ]
+                continue
+            if upcoming is not None:
+                lines[index] = [
+                    f"   📅 Next booking: <@{upcoming.user_id}> <t:{upcoming.start_utc}:f> (<t:{upcoming.start_utc}:R>)"
+                ]
+    except Exception as exc:
+        print(f"Could not read bookings for the panel: {exc}")
+        return {}
+    return lines
+
+
+def _panel_schedule_lines() -> Optional[list[str]]:
+    """Every booking from the start of today through the next SCHEDULE_DAYS days (booking time zone).
+
+    None when booking is off or the store can't be read, so the panel omits the section.
+    """
+    if booking_service is None:
+        return None
+    try:
+        now = booking_service.now_ts()
+        since, until = schedule_window(now, booking_config.timezone)
+        bookings = booking_service.list_window(since, until)
+    except Exception as exc:
+        print(f"Could not read the booking schedule for the panel: {exc}")
+        return None
+
+    lines = []
+    for booking in bookings:
+        line = (
+            f"<t:{booking.start_utc}:f> → <t:{booking.end_utc}:t> · "
+            f"**{api_client.get_server_name_for_key(booking.server_key)}** · <@{booking.user_id}>"
+        )
+        if booking.end_utc <= now:
+            line = f"~~{line}~~"
+        elif booking.start_utc <= now:
+            line = f"🔒 {line}"
+        lines.append(line)
+    return lines
+
+
+# Discord caps an embed field at 1024 characters and a whole embed at 6000.
+_EMBED_FIELD_LIMIT = 1024
+_EMBED_TOTAL_LIMIT = 6000
+_SCHEDULE_MAX_CHARS = 3072
+
+
+def _add_schedule_fields(embed: discord.Embed, lines: list[str]) -> None:
+    """Append the booking schedule as one or more fields, trimmed to fit Discord's embed limits."""
+    title = f"📅 Bookings: today + next {SCHEDULE_DAYS - 1} days"
+    if not lines:
+        embed.add_field(name=title, value="No bookings.", inline=False)
+        return
+
+    budget = min(_SCHEDULE_MAX_CHARS, _EMBED_TOTAL_LIMIT - len(embed) - 200)
+    chunks: list[list[str]] = [[]]
+    used = chunk_len = 0
+    shown = 0
+    for line in lines:
+        if used + len(line) + 1 > budget:
+            break
+        if chunk_len + len(line) + 1 > _EMBED_FIELD_LIMIT - 40:
+            chunks.append([])
+            chunk_len = 0
+        chunks[-1].append(line)
+        chunk_len += len(line) + 1
+        used += len(line) + 1
+        shown += 1
+    if shown < len(lines):
+        chunks[-1].append(f"…and {len(lines) - shown} more (see /bookings).")
+
+    for number, chunk in enumerate(chunks):
+        if chunk:
+            embed.add_field(name=title if number == 0 else "📅 (cont.)", value="\n".join(chunk), inline=False)
+
+
 async def build_panel(focused_server_index: Optional[int] = None) -> Tuple[discord.Embed, "GameModeView"]:
-    statuses = await fetch_server_statuses()
-    embed = build_main_embed(focused_server_index, statuses)
+    statuses, booking_lines, schedule_lines = await asyncio.gather(
+        fetch_server_statuses(),
+        asyncio.to_thread(_panel_booking_lines),
+        asyncio.to_thread(_panel_schedule_lines),
+    )
+    embed = build_main_embed(focused_server_index, statuses, booking_lines, schedule_lines)
     crcon_outage, _ = _panel_crcon_outage_state(statuses, focused_server_index)
     view = GameModeView(focused_server_index=focused_server_index, crcon_outage=crcon_outage)
     return embed, view
@@ -495,6 +675,8 @@ def _panel_crcon_outage_state(
 def build_main_embed(
     focused_server_index: Optional[int],
     statuses: Dict[int, ControlResult],
+    booking_lines: Optional[Dict[int, list[str]]] = None,
+    schedule_lines: Optional[list[str]] = None,
 ) -> discord.Embed:
     """Render the panel embed from statuses already fetched by fetch_server_statuses()."""
     servers = api_client.get_servers()
@@ -505,6 +687,7 @@ def build_main_embed(
         focused_server_index=focused_server_index,
         current_objectives_state=_current_objectives_state,
         dynamic_weather_state=_dynamic_weather_state,
+        booking_lines=booking_lines,
     )
     
     selected_server_label = _build_selected_server_label(servers, focused_server_index)
@@ -526,6 +709,8 @@ def build_main_embed(
         color=0x2f3136,
     )
     embed.set_footer(text="Buttons stay active across restarts. Note: When you choose the last objective it will set the map to the selected objectives immediately.")
+    if schedule_lines is not None:
+        _add_schedule_fields(embed, schedule_lines)
     return embed
 
 
@@ -728,6 +913,9 @@ class AddAdminCamModal(discord.ui.Modal, title="ADD ADMIN CAM ACCESS"):
             await send_temporary_response(interaction, content="Player NOT FOUND", delay=10)
             return
 
+        if await _deny_if_booked(interaction, self.server_index):
+            return
+
         try:
             added = await _run_server_write(
                 self.server_index, client.add_admin, player_id=player_id, role="spectator", description="Admin cam access"
@@ -776,6 +964,8 @@ class TeamSwitchCooldownModal(discord.ui.Modal, title="SET TEAM SWITCH COOLDOWN"
         server_name = api_client.get_server_name(self.server_index)
 
         await defer_interaction(interaction, ephemeral=True)
+        if await _deny_if_booked(interaction, self.server_index):
+            return
         result = await asyncio.to_thread(server_control.set_team_switch_cooldown, self.server_index, cooldown_minutes)
         if not result.success:
             await send_temporary_response(
@@ -819,6 +1009,9 @@ class RemoveAdminCamConfirmView(discord.ui.View):
                 view=None,
             )
             asyncio.create_task(_delete_interaction_after(interaction, 10.0))
+            return
+
+        if await _deny_if_booked(interaction, self.server_index, edit_flow=True):
             return
 
         try:
@@ -947,6 +1140,9 @@ class GameModeView(PersistentView):
 
         minutes = _get_timer_minutes(env_name, default_minutes, server_index)
         server_name = api_client.get_server_name(server_index)
+
+        if await _deny_if_booked(interaction, server_index):
+            return
 
         if timer_name == "match timer":
             result = await asyncio.to_thread(server_control.set_match_timer, server_index, "warfare", minutes)
@@ -1539,6 +1735,10 @@ class DynamicWeatherToggleView(discord.ui.View):
         if not interaction.response.is_done():
             await interaction.response.defer(ephemeral=True)
 
+        if await _deny_if_booked(interaction, self.server_index, edit_flow=True):
+            self.stop()
+            return
+
         result = await asyncio.to_thread(server_control.set_dynamic_weather_enabled, self.server_index, self.map_id, enabled)
         if not result.success:
             followup = await interaction.followup.send(
@@ -1650,6 +1850,10 @@ class ObjectiveSelectionView(discord.ui.View):
             return
 
         objective_list = [choice for choice in objective_list if choice]
+
+        if await _deny_if_booked(interaction, self.server_index, edit_flow=True):
+            self.stop()
+            return
 
         result = await asyncio.to_thread(server_control.set_sector_layout, self.server_index, objective_list)
         if not result.success:
@@ -1836,7 +2040,7 @@ class VariantDropdown(discord.ui.Select):
         # Find the variant name for display
         variant_entry = next((v for v in self.variants if v["id"] == selected_variant_id), None)
         variant_name = variant_entry["variant"] if variant_entry else selected_variant_id
-        
+
         embed = discord.Embed(
             title="🔄 Changing Map...",
             description=f"**Server:** {server_name}\n\nAttempting to change to **{self.map_name}** ({variant_name})",
@@ -1844,8 +2048,10 @@ class VariantDropdown(discord.ui.Select):
         )
         
         await interaction.response.edit_message(embed=embed, view=None)
-        
 
+        # Acknowledge first, then check the booking lock right before the write.
+        if await _deny_if_booked(interaction, self.server_index, edit_flow=True):
+            return
 
         status_lines = []
         overall_success = False
@@ -1963,6 +2169,10 @@ async def on_ready():
     # Start periodic cache cleanup task
     _start_cache_cleanup_task()
 
+    # Re-render the panel when a booking starts or ends (display only).
+    if booking_refresher is not None:
+        booking_refresher.start()
+
     # Warm cache when available, but avoid noisy startup warnings if CRCON isn't reachable yet.
     await asyncio.to_thread(refresh_map_cache, force=False)
 
@@ -2025,6 +2235,26 @@ async def repost_button(interaction: discord.Interaction):
         await send_temporary_response(interaction, content="✅ Map changer button reposted!", delay=20)
     else:
         await send_temporary_response(interaction, content="❌ Could not find the configured channel.", delay=20)
+
+booking_refresher: Optional[BookingBoundaryRefresher] = None
+if booking_service is not None:
+    register_booking_commands(
+        bot.tree,
+        BookingCommandDeps(
+            service=booking_service,
+            config=booking_config,
+            servers=api_client.get_servers,
+            server_key=api_client.get_server_key,
+            server_name_for_key=api_client.get_server_name_for_key,
+            on_change=lambda: refresh_main_embed(),
+        ),
+    )
+    booking_refresher = BookingBoundaryRefresher(
+        booking_service,
+        lambda: refresh_main_embed(),
+        daily_at=booking_config.panel_refresh_time.replace(tzinfo=booking_config.timezone),
+    )
+
 
 if __name__ == '__main__':
     from config.settings import validate_required_env
