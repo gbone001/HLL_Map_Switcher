@@ -6,7 +6,9 @@ import sqlite3
 import sys
 import tempfile
 import unittest
+from datetime import time
 from pathlib import Path
+from zoneinfo import ZoneInfo
 from types import SimpleNamespace
 from unittest import mock
 
@@ -430,6 +432,50 @@ class PanelAndRefreshTests(BookingBotTestCase):
         self.assertFalse(await refresher.tick())
 
         self.assertEqual(refresh.await_count, 2)
+
+    def test_schedule_lists_today_through_two_weeks(self):
+        ended = self.service.create(self.server_key, BOOKER_ID, "booker", T0 - 60, T0 + 60)
+        self.clock.ts = T0 + 120
+        active = self.service.create(self.server_key, OTHER_ID, "other", T0 + 120, T0 + HOUR)
+        later = self.service.create(self.server_key, BOOKER_ID, "booker", T0 + 3 * 24 * HOUR, T0 + 3 * 24 * HOUR + HOUR)
+        self.service.create(self.server_key, BOOKER_ID, "booker", T0 + 15 * 24 * HOUR, T0 + 15 * 24 * HOUR + HOUR)
+
+        lines = bot._panel_schedule_lines()
+
+        self.assertEqual(len(lines), 3)
+        self.assertTrue(lines[0].startswith("~~") and f"<t:{ended.start_utc}:f>" in lines[0])
+        self.assertTrue(lines[1].startswith("🔒") and f"<t:{active.start_utc}:f>" in lines[1])
+        self.assertIn(f"<t:{later.start_utc}:f>", lines[2])
+
+    def test_schedule_omitted_when_booking_disabled(self):
+        with mock.patch.object(bot, "booking_service", None):
+            self.assertIsNone(bot._panel_schedule_lines())
+        embed = bot.build_main_embed(None, {}, None, None)
+        self.assertEqual(embed.fields, [])
+
+    def test_empty_schedule_says_so(self):
+        embed = bot.build_main_embed(None, {}, None, [])
+
+        self.assertEqual(embed.fields[0].value, "No bookings.")
+
+    def test_long_schedule_fits_discord_limits(self):
+        lines = [f"<t:{T0 + i}:f> → <t:{T0 + i + 60}:t> · **Server One** · <@123456789012345678>" for i in range(200)]
+
+        embed = bot.build_main_embed(None, {}, None, lines)
+
+        self.assertGreater(len(embed.fields), 1)
+        self.assertTrue(all(len(field.value) <= 1024 for field in embed.fields))
+        self.assertLessEqual(len(embed), 6000)
+        self.assertRegex(embed.fields[-1].value, r"…and \d+ more")
+
+    async def test_daily_refresh_is_scheduled_and_survives_errors(self):
+        sydney_six = time(6, 0, tzinfo=ZoneInfo("Australia/Sydney"))
+        refresh = mock.AsyncMock(side_effect=[RuntimeError("discord 503"), None])
+        refresher = BookingBoundaryRefresher(self.service, refresh, daily_at=sydney_six)
+
+        self.assertEqual(refresher._daily_loop.time, [sydney_six])
+        self.assertFalse(await refresher.daily())
+        self.assertTrue(await refresher.daily())
 
     async def test_refresher_only_refreshes_when_a_boundary_passes(self):
         refresh = mock.AsyncMock()

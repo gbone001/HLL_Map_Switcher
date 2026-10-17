@@ -16,7 +16,7 @@
 - `src/services/server_control.py` -> HTTP-first control service with direct RCON fallback for status reads, map changes, sector layout changes, dynamic weather, and timer updates.
 - `src/services/booking.py` -> server booking store (SQLite in `data/bookings.db`), overlap checks, time parsing, and the booking-lock decision (`blocking_booking`). No Discord or CRCON dependencies.
 - `src/commands/booking.py` -> `/book`, `/bookings`, `/cancel_booking` slash commands and the booking role/admin checks.
-- `src/events/booking_refresh.py` -> display-only loop that re-renders the panel when a booking starts or ends.
+- `src/events/booking_refresh.py` -> display-only loops that re-render the panel when a booking starts or ends, and daily at `BOOKING_PANEL_REFRESH_TIME` (default 06:00 in `BOOKING_TIMEZONE`) so the panel's two-week booking schedule rolls forward.
 
 ## Supporting Modules
 - `src/config/settings.py` -> older environment-variable loader; not the main runtime configuration path today.

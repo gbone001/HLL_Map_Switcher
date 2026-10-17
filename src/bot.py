@@ -9,7 +9,7 @@ from discord.ext import commands
 from dotenv import load_dotenv
 from commands.booking import BookingCommandDeps, is_booking_admin, register_booking_commands
 from events.booking_refresh import BookingBoundaryRefresher
-from services.booking import Booking, BookingConfig, BookingService
+from services.booking import SCHEDULE_DAYS, Booking, BookingConfig, BookingService, schedule_window
 from services.server_control import ControlResult, GameStatus, ServerControlService
 from utils.map_data import (
     get_maps_for_mode,
@@ -554,12 +554,77 @@ def _panel_booking_lines() -> Dict[int, list[str]]:
     return lines
 
 
+def _panel_schedule_lines() -> Optional[list[str]]:
+    """Every booking from the start of today through the next SCHEDULE_DAYS days (booking time zone).
+
+    None when booking is off or the store can't be read, so the panel omits the section.
+    """
+    if booking_service is None:
+        return None
+    try:
+        now = booking_service.now_ts()
+        since, until = schedule_window(now, booking_config.timezone)
+        bookings = booking_service.list_window(since, until)
+    except Exception as exc:
+        print(f"Could not read the booking schedule for the panel: {exc}")
+        return None
+
+    lines = []
+    for booking in bookings:
+        line = (
+            f"<t:{booking.start_utc}:f> → <t:{booking.end_utc}:t> · "
+            f"**{api_client.get_server_name_for_key(booking.server_key)}** · <@{booking.user_id}>"
+        )
+        if booking.end_utc <= now:
+            line = f"~~{line}~~"
+        elif booking.start_utc <= now:
+            line = f"🔒 {line}"
+        lines.append(line)
+    return lines
+
+
+# Discord caps an embed field at 1024 characters and a whole embed at 6000.
+_EMBED_FIELD_LIMIT = 1024
+_EMBED_TOTAL_LIMIT = 6000
+_SCHEDULE_MAX_CHARS = 3072
+
+
+def _add_schedule_fields(embed: discord.Embed, lines: list[str]) -> None:
+    """Append the booking schedule as one or more fields, trimmed to fit Discord's embed limits."""
+    title = f"📅 Bookings: today + next {SCHEDULE_DAYS - 1} days"
+    if not lines:
+        embed.add_field(name=title, value="No bookings.", inline=False)
+        return
+
+    budget = min(_SCHEDULE_MAX_CHARS, _EMBED_TOTAL_LIMIT - len(embed) - 200)
+    chunks: list[list[str]] = [[]]
+    used = chunk_len = 0
+    shown = 0
+    for line in lines:
+        if used + len(line) + 1 > budget:
+            break
+        if chunk_len + len(line) + 1 > _EMBED_FIELD_LIMIT - 40:
+            chunks.append([])
+            chunk_len = 0
+        chunks[-1].append(line)
+        chunk_len += len(line) + 1
+        used += len(line) + 1
+        shown += 1
+    if shown < len(lines):
+        chunks[-1].append(f"…and {len(lines) - shown} more (see /bookings).")
+
+    for number, chunk in enumerate(chunks):
+        if chunk:
+            embed.add_field(name=title if number == 0 else "📅 (cont.)", value="\n".join(chunk), inline=False)
+
+
 async def build_panel(focused_server_index: Optional[int] = None) -> Tuple[discord.Embed, "GameModeView"]:
-    statuses, booking_lines = await asyncio.gather(
+    statuses, booking_lines, schedule_lines = await asyncio.gather(
         fetch_server_statuses(),
         asyncio.to_thread(_panel_booking_lines),
+        asyncio.to_thread(_panel_schedule_lines),
     )
-    embed = build_main_embed(focused_server_index, statuses, booking_lines)
+    embed = build_main_embed(focused_server_index, statuses, booking_lines, schedule_lines)
     crcon_outage, _ = _panel_crcon_outage_state(statuses, focused_server_index)
     view = GameModeView(focused_server_index=focused_server_index, crcon_outage=crcon_outage)
     return embed, view
@@ -611,6 +676,7 @@ def build_main_embed(
     focused_server_index: Optional[int],
     statuses: Dict[int, ControlResult],
     booking_lines: Optional[Dict[int, list[str]]] = None,
+    schedule_lines: Optional[list[str]] = None,
 ) -> discord.Embed:
     """Render the panel embed from statuses already fetched by fetch_server_statuses()."""
     servers = api_client.get_servers()
@@ -643,6 +709,8 @@ def build_main_embed(
         color=0x2f3136,
     )
     embed.set_footer(text="Buttons stay active across restarts. Note: When you choose the last objective it will set the map to the selected objectives immediately.")
+    if schedule_lines is not None:
+        _add_schedule_fields(embed, schedule_lines)
     return embed
 
 
@@ -2181,7 +2249,11 @@ if booking_service is not None:
             on_change=lambda: refresh_main_embed(),
         ),
     )
-    booking_refresher = BookingBoundaryRefresher(booking_service, lambda: refresh_main_embed())
+    booking_refresher = BookingBoundaryRefresher(
+        booking_service,
+        lambda: refresh_main_embed(),
+        daily_at=booking_config.panel_refresh_time.replace(tzinfo=booking_config.timezone),
+    )
 
 
 if __name__ == '__main__':

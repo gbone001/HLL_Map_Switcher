@@ -14,7 +14,7 @@ import re
 import sqlite3
 from contextlib import closing
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, time, timedelta, timezone
 from pathlib import Path
 from typing import Callable, Optional
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -81,6 +81,8 @@ class Booking:
 
 DEFAULT_MAX_HOURS = 24
 DEFAULT_MAX_DAYS_AHEAD = 90
+DEFAULT_PANEL_REFRESH_TIME = time(6, 0)
+SCHEDULE_DAYS = 14
 
 
 @dataclass(frozen=True)
@@ -100,6 +102,8 @@ class BookingConfig:
     guild_id: Optional[int] = None
     max_duration_seconds: int = DEFAULT_MAX_HOURS * 3600
     max_lead_seconds: int = DEFAULT_MAX_DAYS_AHEAD * 86400
+    # Local time (in `timezone`) at which the panel's two-week schedule is re-rendered each day.
+    panel_refresh_time: time = DEFAULT_PANEL_REFRESH_TIME
 
     @classmethod
     def from_env(cls, environ: Optional[dict] = None) -> "BookingConfig":
@@ -112,6 +116,7 @@ class BookingConfig:
             "guild_id": _optional_int(env.get("DISCORD_GUILD_ID")),
             "max_duration_seconds": _positive_int(env.get("BOOKING_MAX_HOURS"), DEFAULT_MAX_HOURS) * 3600,
             "max_lead_seconds": _positive_int(env.get("BOOKING_MAX_DAYS_AHEAD"), DEFAULT_MAX_DAYS_AHEAD) * 86400,
+            "panel_refresh_time": _clock_time(env.get("BOOKING_PANEL_REFRESH_TIME"), DEFAULT_PANEL_REFRESH_TIME),
         }
 
         def disabled(reason: str) -> "BookingConfig":
@@ -161,6 +166,14 @@ def parse_duration(text: str) -> int:
     if seconds <= 0:
         raise BookingError("Duration must be greater than zero.")
     return seconds
+
+
+def schedule_window(now_ts: int, tz: ZoneInfo, days: int = SCHEDULE_DAYS) -> tuple[int, int]:
+    """[start of today, start of the day `days` later) in the booking time zone, as UTC epoch seconds."""
+    today = datetime.fromtimestamp(now_ts, tz).date()
+    start = datetime.combine(today, time(0, 0), tzinfo=tz)
+    end = datetime.combine(today + timedelta(days=days), time(0, 0), tzinfo=tz)
+    return int(start.timestamp()), int(end.timestamp())
 
 
 def format_local(ts: int, tz: ZoneInfo) -> str:
@@ -286,6 +299,16 @@ class BookingService:
             raise BookingNotFoundError(f"Booking #{booking_id} was not found or has already ended.")
         return self.get(booking_id)
 
+    def list_window(self, since_ts: int, until_ts: int) -> list[Booking]:
+        """Non-cancelled bookings overlapping [since, until), earliest first; includes ones already ended."""
+        with closing(self._connect()) as conn:
+            rows = conn.execute(
+                f"SELECT {_COLUMNS} FROM bookings WHERE cancelled_at IS NULL AND start_utc < ? AND end_utc > ? "
+                "ORDER BY start_utc",
+                (until_ts, since_ts),
+            ).fetchall()
+        return [_row_to_booking(row) for row in rows]
+
     def has_boundary_between(self, since_ts: int, until_ts: int) -> bool:
         """Did any non-cancelled booking start or end in (since, until]?"""
         with closing(self._connect()) as conn:
@@ -308,6 +331,13 @@ def _row_to_booking(row: tuple) -> Booking:
 def _positive_int(value: Optional[str], default: int) -> int:
     parsed = _optional_int(value)
     return parsed if parsed is not None and parsed > 0 else default
+
+
+def _clock_time(value: Optional[str], default: time) -> time:
+    try:
+        return datetime.strptime(str(value).strip(), "%H:%M").time() if value not in (None, "") else default
+    except ValueError:
+        return default
 
 
 def _optional_int(value: Optional[str]) -> Optional[int]:

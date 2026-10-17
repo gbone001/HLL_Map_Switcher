@@ -2,7 +2,7 @@ import sys
 import tempfile
 import threading
 import unittest
-from datetime import datetime, timezone
+from datetime import datetime, time, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -17,6 +17,7 @@ from services.booking import (
     BookingService,
     parse_duration,
     parse_start,
+    schedule_window,
 )
 
 T0 = 1_800_000_000  # fixed "now" for tests (2027-01-15 UTC)
@@ -306,6 +307,42 @@ class ConfigTests(unittest.TestCase):
         config = BookingConfig.from_env({"BOOKING_ROLE_ID": "1", "DISCORD_GUILD_ID": "1", "BOOKING_MAX_HOURS": "-3"})
 
         self.assertEqual((config.max_duration_seconds, config.max_lead_seconds), (24 * HOUR, 90 * 86400))
+
+
+class ScheduleTests(BookingServiceTestCase):
+    SYDNEY = ZoneInfo("Australia/Sydney")
+
+    def test_window_runs_from_local_midnight_for_fourteen_days(self):
+        # 2026-10-01 15:00 Sydney (AEST); clocks go forward on 2026-10-04 inside the window.
+        now = int(datetime(2026, 10, 1, 15, 0, tzinfo=self.SYDNEY).timestamp())
+
+        start, end = schedule_window(now, self.SYDNEY)
+
+        self.assertEqual(datetime.fromtimestamp(start, self.SYDNEY), datetime(2026, 10, 1, tzinfo=self.SYDNEY))
+        self.assertEqual(datetime.fromtimestamp(end, self.SYDNEY), datetime(2026, 10, 15, tzinfo=self.SYDNEY))
+        self.assertEqual(end - start, 14 * 86400 - HOUR)
+
+    def test_list_window_includes_ended_and_excludes_cancelled_and_outside(self):
+        ended = self.book(0, 1)
+        self.clock.ts = T0 + 2 * HOUR
+        upcoming = self.book(3, 1)
+        cancelled = self.book(5, 1)
+        self.service.cancel(cancelled.id, actor_id=1, is_admin=False)
+        self.book(20 * 24, 1)  # far outside
+
+        listed = self.service.list_window(T0 - HOUR, T0 + 14 * 24 * HOUR)
+
+        self.assertEqual([b.id for b in listed], [ended.id, upcoming.id])
+
+    def test_panel_refresh_time_config(self):
+        base = {"BOOKING_ROLE_ID": "1", "DISCORD_GUILD_ID": "2"}
+        self.assertEqual(BookingConfig.from_env(base).panel_refresh_time, time(6, 0))
+        self.assertEqual(
+            BookingConfig.from_env({**base, "BOOKING_PANEL_REFRESH_TIME": "07:30"}).panel_refresh_time, time(7, 30)
+        )
+        self.assertEqual(
+            BookingConfig.from_env({**base, "BOOKING_PANEL_REFRESH_TIME": "25:99"}).panel_refresh_time, time(6, 0)
+        )
 
 
 if __name__ == "__main__":
