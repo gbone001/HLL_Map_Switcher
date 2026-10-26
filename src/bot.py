@@ -371,28 +371,59 @@ LEGACY_EMBED_TITLES = {
 _PANEL_REF_PATH = booking_config.db_path.parent / "panel_message.json"
 
 
-def _load_panel_ref() -> tuple[int, int] | None:
+def _load_panel_refs() -> dict[int, tuple[int, int]]:
+    """guild_id -> (channel_id, message_id) of that guild's panel (multi-guild slice 4)."""
     try:
         data = json.loads(_PANEL_REF_PATH.read_text(encoding="utf-8"))
-        return int(data["channel_id"]), int(data["message_id"])
-    except (OSError, ValueError, KeyError, TypeError):
-        return None
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    if "channel_id" in data:
+        # Single-panel file from before per-guild panels: it was the home guild's panel.
+        try:
+            return {
+                guild_registry.home_guild_id or 0: (
+                    int(data["channel_id"]),
+                    int(data["message_id"]),
+                )
+            }
+        except (KeyError, TypeError, ValueError):
+            return {}
+    refs: dict[int, tuple[int, int]] = {}
+    for guild_id, entry in (data.get("panels") or {}).items():
+        try:
+            refs[int(guild_id)] = (int(entry["channel_id"]), int(entry["message_id"]))
+        except (KeyError, TypeError, ValueError):
+            continue
+    return refs
 
 
-def _set_panel_ref(channel_id: int, message_id: int) -> None:
-    global persistent_message_ref
-    persistent_message_ref = (channel_id, message_id)
+def _set_panel_ref(guild_id: int, channel_id: int, message_id: int) -> None:
+    panel_refs[guild_id] = (channel_id, message_id)
     try:
         _PANEL_REF_PATH.parent.mkdir(parents=True, exist_ok=True)
         _PANEL_REF_PATH.write_text(
-            json.dumps({"channel_id": channel_id, "message_id": message_id}),
+            json.dumps(
+                {
+                    "panels": {
+                        str(gid): {"channel_id": cid, "message_id": mid}
+                        for gid, (cid, mid) in panel_refs.items()
+                    }
+                }
+            ),
             encoding="utf-8",
         )
     except OSError as exc:
-        print(f"Could not save the panel message ID to {_PANEL_REF_PATH}: {exc}")
+        print(f"Could not save panel message IDs to {_PANEL_REF_PATH}: {exc}")
 
 
-persistent_message_ref: tuple[int, int] | None = _load_panel_ref()
+def _guild_of(channel: object) -> int:
+    """Guild ID of a channel; 0 for channels without one (keeps single-guild setups working)."""
+    return getattr(getattr(channel, "guild", None), "id", None) or 0
+
+
+panel_refs: dict[int, tuple[int, int]] = _load_panel_refs()
 # Map channel_id -> focused server index (None = show all)
 _persistent_focused_server: dict[int, int | None] = {}
 # Map (server_index, map_pretty_name) -> current objectives last set through this bot
@@ -748,7 +779,7 @@ async def fetch_server_statuses() -> dict[int, ControlResult]:
     return processed_results
 
 
-def _panel_booking_lines() -> dict[int, list[str]]:
+def _panel_booking_lines(viewer_guild_id: int | None = None) -> dict[int, list[str]]:
     """Active booking (or the next one) per server, as Discord timestamps."""
     if booking_service is None:
         return {}
@@ -761,12 +792,12 @@ def _panel_booking_lines() -> dict[int, list[str]]:
             )
             if active is not None:
                 lines[index] = [
-                    f"   🔒 Booked by {_booked_by(active)} until <t:{active.end_utc}:t> (<t:{active.end_utc}:R>)"
+                    f"   🔒 Booked by {_booked_by(active, viewer_guild_id)} until <t:{active.end_utc}:t> (<t:{active.end_utc}:R>)"
                 ]
                 continue
             if upcoming is not None:
                 lines[index] = [
-                    f"   📅 Next booking: {_booked_by(upcoming)} <t:{upcoming.start_utc}:f> (<t:{upcoming.start_utc}:R>)"
+                    f"   📅 Next booking: {_booked_by(upcoming, viewer_guild_id)} <t:{upcoming.start_utc}:f> (<t:{upcoming.start_utc}:R>)"
                 ]
     except Exception as exc:
         print(f"Could not read bookings for the panel: {exc}")
@@ -774,7 +805,7 @@ def _panel_booking_lines() -> dict[int, list[str]]:
     return lines
 
 
-def _panel_schedule_lines() -> list[str] | None:
+def _panel_schedule_lines(viewer_guild_id: int | None = None) -> list[str] | None:
     """Every booking from the start of today through the next SCHEDULE_DAYS days (booking time zone).
 
     None when booking is off or the store can't be read, so the panel omits the section.
@@ -793,7 +824,7 @@ def _panel_schedule_lines() -> list[str] | None:
     for booking in bookings:
         line = (
             f"<t:{booking.start_utc}:f> → <t:{booking.end_utc}:t> · "
-            f"**{api_client.get_server_name_for_key(booking.server_key)}** · {_booked_by(booking)}"
+            f"**{api_client.get_server_name_for_key(booking.server_key)}** · {_booked_by(booking, viewer_guild_id)}"
         )
         if booking.end_utc <= now:
             line = f"~~{line}~~"
@@ -844,12 +875,21 @@ def _add_schedule_fields(embed: discord.Embed, lines: list[str]) -> None:
 
 async def build_panel(
     focused_server_index: int | None = None,
+    viewer_guild_id: int | None = None,
+    statuses: dict[int, ControlResult] | None = None,
 ) -> tuple[discord.Embed, "GameModeView"]:
+    """The panel as one guild sees it. Pass `statuses` to reuse one CRCON read across guilds."""
+
+    async def current_statuses():
+        return statuses if statuses is not None else await fetch_server_statuses()
+
     statuses, booking_lines, schedule_lines, controls_unlocked = await asyncio.gather(
-        fetch_server_statuses(),
-        asyncio.to_thread(_panel_booking_lines),
-        asyncio.to_thread(_panel_schedule_lines),
-        asyncio.to_thread(_panel_controls_unlocked, focused_server_index),
+        current_statuses(),
+        asyncio.to_thread(_panel_booking_lines, viewer_guild_id),
+        asyncio.to_thread(_panel_schedule_lines, viewer_guild_id),
+        asyncio.to_thread(
+            _panel_controls_unlocked, focused_server_index, viewer_guild_id
+        ),
     )
     embed = build_main_embed(
         focused_server_index, statuses, booking_lines, schedule_lines
@@ -869,11 +909,15 @@ async def build_panel(
     return embed, view
 
 
-def _panel_controls_unlocked(focused_server_index: int | None) -> bool:
+def _panel_controls_unlocked(
+    focused_server_index: int | None, viewer_guild_id: int | None = None
+) -> bool:
     """Show game controls only while a booking is live on the focused server.
 
-    With no focused server (and several configured) any live booking unlocks them. Booking
-    off means no gating. A store failure hides them; writes fail closed in _deny_if_booked anyway.
+    With no focused server (and several configured) any live booking unlocks them. A guest
+    guild's panel only counts bookings made from that guild; the home panel counts every
+    booking so home booking admins can override. Booking off means no gating. A store
+    failure hides them; writes fail closed in _deny_if_booked anyway.
     """
     if booking_service is None:
         return True
@@ -882,11 +926,19 @@ def _panel_controls_unlocked(focused_server_index: int | None) -> bool:
         targets = [focused_server_index]
     else:
         targets = servers
+    counts_any = (
+        viewer_guild_id is None
+        or not guild_registry.configured
+        or guild_registry.is_home(viewer_guild_id)
+    )
     try:
-        return any(
-            booking_service.active_for(api_client.get_server_key(index))
-            for index in targets
-        )
+        for index in targets:
+            active = booking_service.active_for(api_client.get_server_key(index))
+            if active is not None and (
+                counts_any or active.guild_id in (None, viewer_guild_id)
+            ):
+                return True
+        return False
     except Exception as exc:
         print(f"Could not read bookings to gate panel controls: {exc}")
         return False
@@ -993,28 +1045,25 @@ def build_main_embed(
 
 async def ensure_persistent_message(
     channel: discord.abc.Messageable,
+    statuses: dict[int, ControlResult] | None = None,
 ) -> discord.Message | None:
-    global persistent_message_ref
+    """Edit (or find, or post) this guild's panel in `channel`."""
     channel_id = getattr(channel, "id", None)
+    guild_id = _guild_of(channel)
     focused = None
     if channel_id is not None:
-        focused = _persistent_focused_server.get(channel_id)
-    embed, view = await build_panel(focused)
+        focused = _persistent_focused_server.setdefault(channel_id, None)
+    embed, view = await build_panel(focused, guild_id or None, statuses)
 
-    if persistent_message_ref and channel_id is not None:
-        ref_channel_id, message_id = persistent_message_ref
-        if ref_channel_id == channel_id and hasattr(channel, "get_partial_message"):
-            # Edit by ID: unlike fetch_message, this needs no Read Message History permission.
-            try:
-                return await channel.get_partial_message(message_id).edit(
-                    embed=embed, view=view
-                )
-            except discord.NotFound:
-                pass  # deleted by hand; find or post a new one below
-        persistent_message_ref = None
-
-    if channel_id is not None:
-        _persistent_focused_server.setdefault(channel_id, None)
+    ref = panel_refs.get(guild_id)
+    if ref and ref[0] == channel_id and hasattr(channel, "get_partial_message"):
+        # Edit by ID: unlike fetch_message, this needs no Read Message History permission.
+        try:
+            return await channel.get_partial_message(ref[1]).edit(
+                embed=embed, view=view
+            )
+        except discord.NotFound:
+            pass  # deleted by hand; find or post a new one below
 
     history = getattr(channel, "history", None)
     if history is not None:
@@ -1025,7 +1074,7 @@ async def ensure_persistent_message(
                     if title == MAIN_EMBED_TITLE or title in LEGACY_EMBED_TITLES:
                         await message.edit(embed=embed, view=view)
                         if channel_id is not None:
-                            _set_panel_ref(channel_id, message.id)
+                            _set_panel_ref(guild_id, channel_id, message.id)
                         return message
         except discord.Forbidden:
             print(
@@ -1035,18 +1084,34 @@ async def ensure_persistent_message(
 
     message = await channel.send(embed=embed, view=view)  # type: ignore[attr-defined]
     if channel_id is not None:
-        _set_panel_ref(channel_id, message.id)
+        _set_panel_ref(guild_id, channel_id, message.id)
     return message
 
 
-def _panel_channel_id() -> int | None:
-    """The panel's channel: wherever /setup_panel last put it, else DISCORD_CHANNEL_ID."""
-    if persistent_message_ref:
-        return persistent_message_ref[0]
+def _panel_channel_id(guild_id: int | None) -> int | None:
+    """A guild's panel channel: wherever /setup_panel put it. The home guild (or a setup
+    without guilds) falls back to DISCORD_CHANNEL_ID before its first /setup_panel."""
+    ref = panel_refs.get(guild_id or 0)
+    if ref:
+        return ref[0]
+    if guild_id and guild_registry.configured and not guild_registry.is_home(guild_id):
+        return None
     try:
         return int(os.getenv("DISCORD_CHANNEL_ID") or "")
     except ValueError:
         return None
+
+
+def _panel_channel_ids() -> list[int]:
+    """Every approved guild's panel channel, home first."""
+    channels: list[int] = []
+    home_channel = _panel_channel_id(guild_registry.home_guild_id)
+    if home_channel is not None:
+        channels.append(home_channel)
+    for guild_id, (channel_id, _) in panel_refs.items():
+        if guild_registry.is_approved(guild_id) and channel_id not in channels:
+            channels.append(channel_id)
+    return channels
 
 
 async def _resolve_text_channel(
@@ -1068,25 +1133,44 @@ async def _resolve_text_channel(
 async def post_panel(
     channel: discord.TextChannel | discord.Thread,
 ) -> discord.Message:
-    """Post a fresh panel in `channel`, remove the one it replaces, and remember the new one."""
-    _persistent_focused_server.setdefault(channel.id, None)
-    embed, view = await build_panel(_persistent_focused_server[channel.id])
+    """Post a fresh panel in `channel`, remove the one it replaces in this guild, and remember it."""
+    guild_id = _guild_of(channel)
+    focused = _persistent_focused_server.setdefault(channel.id, None)
+    embed, view = await build_panel(focused, guild_id or None)
     message = await channel.send(embed=embed, view=view)
-    if persistent_message_ref and persistent_message_ref[1] != message.id:
-        old_channel = await _resolve_text_channel(persistent_message_ref[0])
+    old = panel_refs.get(guild_id)
+    if old and old[1] != message.id:
+        old_channel = await _resolve_text_channel(old[0])
         if old_channel is not None:
             try:
-                await old_channel.get_partial_message(persistent_message_ref[1]).delete()
+                await old_channel.get_partial_message(old[1]).delete()
             except discord.HTTPException:
                 pass  # already deleted by hand
-    _set_panel_ref(channel.id, message.id)
+    _set_panel_ref(guild_id, channel.id, message.id)
     return message
 
 
-async def refresh_main_embed() -> None:
-    channel = await _resolve_text_channel(_panel_channel_id())
-    if channel is not None:
-        await ensure_persistent_message(channel)
+async def refresh_main_embed() -> list[discord.Message]:
+    """Re-render every approved guild's panel, reading CRCON status once for all of them."""
+    channels = [
+        channel
+        for channel in [await _resolve_text_channel(cid) for cid in _panel_channel_ids()]
+        if channel is not None
+    ]
+    if not channels:
+        return []
+    statuses = await fetch_server_statuses()
+    messages = []
+    for channel in channels:
+        try:
+            message = await ensure_persistent_message(channel, statuses)
+        except discord.HTTPException as exc:
+            # One guild's broken panel (permissions, deleted channel) must not stop the rest.
+            print(f"Could not refresh the panel in channel {channel.id}: {exc}")
+            continue
+        if message is not None:
+            messages.append(message)
+    return messages
 
 
 async def _delete_interaction_after(
@@ -2883,33 +2967,16 @@ async def on_ready():
     # Add the persistent view
     bot.add_view(GameModeView())
 
-    # Restore the panel where /setup_panel last put it (or DISCORD_CHANNEL_ID).
-    channel_id = _panel_channel_id()
-    if channel_id is None:
+    # Restore every guild's panel where /setup_panel last put it (home: or DISCORD_CHANNEL_ID).
+    messages = await refresh_main_embed()
+    if not messages:
         print("No panel channel yet; an admin can run /setup_panel in a channel.")
-        return
-
-    channel = await _resolve_text_channel(channel_id)
-    if channel is not None:
-        message = await ensure_persistent_message(channel)
-        if message:
-            print(
-                f"Persistent controls ready in #{channel.name} (message ID {message.id})"
-            )
-    else:
-        print(f"Could not find text channel with ID: {channel_id}")
-
-
-async def _refuse_outside_home_guild(interaction: discord.Interaction) -> bool:
-    """Until per-guild panels (multi-guild slice 4) there is one panel; only the home guild may move it."""
-    if not guild_registry.configured or guild_registry.is_home(interaction.guild_id):
-        return False
-    await send_temporary_response(
-        interaction,
-        content="❌ For now the control panel can only be set up in the bot's home Discord.",
-        delay=20,
-    )
-    return True
+    for message in messages:
+        guild_name = getattr(getattr(message, "guild", None), "name", "?")
+        channel_name = getattr(message.channel, "name", message.channel.id)
+        print(
+            f"Persistent controls ready in {guild_name} #{channel_name} (message ID {message.id})"
+        )
 
 
 # Admin command to repost the button if needed
@@ -2930,14 +2997,11 @@ async def repost_button(interaction: discord.Interaction):
         )
         return
 
-    if await _refuse_outside_home_guild(interaction):
-        return
-
-    channel = await _resolve_text_channel(_panel_channel_id())
+    channel = await _resolve_text_channel(_panel_channel_id(interaction.guild_id))
     if channel is None:
         await send_temporary_response(
             interaction,
-            content="❌ No panel channel is set. Use /setup_panel in the channel you want.",
+            content="❌ This Discord has no panel yet. Use /setup_panel in the channel you want.",
             delay=20,
         )
         return
@@ -2970,14 +3034,21 @@ async def setup_panel(
         )
         return
 
-    if await _refuse_outside_home_guild(interaction):
+    if not guild_registry.is_approved(interaction.guild_id):
+        await send_temporary_response(
+            interaction,
+            content="❌ This Discord isn't set up to use this bot.",
+            delay=20,
+        )
         return
 
     target = channel or interaction.channel
-    if not isinstance(target, (discord.TextChannel, discord.Thread)):
+    if not isinstance(target, (discord.TextChannel, discord.Thread)) or (
+        _guild_of(target) != (interaction.guild_id or 0)
+    ):
         await send_temporary_response(
             interaction,
-            content="❌ Pick a text channel for the panel.",
+            content="❌ Pick a text channel in this Discord for the panel.",
             delay=20,
         )
         return

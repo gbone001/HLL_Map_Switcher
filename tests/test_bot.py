@@ -164,63 +164,96 @@ if __name__ == "__main__":
     unittest.main()
 
 
+HOME, GUEST = 100, 200
+
+
+def fake_channel(channel_id, guild_id, message_id=None):
+    channel = mock.MagicMock(id=channel_id)
+    channel.guild = mock.MagicMock(id=guild_id)
+    partial = mock.MagicMock()
+    partial.edit = mock.AsyncMock(return_value=f"edited {channel_id}")
+    partial.delete = mock.AsyncMock()
+    channel.get_partial_message.return_value = partial
+    channel.send = mock.AsyncMock(return_value=mock.MagicMock(id=message_id))
+    channel.history.side_effect = AssertionError("history should not be read")
+    return channel
+
+
 class PanelMessageTests(unittest.IsolatedAsyncioTestCase):
+    """Multi-guild slice 4: one saved panel per guild."""
+
     def setUp(self):
         import tempfile
 
         self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.path = Path(self._tmp.name) / "panel_message.json"
         patches = [
-            mock.patch.object(bot, "_PANEL_REF_PATH", Path(self._tmp.name) / "panel_message.json"),
-            mock.patch.object(bot, "persistent_message_ref", None),
+            mock.patch.object(bot, "_PANEL_REF_PATH", self.path),
+            mock.patch.object(bot, "panel_refs", {}),
+            mock.patch.object(bot, "guild_registry", registry(str(HOME), str(GUEST))),
+            mock.patch.object(bot, "build_panel", mock.AsyncMock(return_value=("embed", "view"))),
         ]
         for patch in patches:
             patch.start()
             self.addCleanup(patch.stop)
-        self.addCleanup(self._tmp.cleanup)
 
-    def test_panel_message_id_survives_a_restart(self):
-        bot._set_panel_ref(11, 22)
+    def test_panels_survive_a_restart_per_guild(self):
+        bot._set_panel_ref(HOME, 11, 22)
+        bot._set_panel_ref(GUEST, 33, 44)
 
-        self.assertEqual(bot._load_panel_ref(), (11, 22))
+        self.assertEqual(bot._load_panel_refs(), {HOME: (11, 22), GUEST: (33, 44)})
 
-    async def test_refresh_edits_saved_panel_without_reading_history(self):
-        bot._set_panel_ref(11, 22)
-        partial = mock.MagicMock()
-        partial.edit = mock.AsyncMock(return_value="edited")
-        channel = mock.MagicMock(id=11)
-        channel.get_partial_message.return_value = partial
-        channel.history.side_effect = AssertionError("history should not be read")
+    def test_old_single_panel_file_becomes_the_home_guild_panel(self):
+        self.path.write_text('{"channel_id": 11, "message_id": 22}', encoding="utf-8")
 
-        with mock.patch.object(bot, "build_panel", mock.AsyncMock(return_value=("embed", "view"))):
-            result = await bot.ensure_persistent_message(channel)
+        self.assertEqual(bot._load_panel_refs(), {HOME: (11, 22)})
 
-        self.assertEqual(result, "edited")
-        channel.get_partial_message.assert_called_once_with(22)
-        channel.send.assert_not_called()
-
-    def test_panel_channel_prefers_saved_panel_over_env(self):
+    def test_panel_channel_per_guild_with_env_fallback_for_home_only(self):
         with mock.patch.dict(os.environ, {"DISCORD_CHANNEL_ID": "99"}):
-            self.assertEqual(bot._panel_channel_id(), 99)
-            bot._set_panel_ref(11, 22)
-            self.assertEqual(bot._panel_channel_id(), 11)
+            self.assertEqual(bot._panel_channel_id(HOME), 99)
+            self.assertIsNone(bot._panel_channel_id(GUEST))
+            bot._set_panel_ref(HOME, 11, 22)
+            bot._set_panel_ref(GUEST, 33, 44)
+            self.assertEqual(bot._panel_channel_id(HOME), 11)
+            self.assertEqual(bot._panel_channel_id(GUEST), 33)
+            self.assertEqual(bot._panel_channel_ids(), [11, 33])
 
-    async def test_post_panel_moves_panel_and_deletes_the_old_one(self):
-        bot._set_panel_ref(11, 22)
-        old_partial = mock.MagicMock()
-        old_partial.delete = mock.AsyncMock()
-        old_channel = mock.MagicMock(id=11)
-        old_channel.get_partial_message.return_value = old_partial
-        new_channel = mock.MagicMock(id=33)
-        new_channel.send = mock.AsyncMock(return_value=mock.MagicMock(id=44))
+    async def test_post_panel_replaces_only_this_guilds_panel(self):
+        bot._set_panel_ref(HOME, 11, 22)
+        bot._set_panel_ref(GUEST, 33, 44)
+        old_guest = fake_channel(33, GUEST)
+        new_guest = fake_channel(55, GUEST, message_id=66)
 
-        with mock.patch.object(bot, "build_panel", mock.AsyncMock(return_value=("embed", "view"))), \
-                mock.patch.object(bot, "_resolve_text_channel", mock.AsyncMock(return_value=old_channel)):
-            await bot.post_panel(new_channel)
+        with mock.patch.object(bot, "_resolve_text_channel", mock.AsyncMock(return_value=old_guest)):
+            await bot.post_panel(new_guest)
 
-        old_channel.get_partial_message.assert_called_once_with(22)
-        old_partial.delete.assert_awaited_once()
-        self.assertEqual(bot._load_panel_ref(), (33, 44))
-        self.assertEqual(bot._panel_channel_id(), 33)
+        old_guest.get_partial_message.assert_called_once_with(44)
+        old_guest.get_partial_message.return_value.delete.assert_awaited_once()
+        self.assertEqual(bot._load_panel_refs(), {HOME: (11, 22), GUEST: (55, 66)})
+
+    async def test_refresh_updates_every_guild_panel_with_one_status_read(self):
+        bot._set_panel_ref(HOME, 11, 22)
+        bot._set_panel_ref(GUEST, 33, 44)
+        channels = {11: fake_channel(11, HOME), 33: fake_channel(33, GUEST)}
+        statuses = mock.AsyncMock(return_value={"status": "ok"})
+
+        with mock.patch.object(bot, "_resolve_text_channel", mock.AsyncMock(side_effect=channels.get)), \
+                mock.patch.object(bot, "fetch_server_statuses", statuses):
+            messages = await bot.refresh_main_embed()
+
+        self.assertEqual(messages, ["edited 11", "edited 33"])
+        statuses.assert_awaited_once()
+        built_for = [call.args[1] for call in bot.build_panel.await_args_list]
+        self.assertEqual(built_for, [HOME, GUEST])
+        channels[11].get_partial_message.assert_called_once_with(22)
+        channels[33].get_partial_message.assert_called_once_with(44)
+
+    async def test_unapproved_guild_panels_are_not_refreshed(self):
+        bot._set_panel_ref(HOME, 11, 22)
+        bot._set_panel_ref(999, 77, 88)
+
+        self.assertEqual(bot._panel_channel_ids(), [11])
 
 
 class GuildApprovalTests(unittest.IsolatedAsyncioTestCase):
@@ -242,10 +275,3 @@ class GuildApprovalTests(unittest.IsolatedAsyncioTestCase):
         with mock.patch.object(bot, "guild_registry", registry()):
             self.assertFalse(await bot._leave_if_unapproved(guild))
         guild.leave.assert_not_awaited()
-
-    async def test_panel_commands_are_home_guild_only_for_now(self):
-        sent = mock.AsyncMock()
-        with mock.patch.object(bot, "guild_registry", registry("100", "200")),                 mock.patch.object(bot, "send_temporary_response", sent):
-            self.assertFalse(await bot._refuse_outside_home_guild(mock.MagicMock(guild_id=100)))
-            self.assertTrue(await bot._refuse_outside_home_guild(mock.MagicMock(guild_id=200)))
-        self.assertIn("home Discord", sent.await_args.kwargs["content"])

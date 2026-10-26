@@ -12,7 +12,7 @@ shaping: true
   - the panel saved to the volume, and `/setup_panel`
   - two game servers (`SERVER1_*`, `SERVER2_*`)
 - **Status: accepted** 2026-10-27. Sequence: 1 → 2 → 3 → 4 → 5. Each slice is deployable on its own.
-- **Progress:** slice 1 deployed 2026-10-27 (`e5f61a6`); slice 2 deployed 2026-10-27 (`30c574b`); slice 3 built 2026-10-27.
+- **Progress:** slice 1 deployed 2026-10-27 (`e5f61a6`); slice 2 deployed 2026-10-27 (`30c574b`); slice 3 deployed 2026-10-27 (`13fae7e`, admin cam follow-up `a654038`); slice 4 built 2026-10-27.
 
 ## Slices
 

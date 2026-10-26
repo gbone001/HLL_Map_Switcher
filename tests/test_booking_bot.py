@@ -654,3 +654,41 @@ class GuestGuildTests(CommandTests):
 
     async def test_unapproved_guild_is_refused(self):
         self.assertIn("isn't set up", await self.run_book(member(BOOKER_ID, guild_id=OTHER_GUILD)))
+
+
+class GuestPanelTests(BookingBotTestCase):
+    """Multi-guild slice 4: each guild's panel is rendered for that guild."""
+
+    GUEST = 5555
+
+    def setUp(self):
+        super().setUp()
+        for patch in (
+            mock.patch.object(
+                bot,
+                "guild_registry",
+                bot.GuildRegistry.from_env({"DISCORD_GUILD_ID": str(HOME_GUILD), "BOOKING_GUILD_IDS": str(self.GUEST)}),
+            ),
+            mock.patch.object(bot, "_guild_name", {HOME_GUILD: "Home", self.GUEST: "Guest Clan"}.get),
+        ):
+            patch.start()
+            self.addCleanup(patch.stop)
+
+    def test_guest_panel_shows_controls_only_for_its_own_bookings(self):
+        self.service.create(self.server_key, BOOKER_ID, "b", T0 - 60, T0 + HOUR, guild_id=HOME_GUILD)
+
+        self.assertTrue(bot._panel_controls_unlocked(0, HOME_GUILD))
+        self.assertFalse(bot._panel_controls_unlocked(0, self.GUEST))
+
+    def test_home_panel_shows_controls_during_a_guest_booking_for_admin_override(self):
+        self.service.create(self.server_key, BOOKER_ID, "b", T0 - 60, T0 + HOUR, guild_id=self.GUEST)
+
+        self.assertTrue(bot._panel_controls_unlocked(0, self.GUEST))
+        self.assertTrue(bot._panel_controls_unlocked(0, HOME_GUILD))
+
+    def test_booking_lines_mention_the_booker_only_in_their_guild(self):
+        self.service.create(self.server_key, BOOKER_ID, "b", T0 - 60, T0 + HOUR, guild_id=self.GUEST)
+
+        self.assertIn(f"<@{BOOKER_ID}>", bot._panel_booking_lines(self.GUEST)[0][0])
+        self.assertIn("**Guest Clan**", bot._panel_booking_lines(HOME_GUILD)[0][0])
+        self.assertNotIn(f"<@{BOOKER_ID}>", " ".join(bot._panel_schedule_lines(HOME_GUILD)))
