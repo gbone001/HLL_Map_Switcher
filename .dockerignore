@@ -25,3 +25,6 @@ __pycache__
 # Booking database (bind-mounted at runtime; never bake into the image)
 data/*.db
 data/*.db-journal
+
+# Panel message ID remembered at runtime
+data/panel_message.json

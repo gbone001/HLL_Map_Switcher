@@ -148,3 +148,38 @@ class OffEventLoopTests(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class PanelMessageTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        import tempfile
+
+        self._tmp = tempfile.TemporaryDirectory()
+        patches = [
+            mock.patch.object(bot, "_PANEL_REF_PATH", Path(self._tmp.name) / "panel_message.json"),
+            mock.patch.object(bot, "persistent_message_ref", None),
+        ]
+        for patch in patches:
+            patch.start()
+            self.addCleanup(patch.stop)
+        self.addCleanup(self._tmp.cleanup)
+
+    def test_panel_message_id_survives_a_restart(self):
+        bot._set_panel_ref(11, 22)
+
+        self.assertEqual(bot._load_panel_ref(), (11, 22))
+
+    async def test_refresh_edits_saved_panel_without_reading_history(self):
+        bot._set_panel_ref(11, 22)
+        partial = mock.MagicMock()
+        partial.edit = mock.AsyncMock(return_value="edited")
+        channel = mock.MagicMock(id=11)
+        channel.get_partial_message.return_value = partial
+        channel.history.side_effect = AssertionError("history should not be read")
+
+        with mock.patch.object(bot, "build_panel", mock.AsyncMock(return_value=("embed", "view"))):
+            result = await bot.ensure_persistent_message(channel)
+
+        self.assertEqual(result, "edited")
+        channel.get_partial_message.assert_called_once_with(22)
+        channel.send.assert_not_called()

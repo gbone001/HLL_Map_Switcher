@@ -52,9 +52,9 @@ class _CloseButton(discord.ui.Button):
         super().__init__(label="Close", style=discord.ButtonStyle.danger, row=row)
 
     async def callback(self, interaction: discord.Interaction):
-        await interaction.response.edit_message(
-            content="Booking panel closed.", embed=None, view=None
-        )
+        await interaction.response.defer()
+        self.view.close = interaction.delete_original_response
+        await self.view.finish()
 
 
 # ---------------------------------------------------------------- creation
@@ -72,9 +72,30 @@ async def open_book_panel(
     await interaction.response.send_message(
         embed=view.embed(), view=view, ephemeral=True
     )
+    view.close = interaction.delete_original_response
 
 
-DATE_PAGE_DAYS = 14
+class _SelfClosingView(discord.ui.View):
+    """An ephemeral panel that deletes its own message when it times out or is finished."""
+
+    close = None  # coroutine function that deletes the panel message; set once it is sent
+
+    async def finish(self) -> None:
+        self.stop()
+        if self.close is not None:
+            try:
+                await self.close()
+            except discord.HTTPException:
+                pass  # already dismissed, or the interaction token expired
+
+    async def on_timeout(self) -> None:
+        await self.finish()
+
+
+# One server: the server row is not needed, so 30 days fit as two 15-day dropdowns.
+# Several servers: one 25-day dropdown (Discord's per-select limit), paged with ◀ ▶.
+SINGLE_SERVER_DATE_DAYS = 30
+MULTI_SERVER_DATE_DAYS = 25
 SLOT_MINUTES = 30
 DURATION_CHOICES = [30, 60, 90, 120, 150, 180, 240, 300, 360, 480, 720, 1440]
 
@@ -112,13 +133,13 @@ class _ActionButton(discord.ui.Button):
         await self.action(interaction)
 
 
-class BookingPickerView(discord.ui.View):
+class BookingPickerView(_SelfClosingView):
     """Google-Calendar-style picker: server, date, start time and length as dropdowns.
 
     The embed shows the slot as it will be booked and updates on every pick. 🔁 swaps in a
     repeat panel, like Calendar's "Does not repeat" menu. Discord allows 5 rows and 25
-    options per select, so dates page two weeks at a time and start times show one half
-    of the day (AM/PM toggle) in 30-minute steps.
+    options per select, so start times show one half of the day (AM/PM toggle) in
+    30-minute steps. The picker deletes itself after a successful booking or on timeout.
     """
 
     def __init__(self, deps: BookingCommandDeps):
@@ -128,14 +149,18 @@ class BookingPickerView(discord.ui.View):
         now = datetime.now(self.tz)
         self.today = now.date()
         servers = deps.servers()
-        self.server_index: int | None = servers[0][0] if len(servers) == 1 else None
+        self.single_server = len(servers) == 1
+        self.page_days = (
+            SINGLE_SERVER_DATE_DAYS if self.single_server else MULTI_SERVER_DATE_DAYS
+        )
+        self.server_index: int | None = servers[0][0] if self.single_server else None
         # Default slot: the next half hour, one hour long, like a new Calendar event.
         minute_of_day = now.hour * 60 + now.minute
         next_slot = (minute_of_day // SLOT_MINUTES + 1) * SLOT_MINUTES
         self.date = self.today + timedelta(days=next_slot // 1440)
         self.start_minutes = next_slot % 1440
         self.pm = self.start_minutes >= 720
-        self.page = (self.date - self.today).days // DATE_PAGE_DAYS
+        self.page = (self.date - self.today).days // self.page_days
         self.duration = 60
         self.recurrence = "none"
         self.count = 1
@@ -180,46 +205,53 @@ class BookingPickerView(discord.ui.View):
             self._render_picker()
 
     def _render_picker(self) -> None:
-        self.add_item(
-            _StateSelect(
-                "server_index",
-                int,
-                placeholder="Select a server...",
-                options=[
-                    discord.SelectOption(
-                        label=name[:100],
-                        value=str(index),
-                        default=index == self.server_index,
-                    )
-                    for index, name in self.deps.servers()[:25]
-                ],
-                row=0,
+        if not self.single_server:
+            self.add_item(
+                _StateSelect(
+                    "server_index",
+                    int,
+                    placeholder="Select a server...",
+                    options=[
+                        discord.SelectOption(
+                            label=name[:100],
+                            value=str(index),
+                            default=index == self.server_index,
+                        )
+                        for index, name in self.deps.servers()[:25]
+                    ],
+                )
             )
-        )
 
-        first = self.page * DATE_PAGE_DAYS
-        last = min(first + DATE_PAGE_DAYS, self.max_days + 1)
-        self.add_item(
-            _StateSelect(
-                "date",
-                date.fromisoformat,
-                placeholder="Date",
-                options=[
-                    discord.SelectOption(
-                        label=d.strftime("%a %d %b"),
-                        value=d.isoformat(),
-                        description={0: "Today", 1: "Tomorrow"}.get(
-                            (d - self.today).days
-                        ),
-                        default=d == self.date,
-                    )
-                    for d in (
-                        self.today + timedelta(days=n) for n in range(first, last)
-                    )
-                ],
-                row=1,
+        first = self.page * self.page_days
+        days = [
+            self.today + timedelta(days=n)
+            for n in range(first, min(first + self.page_days, self.max_days + 1))
+        ]
+        # Split into equal dropdowns of at most 25 days (30 days -> two of 15).
+        chunks = -(-len(days) // 25)
+        size = -(-len(days) // chunks)
+        for start in range(0, len(days), size):
+            chunk = days[start : start + size]
+            self.add_item(
+                _StateSelect(
+                    "date",
+                    date.fromisoformat,
+                    placeholder=(
+                        f"Date: {chunk[0].strftime('%d %b')} – {chunk[-1].strftime('%d %b')}"
+                    ),
+                    options=[
+                        discord.SelectOption(
+                            label=d.strftime("%a %d %b"),
+                            value=d.isoformat(),
+                            description={0: "Today", 1: "Tomorrow"}.get(
+                                (d - self.today).days
+                            ),
+                            default=d == self.date,
+                        )
+                        for d in chunk
+                    ],
+                )
             )
-        )
 
         base = 720 if self.pm else 0
         self.add_item(
@@ -233,7 +265,6 @@ class BookingPickerView(discord.ui.View):
                     )
                     for m in range(base, base + 720, SLOT_MINUTES)
                 ],
-                row=2,
             )
         )
 
@@ -252,11 +283,12 @@ class BookingPickerView(discord.ui.View):
                     for m in DURATION_CHOICES
                     if m <= self.max_minutes
                 ],
-                row=3,
             )
         )
+        for row, item in enumerate(self.children):
+            item.row = row
 
-        last_page = self.max_days // DATE_PAGE_DAYS
+        last_page = self.max_days // self.page_days
         buttons = [
             _ActionButton(self._shift_page(-1), label="◀", disabled=self.page == 0),
             _ActionButton(
@@ -320,13 +352,15 @@ class BookingPickerView(discord.ui.View):
             self.count = 2
         self._render()
         await interaction.response.edit_message(embed=self.embed(), view=self)
+        # Keep the freshest interaction token (valid 15 minutes) for deleting on timeout.
+        self.close = interaction.delete_original_response
 
     # ------------------------------------------------------------ actions
 
     def _shift_page(self, step: int):
         async def action(interaction: discord.Interaction):
             self.page += step
-            self.date = self.today + timedelta(days=self.page * DATE_PAGE_DAYS)
+            self.date = self.today + timedelta(days=self.page * self.page_days)
             await self.redraw(interaction)
 
         return action
@@ -345,7 +379,10 @@ class BookingPickerView(discord.ui.View):
         await self.redraw(interaction)
 
     async def _book(self, interaction: discord.Interaction):
-        await book_and_reply(
+        # Deferring the button press keeps the picker as this interaction's original
+        # response, so it can be deleted once the booking succeeds.
+        await interaction.response.defer()
+        booked = await book_and_reply(
             interaction,
             self.deps,
             self.server_index,
@@ -354,6 +391,9 @@ class BookingPickerView(discord.ui.View):
             self.recurrence,
             self.count if self.recurrence != "none" else 1,
         )
+        if booked:
+            self.close = interaction.delete_original_response
+            await self.finish()
 
 
 # ---------------------------------------------------------------- management
@@ -386,15 +426,17 @@ async def open_manage_panel(
         interaction.user.id,
         is_booking_admin(interaction.user, deps.config),
     )
-    await interaction.followup.send(
+    message = await interaction.followup.send(
         embed=view.embed,
         view=view,
         ephemeral=True,
         allowed_mentions=discord.AllowedMentions.none(),
+        wait=True,
     )
+    view.close = message.delete
 
 
-class ManageBookingsView(discord.ui.View):
+class ManageBookingsView(_SelfClosingView):
     def __init__(
         self,
         deps: BookingCommandDeps,
@@ -447,15 +489,20 @@ class ManageBookingsView(discord.ui.View):
         if not self.booking_select.values:
             await _reply(interaction, "Select a booking first.")
             return
-        await cancel_and_reply(
+        await interaction.response.defer()
+        if await cancel_and_reply(
             interaction, self.deps, int(self.booking_select.values[0])
-        )
+        ):
+            await self._reload(interaction)
 
     @discord.ui.button(label="🔄 Refresh", style=discord.ButtonStyle.secondary, row=1)
     async def refresh(
         self, interaction: discord.Interaction, button: discord.ui.Button
     ):
         await interaction.response.defer()
+        await self._reload(interaction)
+
+    async def _reload(self, interaction: discord.Interaction) -> None:
         bookings = await _load_live(interaction, self.deps)
         if bookings is None:
             return

@@ -1,4 +1,5 @@
 import asyncio
+import json
 import os
 import sys
 import threading
@@ -293,7 +294,33 @@ LEGACY_EMBED_TITLES = {
     "🎮 Hell Let Loose Map Changer",
     "?? Hell Let Loose Map Changer",
 }
-persistent_message_ref: tuple[int, int] | None = None
+# The panel message is remembered on the data volume so restarts edit it instead of posting a
+# new one: without Read Message History the bot cannot find its old panel by searching.
+_PANEL_REF_PATH = booking_config.db_path.parent / "panel_message.json"
+
+
+def _load_panel_ref() -> tuple[int, int] | None:
+    try:
+        data = json.loads(_PANEL_REF_PATH.read_text(encoding="utf-8"))
+        return int(data["channel_id"]), int(data["message_id"])
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+
+
+def _set_panel_ref(channel_id: int, message_id: int) -> None:
+    global persistent_message_ref
+    persistent_message_ref = (channel_id, message_id)
+    try:
+        _PANEL_REF_PATH.parent.mkdir(parents=True, exist_ok=True)
+        _PANEL_REF_PATH.write_text(
+            json.dumps({"channel_id": channel_id, "message_id": message_id}),
+            encoding="utf-8",
+        )
+    except OSError as exc:
+        print(f"Could not save the panel message ID to {_PANEL_REF_PATH}: {exc}")
+
+
+persistent_message_ref: tuple[int, int] | None = _load_panel_ref()
 # Map channel_id -> focused server index (None = show all)
 _persistent_focused_server: dict[int, int | None] = {}
 # Map (server_index, map_pretty_name) -> current objectives last set through this bot
@@ -904,44 +931,39 @@ async def ensure_persistent_message(
 
     if persistent_message_ref and channel_id is not None:
         ref_channel_id, message_id = persistent_message_ref
-        if ref_channel_id != channel_id:
-            persistent_message_ref = None
-        else:
+        if ref_channel_id == channel_id and hasattr(channel, "get_partial_message"):
+            # Edit by ID: unlike fetch_message, this needs no Read Message History permission.
             try:
-                message = await channel.fetch_message(message_id)  # type: ignore[attr-defined]
-                await message.edit(embed=embed, view=view)
-                return message
-            except (discord.NotFound, AttributeError):
-                persistent_message_ref = None
+                return await channel.get_partial_message(message_id).edit(
+                    embed=embed, view=view
+                )
+            except discord.NotFound:
+                pass  # deleted by hand; find or post a new one below
+        persistent_message_ref = None
 
-    try:
-        history = channel.history  # type: ignore[attr-defined]
-    except AttributeError:
-        message = await channel.send(embed=embed, view=view)  # type: ignore[attr-defined]
-        if channel_id is not None:
-            persistent_message_ref = (channel_id, message.id)
-            # initialize focus map
-            _persistent_focused_server[channel_id] = None
-        return message
+    if channel_id is not None:
+        _persistent_focused_server.setdefault(channel_id, None)
 
-    async for message in history(limit=50):
-        if message.author == bot.user and message.embeds:
-            title = message.embeds[0].title
-            if title == MAIN_EMBED_TITLE or title in LEGACY_EMBED_TITLES:
-                if channel_id is not None:
-                    persistent_message_ref = (channel_id, message.id)
-                await message.edit(embed=embed, view=view)
-                # ensure focus map initialized
-                if (
-                    channel_id is not None
-                    and channel_id not in _persistent_focused_server
-                ):
-                    _persistent_focused_server[channel_id] = None
-                return message
+    history = getattr(channel, "history", None)
+    if history is not None:
+        try:
+            async for message in history(limit=50):
+                if message.author == bot.user and message.embeds:
+                    title = message.embeds[0].title
+                    if title == MAIN_EMBED_TITLE or title in LEGACY_EMBED_TITLES:
+                        await message.edit(embed=embed, view=view)
+                        if channel_id is not None:
+                            _set_panel_ref(channel_id, message.id)
+                        return message
+        except discord.Forbidden:
+            print(
+                "Cannot read channel history to find the old panel; grant the bot "
+                "Read Message History so restarts never leave a duplicate."
+            )
 
     message = await channel.send(embed=embed, view=view)  # type: ignore[attr-defined]
     if channel_id is not None:
-        persistent_message_ref = (channel_id, message.id)
+        _set_panel_ref(channel_id, message.id)
     return message
 
 
@@ -1919,22 +1941,8 @@ class ChangeServerDropdown(discord.ui.Select):
             # Store focus and update persistent message if present
             _persistent_focused_server[channel_id] = selected
 
-            # Update persistent message if we have a reference for this channel
-            if (
-                persistent_message_ref
-                and persistent_message_ref[0] == channel_id
-            ):
-                _, message_id = persistent_message_ref
-                try:
-                    msg = await channel.fetch_message(message_id)  # type: ignore[attr-defined]
-                    embed, view = await build_panel(selected)
-                    await msg.edit(embed=embed, view=view)
-                except (discord.NotFound, discord.HTTPException):
-                    # recreate persistent message
-                    if isinstance(
-                        channel, (discord.TextChannel, discord.Thread)
-                    ):
-                        await ensure_persistent_message(channel)
+            if isinstance(channel, (discord.TextChannel, discord.Thread)):
+                await ensure_persistent_message(channel)
 
             await update_interaction_message(
                 interaction,
@@ -2820,8 +2828,13 @@ async def repost_button(interaction: discord.Interaction):
         await defer_interaction(interaction, ephemeral=True)
         embed, view = await build_panel()
         message = await channel.send(embed=embed, view=view)
-        global persistent_message_ref
-        persistent_message_ref = (channel.id, message.id)
+        if persistent_message_ref and persistent_message_ref[0] == channel.id:
+            # Remove the panel being replaced so the channel keeps a single copy.
+            try:
+                await channel.get_partial_message(persistent_message_ref[1]).delete()
+            except discord.HTTPException:
+                pass
+        _set_panel_ref(channel.id, message.id)
         await send_temporary_response(
             interaction, content="✅ Map changer button reposted!", delay=20
         )

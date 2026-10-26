@@ -34,6 +34,8 @@ WRONG_GUILD_MESSAGE = (
 )
 NOT_A_MEMBER_MESSAGE = "You must be a member of the booking guild to book a server."
 STORE_ERROR_MESSAGE = "❌ Could not reach the booking store. Nothing was changed; try again shortly."
+# Booking replies are ephemeral and delete themselves after this long.
+REPLY_EXPIRY_SECONDS = 90
 # Discord rejects messages over 2000 characters; leave room for the "…and N more." line.
 MAX_REPLY_CHARS = 1900
 
@@ -103,15 +105,29 @@ def describe_booking(booking: Booking, server_name: str) -> str:
 
 
 async def _reply(interaction: discord.Interaction, content: str) -> None:
+    """Ephemeral reply that removes itself after REPLY_EXPIRY_SECONDS so the channel stays clean."""
     mentions = discord.AllowedMentions.none()
     if interaction.response.is_done():
-        await interaction.followup.send(
-            content, ephemeral=True, allowed_mentions=mentions
+        message = await interaction.followup.send(
+            content, ephemeral=True, allowed_mentions=mentions, wait=True
         )
+        if message is not None:
+            await message.delete(delay=REPLY_EXPIRY_SECONDS)
     else:
         await interaction.response.send_message(
-            content, ephemeral=True, allowed_mentions=mentions
+            content,
+            ephemeral=True,
+            allowed_mentions=mentions,
+            delete_after=REPLY_EXPIRY_SECONDS,
         )
+
+
+async def _notify_change(deps: BookingCommandDeps) -> None:
+    """Refresh the panel after a booking change; a failed refresh must not fail the booking."""
+    try:
+        await deps.on_change()
+    except Exception:
+        logger.exception("Panel refresh after a booking change failed")
 
 
 async def _defer(interaction: discord.Interaction) -> None:
@@ -149,11 +165,11 @@ async def book_and_reply(
     duration: str,
     recurrence: str = "none",
     count: int = 1,
-) -> None:
-    """Create a booking (or recurring series) and reply; shared by /book and the panel."""
+) -> bool:
+    """Create a booking (or recurring series) and reply; True if it was created. Shared by /book and the panel."""
     if not can_book(interaction.user, deps.config):
         await _reply(interaction, NOT_A_MEMBER_MESSAGE)
-        return
+        return False
 
     await _defer(interaction)
     server_key = deps.server_key(server_index)
@@ -177,18 +193,18 @@ async def book_and_reply(
             f"❌ That overlaps <@{conflict.user_id}>'s booking #{conflict.id}: "
             f"{timestamp(conflict.start_utc)} → {timestamp(conflict.end_utc, 't')}.",
         )
-        return
+        return False
     except sqlite3.Error:
         logger.exception("Booking store failed while creating a booking")
         await _reply(interaction, STORE_ERROR_MESSAGE)
-        return
+        return False
     except BookingError as exc:
         await _reply(
             interaction,
             f"❌ {exc} Use start `{START_FORMAT_HINT}` in {deps.config.timezone.key} "
             f"and duration as {DURATION_HINT}.",
         )
-        return
+        return False
 
     first = bookings[0]
     series = f" (+{len(bookings) - 1} more, {recurrence})" if len(bookings) > 1 else ""
@@ -198,13 +214,14 @@ async def book_and_reply(
         f"{timestamp(first.end_utc, 't')} (booking #{first.id}){series}. "
         "During your slot only you and booking admins can change this server.",
     )
-    await deps.on_change()
+    await _notify_change(deps)
+    return True
 
 
 async def cancel_and_reply(
     interaction: discord.Interaction, deps: BookingCommandDeps, booking_id: int
-) -> None:
-    """Cancel a booking and reply; shared by /cancel_booking and the panel."""
+) -> bool:
+    """Cancel a booking and reply; True if it was cancelled. Shared by /cancel_booking and the panel."""
     await _defer(interaction)
     try:
         booking = await asyncio.to_thread(
@@ -216,15 +233,16 @@ async def cancel_and_reply(
     except sqlite3.Error:
         logger.exception("Booking store failed while cancelling a booking")
         await _reply(interaction, STORE_ERROR_MESSAGE)
-        return
+        return False
     except BookingError as exc:
         await _reply(interaction, f"❌ {exc}")
-        return
+        return False
     await _reply(
         interaction,
         f"✅ Cancelled booking #{booking.id} on **{deps.server_name_for_key(booking.server_key)}**.",
     )
-    await deps.on_change()
+    await _notify_change(deps)
+    return True
 
 
 def register_booking_commands(

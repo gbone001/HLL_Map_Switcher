@@ -70,6 +70,9 @@
 - Keep HTTP-first / direct-RCON-fallback orchestration inside `src/services/server_control.py`.
 - Every new control write in `src/bot.py` must call `_deny_if_booked(...)` immediately before the write so the booking lock covers it.
 - Game-control panel buttons (`BOOKING_GATED_BUTTONS`: map, objectives, weather, timers, team switch, admin cam) are only shown while a booking is live on the focused server (`_panel_controls_unlocked`); new control buttons belong in that set.
+- The panel message ID is saved to `data/panel_message.json` and edited by ID (no Read Message History needed); restarts and booking changes edit that one message instead of posting duplicates.
+- Booking replies and panel pickers are ephemeral and delete themselves (`REPLY_EXPIRY_SECONDS`, picker removed after a successful booking or on timeout).
+- Server display names come from `SERVER_NAME` (single server) or `SERVER{N}_NAME`; bookings are keyed by server number, so renaming is safe.
 - The booking refresh loop must stay display-only; it must never call `ServerControlService`.
 - Keep Discord responses admin-friendly and short. Panel interactions should acknowledge quickly before doing slow network work.
 - Any new networked Discord interaction should be async-safe and avoid the `This interaction failed` pattern by deferring or responding immediately before slow work.
