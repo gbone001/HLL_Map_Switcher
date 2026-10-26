@@ -32,6 +32,7 @@ NOT_CONFIGURED_MESSAGE = "Server booking is not configured on this bot."
 WRONG_GUILD_MESSAGE = (
     "Server booking is only available in this bot's home Discord."
 )
+NOT_A_MEMBER_MESSAGE = "You must be a member of the booking guild to book a server."
 STORE_ERROR_MESSAGE = "❌ Could not reach the booking store. Nothing was changed; try again shortly."
 # Discord rejects messages over 2000 characters; leave room for the "…and N more." line.
 MAX_REPLY_CHARS = 1900
@@ -115,10 +116,11 @@ async def _reply(interaction: discord.Interaction, content: str) -> None:
 
 async def _defer(interaction: discord.Interaction) -> None:
     """Acknowledge before touching the store: a locked SQLite file can wait longer than Discord's 3s deadline."""
-    await interaction.response.defer(ephemeral=True, thinking=True)
+    if not interaction.response.is_done():
+        await interaction.response.defer(ephemeral=True, thinking=True)
 
 
-async def _refuse_unavailable(
+async def refuse_unavailable(
     interaction: discord.Interaction, deps: BookingCommandDeps
 ) -> bool:
     """Reply and return True when booking is off or the command came from another guild or a DM."""
@@ -129,6 +131,100 @@ async def _refuse_unavailable(
         await _reply(interaction, WRONG_GUILD_MESSAGE)
         return True
     return False
+
+
+def booking_label(booking: Booking, deps: BookingCommandDeps) -> str:
+    """Plain-text booking label for choices and select options, where Discord timestamps don't render."""
+    return (
+        f"#{booking.id} {deps.server_name_for_key(booking.server_key)} "
+        f"{format_local(booking.start_utc, deps.config.timezone)} ({booking.user_name})"
+    )[:100]
+
+
+async def book_and_reply(
+    interaction: discord.Interaction,
+    deps: BookingCommandDeps,
+    server_index: int,
+    start: str,
+    duration: str,
+    recurrence: str = "none",
+    count: int = 1,
+) -> None:
+    """Create a booking (or recurring series) and reply; shared by /book and the panel."""
+    if not can_book(interaction.user, deps.config):
+        await _reply(interaction, NOT_A_MEMBER_MESSAGE)
+        return
+
+    await _defer(interaction)
+    server_key = deps.server_key(server_index)
+    try:
+        start_utc = parse_start(start, deps.config.timezone)
+        end_utc = start_utc + parse_duration(duration)
+        bookings = await asyncio.to_thread(
+            deps.service.create_series,
+            server_key=server_key,
+            user_id=interaction.user.id,
+            user_name=interaction.user.display_name,
+            start_utc=start_utc,
+            end_utc=end_utc,
+            recurrence=recurrence,
+            count=count,
+        )
+    except BookingOverlapError as exc:
+        conflict = exc.conflict
+        await _reply(
+            interaction,
+            f"❌ That overlaps <@{conflict.user_id}>'s booking #{conflict.id}: "
+            f"{timestamp(conflict.start_utc)} → {timestamp(conflict.end_utc, 't')}.",
+        )
+        return
+    except sqlite3.Error:
+        logger.exception("Booking store failed while creating a booking")
+        await _reply(interaction, STORE_ERROR_MESSAGE)
+        return
+    except BookingError as exc:
+        await _reply(
+            interaction,
+            f"❌ {exc} Use start `{START_FORMAT_HINT}` in {deps.config.timezone.key} "
+            f"and duration as {DURATION_HINT}.",
+        )
+        return
+
+    first = bookings[0]
+    series = f" (+{len(bookings) - 1} more, {recurrence})" if len(bookings) > 1 else ""
+    await _reply(
+        interaction,
+        f"✅ **{deps.server_name_for_key(server_key)}** booked {timestamp(first.start_utc)} → "
+        f"{timestamp(first.end_utc, 't')} (booking #{first.id}){series}. "
+        "During your slot only you and booking admins can change this server.",
+    )
+    await deps.on_change()
+
+
+async def cancel_and_reply(
+    interaction: discord.Interaction, deps: BookingCommandDeps, booking_id: int
+) -> None:
+    """Cancel a booking and reply; shared by /cancel_booking and the panel."""
+    await _defer(interaction)
+    try:
+        booking = await asyncio.to_thread(
+            deps.service.cancel,
+            booking_id,
+            interaction.user.id,
+            is_booking_admin(interaction.user, deps.config),
+        )
+    except sqlite3.Error:
+        logger.exception("Booking store failed while cancelling a booking")
+        await _reply(interaction, STORE_ERROR_MESSAGE)
+        return
+    except BookingError as exc:
+        await _reply(interaction, f"❌ {exc}")
+        return
+    await _reply(
+        interaction,
+        f"✅ Cancelled booking #{booking.id} on **{deps.server_name_for_key(booking.server_key)}**.",
+    )
+    await deps.on_change()
 
 
 def register_booking_commands(
@@ -152,54 +248,9 @@ def register_booking_commands(
         start: str,
         duration: str,
     ):
-        if await _refuse_unavailable(interaction, deps):
+        if await refuse_unavailable(interaction, deps):
             return
-        if not can_book(interaction.user, deps.config):
-                    await _reply(
-                        interaction,
-                        "You must be a member of the booking guild to book a server.",
-                    )
-                    return
-
-        await _defer(interaction)
-        try:
-            start_utc = parse_start(start, deps.config.timezone)
-            end_utc = start_utc + parse_duration(duration)
-            server_key = deps.server_key(int(server.value))
-            booking = await asyncio.to_thread(
-                deps.service.create,
-                server_key=server_key,
-                user_id=interaction.user.id,
-                user_name=interaction.user.display_name,
-                start_utc=start_utc,
-                end_utc=end_utc,
-            )
-        except BookingOverlapError as exc:
-            conflict = exc.conflict
-            await _reply(
-                interaction,
-                f"❌ That overlaps <@{conflict.user_id}>'s booking #{conflict.id}: "
-                f"{timestamp(conflict.start_utc)} → {timestamp(conflict.end_utc, 't')}.",
-            )
-            return
-        except sqlite3.Error:
-            logger.exception("Booking store failed during /book")
-            await _reply(interaction, STORE_ERROR_MESSAGE)
-            return
-        except BookingError as exc:
-            await _reply(
-                interaction,
-                f"❌ {exc} Use start `{START_FORMAT_HINT}` in {deps.config.timezone.key} "
-                f"and duration as {DURATION_HINT}.",
-            )
-            return
-
-        await _reply(
-            interaction,
-            f"✅ **{server.name}** booked {timestamp(booking.start_utc)} → {timestamp(booking.end_utc, 't')} "
-            f"(booking #{booking.id}). During your slot only you and booking admins can change this server.",
-        )
-        await deps.on_change()
+        await book_and_reply(interaction, deps, int(server.value), start, duration)
 
     @tree.command(
         name="bookings", description="List active and upcoming server bookings"
@@ -210,7 +261,7 @@ def register_booking_commands(
         interaction: discord.Interaction,
         server: app_commands.Choice[str] | None = None,
     ):
-        if await _refuse_unavailable(interaction, deps):
+        if await refuse_unavailable(interaction, deps):
             return
         server_key = deps.server_key(int(server.value)) if server else None
         await _defer(interaction)
@@ -237,28 +288,9 @@ def register_booking_commands(
     async def cancel_booking(
         interaction: discord.Interaction, booking_id: int
     ):
-        if await _refuse_unavailable(interaction, deps):
+        if await refuse_unavailable(interaction, deps):
             return
-        await _defer(interaction)
-        try:
-            booking = await asyncio.to_thread(
-                deps.service.cancel,
-                booking_id,
-                interaction.user.id,
-                is_booking_admin(interaction.user, deps.config),
-            )
-        except sqlite3.Error:
-            logger.exception("Booking store failed during /cancel_booking")
-            await _reply(interaction, STORE_ERROR_MESSAGE)
-            return
-        except BookingError as exc:
-            await _reply(interaction, f"❌ {exc}")
-            return
-        await _reply(
-            interaction,
-            f"✅ Cancelled booking #{booking.id} on **{deps.server_name_for_key(booking.server_key)}**.",
-        )
-        await deps.on_change()
+        await cancel_and_reply(interaction, deps, booking_id)
 
     @cancel_booking.autocomplete("booking_id")
     async def cancel_booking_autocomplete(
@@ -283,10 +315,7 @@ def register_booking_commands(
         for booking in live:
             if not admin and booking.user_id != interaction.user.id:
                 continue
-            label = (
-                f"#{booking.id} {deps.server_name_for_key(booking.server_key)} "
-                f"{format_local(booking.start_utc, deps.config.timezone)} ({booking.user_name})"
-            )
+            label = booking_label(booking, deps)
             if needle and needle not in label.lower():
                 continue
             choices.append(

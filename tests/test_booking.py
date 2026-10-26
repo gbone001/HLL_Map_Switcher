@@ -96,6 +96,29 @@ class CreateAndListTests(BookingServiceTestCase):
             self.service.create("server1", 1, "u", T0 + HOUR, T0 + HOUR)
 
 
+class SeriesTests(BookingServiceTestCase):
+    def test_weekly_series_creates_each_occurrence(self):
+        series = self.service.create_series("server1", 1, "u", T0 + HOUR, T0 + 2 * HOUR, "weekly", 3)
+
+        self.assertEqual([b.start_utc - T0 for b in series], [HOUR, HOUR + 7 * 86400, HOUR + 14 * 86400])
+        self.assertEqual([b.id for b in self.service.list_live()], [b.id for b in series])
+
+    def test_series_is_all_or_nothing_on_overlap(self):
+        blocker = self.service.create("server1", 2, "other", T0 + 86400 + HOUR, T0 + 86400 + 2 * HOUR)
+
+        with self.assertRaises(BookingOverlapError):
+            self.service.create_series("server1", 1, "u", T0 + HOUR, T0 + 2 * HOUR, "daily", 3)
+
+        self.assertEqual([b.id for b in self.service.list_live()], [blocker.id])
+
+    def test_no_recurrence_ignores_count_and_bad_input_is_rejected(self):
+        self.assertEqual(len(self.service.create_series("server1", 1, "u", T0 + HOUR, T0 + 2 * HOUR, "none", 5)), 1)
+        with self.assertRaises(BookingError):
+            self.service.create_series("server1", 1, "u", T0 + HOUR, T0 + 2 * HOUR, "daily", 0)
+        with self.assertRaises(BookingError):
+            self.service.create_series("server1", 1, "u", T0 + HOUR, T0 + 2 * HOUR, "monthly", 2)
+
+
 class OverlapTests(BookingServiceTestCase):
     def test_overlap_on_same_server_is_rejected_with_conflict(self):
         first = self.book(1, 2, user_id=1)

@@ -13,6 +13,7 @@ from commands.booking import (
     is_booking_admin,
     register_booking_commands,
 )
+from commands.booking_panel import open_book_panel, open_manage_panel
 from events.booking_refresh import BookingBoundaryRefresher
 from services.booking import (
     SCHEDULE_DAYS,
@@ -171,6 +172,16 @@ if booking_config.enabled:
 else:
     print(f"Server booking disabled: {booking_config.disabled_reason}")
 
+
+# Shared by the booking slash commands and the panel's booking buttons.
+booking_deps = BookingCommandDeps(
+    service=booking_service,
+    config=booking_config,
+    servers=api_client.get_servers,
+    server_key=api_client.get_server_key,
+    server_name_for_key=api_client.get_server_name_for_key,
+    on_change=lambda: refresh_main_embed(),
+)
 
 def _orphaned_booking_keys() -> set[str]:
     """Server keys of live bookings that match no configured server (e.g. after SERVER{N}_* changes)."""
@@ -1379,6 +1390,28 @@ class GameModeView(PersistentView):
         await send_temporary_response(
             interaction, embed=embed, view=view, delay=None
         )
+
+    @discord.ui.button(
+        label="📅 Book Server",
+        style=discord.ButtonStyle.success,
+        custom_id="persistent:book_server",
+        row=0,
+    )
+    async def book_server(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ):
+        await open_book_panel(interaction, booking_deps)
+
+    @discord.ui.button(
+        label="📋 Manage Bookings",
+        style=discord.ButtonStyle.primary,
+        custom_id="persistent:manage_bookings",
+        row=0,
+    )
+    async def manage_bookings(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ):
+        await open_manage_panel(interaction, booking_deps)
 
     @discord.ui.button(
         label="🔄 Refresh Status",
@@ -2732,17 +2765,7 @@ async def repost_button(interaction: discord.Interaction):
 
 booking_refresher: BookingBoundaryRefresher | None = None
 if booking_service is not None:
-    register_booking_commands(
-        bot.tree,
-        BookingCommandDeps(
-            service=booking_service,
-            config=booking_config,
-            servers=api_client.get_servers,
-            server_key=api_client.get_server_key,
-            server_name_for_key=api_client.get_server_name_for_key,
-            on_change=lambda: refresh_main_embed(),
-        ),
-    )
+    register_booking_commands(bot.tree, booking_deps)
     booking_refresher = BookingBoundaryRefresher(
         booking_service,
         lambda: refresh_main_embed(),

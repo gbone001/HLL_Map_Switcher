@@ -90,6 +90,9 @@ DEFAULT_MAX_HOURS = 24
 DEFAULT_MAX_DAYS_AHEAD = 90
 DEFAULT_PANEL_REFRESH_TIME = time(6, 0)
 SCHEDULE_DAYS = 14
+# Days between occurrences for each recurrence choice offered on the panel.
+RECURRENCE_DAYS = {"none": 0, "daily": 1, "weekly": 7, "biweekly": 14}
+MAX_OCCURRENCES = 20
 
 
 @dataclass(frozen=True)
@@ -256,7 +259,78 @@ class BookingService:
         end_utc: int,
     ) -> Booking:
         """Insert a booking unless it is invalid or overlaps a live booking on the same server."""
+        return self.create_series(
+            server_key, user_id, user_name, start_utc, end_utc
+        )[0]
+
+    def create_series(
+        self,
+        server_key: str,
+        user_id: int,
+        user_name: str,
+        start_utc: int,
+        end_utc: int,
+        recurrence: str = "none",
+        count: int = 1,
+    ) -> list[Booking]:
+        """Insert `count` bookings `recurrence` apart, all or nothing.
+
+        Every occurrence is validated and overlap-checked inside one transaction, so a
+        conflict on any of them leaves the store unchanged.
+        """
+        if recurrence not in RECURRENCE_DAYS:
+            raise BookingError(f"Unknown recurrence {recurrence!r}.")
+        if not 1 <= count <= MAX_OCCURRENCES:
+            raise BookingError(
+                f"Occurrences must be between 1 and {MAX_OCCURRENCES}."
+            )
+        if RECURRENCE_DAYS[recurrence] == 0:
+            count = 1
+        step = RECURRENCE_DAYS[recurrence] * 86400
         now = self.now_ts()
+        slots = [
+            (start_utc + i * step, end_utc + i * step) for i in range(count)
+        ]
+        for start, end in slots:
+            self._validate_slot(start, end, now)
+
+        bookings = []
+        conn = self._connect()
+        try:
+            # BEGIN IMMEDIATE takes the write lock up front so two concurrent /book calls
+            # cannot both pass the overlap check.
+            conn.execute("BEGIN IMMEDIATE")
+            for start, end in slots:
+                row = conn.execute(
+                    f"SELECT {_COLUMNS} FROM bookings WHERE server_key = ? AND cancelled_at IS NULL "
+                    "AND start_utc < ? AND end_utc > ? ORDER BY start_utc LIMIT 1",
+                    (server_key, end, start),
+                ).fetchone()
+                if row is not None:
+                    conn.execute("ROLLBACK")
+                    raise BookingOverlapError(_row_to_booking(row))
+                cursor = conn.execute(
+                    "INSERT INTO bookings (server_key, user_id, user_name, start_utc, end_utc, created_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?)",
+                    (server_key, user_id, user_name, start, end, now),
+                )
+                bookings.append(
+                    Booking(
+                        cursor.lastrowid,
+                        server_key,
+                        user_id,
+                        user_name,
+                        start,
+                        end,
+                        now,
+                    )
+                )
+            conn.execute("COMMIT")
+        finally:
+            conn.close()
+        return bookings
+
+    def _validate_slot(self, start_utc: int, end_utc: int, now: int) -> None:
         if end_utc <= start_utc:
             raise BookingError("The booking must end after it starts.")
         if start_utc < now - 60:
@@ -272,30 +346,6 @@ class BookingService:
             raise BookingError(
                 f"Bookings can start at most {self.max_lead_seconds // 86400} days ahead."
             )
-
-        conn = self._connect()
-        try:
-            # BEGIN IMMEDIATE takes the write lock up front so two concurrent /book calls
-            # cannot both pass the overlap check.
-            conn.execute("BEGIN IMMEDIATE")
-            row = conn.execute(
-                f"SELECT {_COLUMNS} FROM bookings WHERE server_key = ? AND cancelled_at IS NULL "
-                "AND start_utc < ? AND end_utc > ? ORDER BY start_utc LIMIT 1",
-                (server_key, end_utc, start_utc),
-            ).fetchone()
-            if row is not None:
-                conn.execute("ROLLBACK")
-                raise BookingOverlapError(_row_to_booking(row))
-            cursor = conn.execute(
-                "INSERT INTO bookings (server_key, user_id, user_name, start_utc, end_utc, created_at) "
-                "VALUES (?, ?, ?, ?, ?, ?)",
-                (server_key, user_id, user_name, start_utc, end_utc, now),
-            )
-            booking_id = cursor.lastrowid
-            conn.execute("COMMIT")
-        finally:
-            conn.close()
-        return self.get(booking_id)
 
     def get(self, booking_id: int) -> Booking | None:
         with closing(self._connect()) as conn:
