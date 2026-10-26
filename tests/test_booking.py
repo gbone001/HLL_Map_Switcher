@@ -190,16 +190,18 @@ class ActiveAndLockTests(BookingServiceTestCase):
         self.assertEqual((summary["server2"][0], summary["server2"][1].id), (None, other.id))
         self.assertNotIn(later.id, [b.id for pair in summary.values() for b in pair if b])
 
-    def test_blocking_booking_rules(self):
+    def test_control_check_rules(self):
         booking = self.book(0, 1, user_id=1)
 
-        self.assertEqual(self.service.blocking_booking("server1", user_id=2, is_admin=False).id, booking.id)
-        self.assertIsNone(self.service.blocking_booking("server1", user_id=1, is_admin=False))
-        self.assertIsNone(self.service.blocking_booking("server1", user_id=2, is_admin=True))
-        self.assertIsNone(self.service.blocking_booking("server2", user_id=2, is_admin=False))
+        self.assertEqual(self.service.control_check("server1", user_id=1, is_admin=False), (True, booking))
+        self.assertEqual(self.service.control_check("server1", user_id=2, is_admin=False), (False, booking))
+        self.assertEqual(self.service.control_check("server1", user_id=2, is_admin=True), (True, booking))
+        # The booker's slot on server1 gives no control over server2.
+        self.assertEqual(self.service.control_check("server2", user_id=1, is_admin=False), (False, None))
+        self.assertEqual(self.service.control_check("server2", user_id=2, is_admin=True), (True, None))
 
         self.clock.ts = T0 + HOUR
-        self.assertIsNone(self.service.blocking_booking("server1", user_id=2, is_admin=False))
+        self.assertEqual(self.service.control_check("server1", user_id=1, is_admin=False), (False, None))
 
 
 class CancelTests(BookingServiceTestCase):

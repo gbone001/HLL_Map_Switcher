@@ -69,6 +69,7 @@
 - Keep server discovery and server-name resolution inside `src/utils/api_client.py` or a future dedicated service module.
 - Keep HTTP-first / direct-RCON-fallback orchestration inside `src/services/server_control.py`.
 - Every new control write in `src/bot.py` must call `_deny_if_booked(...)` immediately before the write so the booking lock covers it.
+- The booking lock is strict: a control write to a server is allowed only for the holder of that server's live booking, or a booking admin (`BookingService.control_check`). No live booking means nobody else can write, and a booking on one server gives no control over another.
 - Game-control panel buttons (`BOOKING_GATED_BUTTONS`: map, objectives, weather, timers, team switch, admin cam) are only shown while a booking is live on the focused server (`_panel_controls_unlocked`); new control buttons belong in that set.
 - The panel message ID is saved to `data/panel_message.json` and edited by ID (no Read Message History needed); restarts and booking changes edit that one message instead of posting duplicates.
 - Booking replies and panel pickers are ephemeral and delete themselves (`REPLY_EXPIRY_SECONDS`, picker removed after a successful booking or on timeout).

@@ -229,13 +229,13 @@ if booking_service is not None:
             )
 
 
-async def _booking_blocking_user(
+async def _booking_control_check(
     interaction: discord.Interaction, server_index: int
-) -> Booking | None:
+) -> tuple[bool, Booking | None]:
     if booking_service is None:
-        return None
+        return True, None
     return await asyncio.to_thread(
-        booking_service.blocking_booking,
+        booking_service.control_check,
         api_client.get_server_key(server_index),
         interaction.user.id,
         is_booking_admin(interaction.user, booking_config),
@@ -248,13 +248,15 @@ async def _deny_if_booked(
     *,
     edit_flow: bool = False,
 ) -> bool:
-    """Booking guard for control writes: True (and tell the user) if someone else holds the server.
+    """Booking guard for control writes: True (and tell the user) unless they may control this server.
 
-    Called right before each write rather than when a flow opens, so a flow opened before a
-    booking starts cannot finish during it.
+    Only the holder of this server's live booking (or a booking admin) may write to it; a
+    booking on another server gives no control here. Called right before each write rather
+    than when a flow opens, so a flow cannot finish after its booking has ended.
     """
+    server_name = api_client.get_server_name(server_index)
     try:
-        blocking = await _booking_blocking_user(interaction, server_index)
+        allowed, active = await _booking_control_check(interaction, server_index)
     except Exception as exc:
         # Fail closed: without the booking store we can't tell whether someone holds the server.
         print(
@@ -262,15 +264,20 @@ async def _deny_if_booked(
         )
         message = "❌ Could not check server bookings, so nothing was changed. Try again shortly."
     else:
-        if blocking is None:
+        if allowed:
             return False
-        message = (
-            f"🔒 **{api_client.get_server_name(server_index)}** is booked by <@{blocking.user_id}> "
-            f"until <t:{blocking.end_utc}:t>. Only they or a booking admin can change it right now."
-        )
+        if active is None:
+            message = (
+                f"🔒 **{server_name}** has no live booking. Book it with 📅 Book to control it."
+            )
+        else:
+            message = (
+                f"🔒 **{server_name}** is booked by <@{active.user_id}> until <t:{active.end_utc}:t>. "
+                "Only they or a booking admin can change it right now."
+            )
         print(
             f"Booking guard blocked user {interaction.user.id} on server index {server_index} "
-            f"(booking #{blocking.id})"
+            f"(live booking: {active.id if active else 'none'})"
         )
     if edit_flow:
         await update_interaction_message(

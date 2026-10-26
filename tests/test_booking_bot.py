@@ -148,12 +148,24 @@ class GuardAtWriteSiteTests(BookingBotTestCase):
 
         write.assert_not_called()
 
-    async def test_no_active_booking_allows_anyone(self):
+    async def test_no_live_booking_blocks_everyone_but_admins(self):
         self.service.create(self.server_key, BOOKER_ID, "booker", T0 + HOUR, T0 + 2 * HOUR)
 
-        _, write = await self.submit_cooldown(member(OTHER_ID))
+        for user in (member(OTHER_ID), member(BOOKER_ID)):  # the booker's slot hasn't started
+            interaction, write = await self.submit_cooldown(user)
+            write.assert_not_called()
+            self.assertIn("has no live booking", interaction.followup.send.await_args.kwargs.get("content", ""))
 
+        _, write = await self.submit_cooldown(member(ADMIN_ID, administrator=True))
         write.assert_called_once()
+
+    async def test_booking_on_another_server_gives_no_control(self):
+        self.service.create("server-other", BOOKER_ID, "booker", T0 - 60, T0 + HOUR)
+
+        interaction, write = await self.submit_cooldown(member(BOOKER_ID))
+
+        write.assert_not_called()
+        self.assertIn("has no live booking", interaction.followup.send.await_args.kwargs.get("content", ""))
 
     async def test_booking_disabled_allows_anyone(self):
         self.book_now()
@@ -164,7 +176,7 @@ class GuardAtWriteSiteTests(BookingBotTestCase):
 
     async def test_store_error_fails_closed_with_explicit_message(self):
         with mock.patch.object(
-            self.service, "blocking_booking", side_effect=sqlite3.OperationalError("database is locked")
+            self.service, "control_check", side_effect=sqlite3.OperationalError("database is locked")
         ):
             interaction, write = await self.submit_cooldown(member(OTHER_ID))
 

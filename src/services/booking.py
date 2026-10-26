@@ -393,16 +393,18 @@ class BookingService:
             summary[booking.server_key] = (active, upcoming)
         return summary
 
-    def blocking_booking(
+    def control_check(
         self, server_key: str, user_id: int, is_admin: bool
-    ) -> Booking | None:
-        """The booking that stops this user writing to this server right now, if any."""
-        if is_admin:
-            return None
+    ) -> tuple[bool, Booking | None]:
+        """(allowed, live booking) for a control write to this server right now.
+
+        Only the holder of the server's live booking may control it; booking admins always
+        may. With no live booking on this server nobody else can, even if they hold a
+        booking on a different server.
+        """
         active = self.active_for(server_key)
-        if active is None or active.user_id == user_id:
-            return None
-        return active
+        allowed = is_admin or (active is not None and active.user_id == user_id)
+        return allowed, active
 
     def cancel(
         self, booking_id: int, actor_id: int, is_admin: bool
