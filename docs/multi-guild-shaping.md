@@ -6,8 +6,25 @@ Extends the server booking bet ([booking-shaping.md](booking-shaping.md), branch
 
 ## Working mode
 - Profile: collaborative
-- Current move: selected-design breadboard accepted ([multi-guild-breadboard.md](multi-guild-breadboard.md)) → next is slicing
-- Status: **selected** (shape A), 2026-10-16. A6 revised 2026-10-16 to resolve breadboard issue G1
+- Current move: **revised 2026-10-27** (see below) → sliced in [multi-guild-slices.md](multi-guild-slices.md); slice 1 in build
+- Status: **selected** (shape A, revised), 2026-10-16. A6 revised 2026-10-16 to resolve breadboard issue G1; A1, A4, A5, A6 revised again 2026-10-27
+
+## Revision 2026-10-27 (supersedes conflicting rows below)
+`feat/server-booking` moved on after this record was accepted, so the repo owner re-decided five points on 2026-10-27:
+
+| # | Decision | Replaces |
+|---|---|---|
+| R1 | **Unbooked game server:** nobody may control it except home-guild booking admins (the strict lock now in production) | M2 / C1 "owner guild members may control when unbooked" |
+| R2 | **During a booking:** the booker, plus Administrators of the booking's guild; home-guild booking admins always override | M2 / C2–C3 "booking guild's role members" (`BOOKING_ROLE_ID` was removed: any approved-guild member may book) |
+| R3 | **Approval:** allow-list in one variable, `BOOKING_GUILD_IDS`, next to `DISCORD_GUILD_ID` (home). Unlisted guilds are left | A1's `GUILD{N}_ID` / `GUILD{N}_CHANNEL_ID` / `GUILD{N}_BOOKING_ROLE_ID` |
+| R4 | **Game servers:** every approved guild sees and can book every game server | — (new; per-guild server lists deferred) |
+| R5 | **Admin cam:** home guild only; guest panels omit the buttons | M7 (unchanged, restated) |
+
+Consequences for the parts:
+- **A1:** the registry is `DISCORD_GUILD_ID` + `BOOKING_GUILD_IDS`. There are no per-guild channel or role variables.
+- **A4:** the lock is `control_check` plus the guild: the guild must match the booking's guild, or the request must come from a home-guild booking admin.
+- **A5:** guest guild Administrators manage their own guild's bookings. Home-guild Administrators and `BOOKING_ADMIN_ROLE_ID` holders are booking admins everywhere.
+- **A6:** panels are saved per guild in `data/panel_message.json` (on the Railway volume) and created with `/setup_panel`. This replaces the in-memory map and history scan (G1), because the bot lacks Read Message History.
 
 ## Frame
 - **x — current situation:** the bot assumes one guild:

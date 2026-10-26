@@ -16,6 +16,7 @@ from commands.booking import (
 )
 from commands.booking_panel import open_book_panel, open_manage_panel
 from events.booking_refresh import BookingBoundaryRefresher
+from services.guild_registry import GuildRegistry
 from services.booking import (
     SCHEDULE_DAYS,
     Booking,
@@ -41,40 +42,42 @@ load_dotenv()
 
 
 async def sync_app_commands(
-    tree: discord.app_commands.CommandTree, guild_id_raw: str | None = None
+    tree: discord.app_commands.CommandTree,
+    registry: GuildRegistry | None = None,
 ) -> list:
     """Register slash commands with Discord.
 
-    With DISCORD_GUILD_ID set, commands are copied to that guild so they appear
-    immediately; otherwise they are synced globally (can take up to an hour).
+    Commands are copied to every approved guild (DISCORD_GUILD_ID plus BOOKING_GUILD_IDS) so
+    they appear immediately. Without a home guild they are synced globally (can take up to an
+    hour). Returns the commands synced to the home guild (or globally).
     """
-    if guild_id_raw is None:
-        guild_id_raw = os.getenv("DISCORD_GUILD_ID")
-    guild_id_raw = (guild_id_raw or "").strip()
+    registry = registry or guild_registry
+    for entry in registry.invalid_entries:
+        print(f"Ignoring invalid BOOKING_GUILD_IDS entry: {entry!r}")
 
-    guild: discord.Object | None = None
-    if guild_id_raw:
+    if not registry.configured:
         try:
-            guild = discord.Object(id=int(guild_id_raw))
-        except ValueError:
-            print(
-                f"Invalid DISCORD_GUILD_ID value: {guild_id_raw}; syncing slash commands globally."
-            )
+            synced = await tree.sync()
+        except discord.HTTPException as exc:
+            print(f"Failed to sync slash commands globally: {exc}")
+            return []
+        print(f"Synced {len(synced)} slash command(s) globally.")
+        return synced
 
-    try:
-        if guild is not None:
+    home_synced: list = []
+    for guild_id in registry.approved_ids():
+        guild = discord.Object(id=guild_id)
+        try:
             tree.copy_global_to(guild=guild)
             synced = await tree.sync(guild=guild)
-            print(
-                f"Synced {len(synced)} slash command(s) to guild {guild.id}."
-            )
-        else:
-            synced = await tree.sync()
-            print(f"Synced {len(synced)} slash command(s) globally.")
-    except discord.HTTPException as exc:
-        print(f"Failed to sync slash commands: {exc}")
-        return []
-    return synced
+        except discord.HTTPException as exc:
+            # One unreachable guild (e.g. the bot isn't in it yet) must not block the others.
+            print(f"Failed to sync slash commands to guild {guild_id}: {exc}")
+            continue
+        print(f"Synced {len(synced)} slash command(s) to guild {guild_id}.")
+        if registry.is_home(guild_id):
+            home_synced = synced
+    return home_synced
 
 
 class MapSwitcherBot(commands.Bot):
@@ -94,6 +97,9 @@ intents.guilds = True
 intents.guild_messages = True
 intents.message_content = True
 bot = MapSwitcherBot(command_prefix="!", intents=intents)
+
+# Approved Discord guilds: DISCORD_GUILD_ID (home) plus BOOKING_GUILD_IDS (guests).
+guild_registry = GuildRegistry.from_env()
 
 # API client
 api_client = HLLAPIClient()
@@ -2790,10 +2796,38 @@ class BackToMapSelectionButton(discord.ui.Button):
         await update_interaction_message(interaction, embed=embed, view=view)
 
 
+async def _leave_if_unapproved(guild: discord.Guild) -> bool:
+    """Leave a guild missing from DISCORD_GUILD_ID / BOOKING_GUILD_IDS. True if it left."""
+    if guild_registry.is_approved(guild.id):
+        return False
+    print(
+        f"Leaving guild {guild.name!r} ({guild.id}): not in DISCORD_GUILD_ID or BOOKING_GUILD_IDS."
+    )
+    try:
+        await guild.leave()
+    except discord.HTTPException as exc:
+        print(f"Could not leave guild {guild.id}: {exc}")
+        return False
+    return True
+
+
+@bot.event
+async def on_guild_join(guild: discord.Guild):
+    if not await _leave_if_unapproved(guild):
+        print(f"Joined approved guild {guild.name!r} ({guild.id}).")
+
+
 @bot.event
 async def on_ready():
     print(f"{bot.user} has connected to Discord!")
+    for guild in list(bot.guilds):
+        await _leave_if_unapproved(guild)
     print(f"Bot is in {len(bot.guilds)} guilds")
+    missing = set(guild_registry.approved_ids()) - {g.id for g in bot.guilds}
+    if missing:
+        print(
+            f"Approved guild(s) the bot has not joined yet: {', '.join(map(str, sorted(missing)))}"
+        )
 
     # Start periodic cache cleanup task
     _start_cache_cleanup_task()
@@ -2825,6 +2859,18 @@ async def on_ready():
         print(f"Could not find text channel with ID: {channel_id}")
 
 
+async def _refuse_outside_home_guild(interaction: discord.Interaction) -> bool:
+    """Until per-guild panels (multi-guild slice 4) there is one panel; only the home guild may move it."""
+    if not guild_registry.configured or guild_registry.is_home(interaction.guild_id):
+        return False
+    await send_temporary_response(
+        interaction,
+        content="❌ For now the control panel can only be set up in the bot's home Discord.",
+        delay=20,
+    )
+    return True
+
+
 # Admin command to repost the button if needed
 @bot.tree.command(
     name="repost_button",
@@ -2841,6 +2887,9 @@ async def repost_button(interaction: discord.Interaction):
             content="❌ You need administrator permissions to use this command.",
             delay=20,
         )
+        return
+
+    if await _refuse_outside_home_guild(interaction):
         return
 
     channel = await _resolve_text_channel(_panel_channel_id())
@@ -2878,6 +2927,9 @@ async def setup_panel(
             content="❌ You need administrator permissions to use this command.",
             delay=20,
         )
+        return
+
+    if await _refuse_outside_home_guild(interaction):
         return
 
     target = channel or interaction.channel
