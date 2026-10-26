@@ -15,6 +15,7 @@ from dataclasses import dataclass
 import discord
 from discord import app_commands
 
+from services.guild_registry import GuildRegistry
 from services.booking import (
     DURATION_HINT,
     START_FORMAT_HINT,
@@ -29,10 +30,8 @@ from services.booking import (
 )
 
 NOT_CONFIGURED_MESSAGE = "Server booking is not configured on this bot."
-WRONG_GUILD_MESSAGE = (
-    "Server booking is only available in this bot's home Discord."
-)
-NOT_A_MEMBER_MESSAGE = "You must be a member of the booking guild to book a server."
+WRONG_GUILD_MESSAGE = "This Discord isn't set up to use server booking."
+NOT_A_MEMBER_MESSAGE = "You must be a member of an approved Discord to book a server."
 STORE_ERROR_MESSAGE = "❌ Could not reach the booking store. Nothing was changed; try again shortly."
 # Booking replies are ephemeral and delete themselves after this long.
 REPLY_EXPIRY_SECONDS = 90
@@ -50,6 +49,15 @@ class BookingCommandDeps:
     server_key: Callable[[int], str]
     server_name_for_key: Callable[[str], str]
     on_change: Callable[[], Awaitable[None]]
+    # Approved guilds (multi-guild). None means single-guild: only config.guild_id.
+    registry: GuildRegistry | None = None
+    # Display name for a guild ID, used when showing other guilds' bookings.
+    guild_name: Callable[[int | None], str] = lambda guild_id: "another Discord"
+
+    def is_approved(self, guild_id: int | None) -> bool:
+        if self.registry is not None:
+            return self.registry.configured and self.registry.is_approved(guild_id)
+        return guild_id is not None and guild_id == self.config.guild_id
 
 
 def _member_of_booking_guild(user: object, config: BookingConfig) -> bool:
@@ -71,12 +79,31 @@ def is_booking_admin(user: object, config: BookingConfig) -> bool:
     )
 
 
-def can_book(user: object, config: BookingConfig) -> bool:
-    if is_booking_admin(user, config):
+def can_book(user: object, deps: BookingCommandDeps) -> bool:
+    """Any member of an approved guild can book; home booking admins always can."""
+    if is_booking_admin(user, deps.config):
         return True
-    if not _member_of_booking_guild(user, config):
-        return False
-    return True  # any guild member can book
+    return isinstance(user, discord.Member) and deps.is_approved(
+        getattr(user.guild, "id", None)
+    )
+
+
+def guild_admin_id(user: object) -> int | None:
+    """The guild this user administers in this interaction, if any (manages that guild's bookings)."""
+    if isinstance(user, discord.Member) and user.guild_permissions.administrator:
+        return getattr(user.guild, "id", None)
+    return None
+
+
+def booker_text(
+    booking: Booking,
+    viewer_guild_id: int | None,
+    guild_name: Callable[[int | None], str],
+) -> str:
+    """Mention the booker inside their own guild; elsewhere show only the guild's name."""
+    if booking.guild_id is None or booking.guild_id == viewer_guild_id:
+        return f"<@{booking.user_id}>"
+    return f"**{guild_name(booking.guild_id)}**"
 
 
 def fit_lines(lines: list[str], limit: int = MAX_REPLY_CHARS) -> str:
@@ -97,9 +124,11 @@ def timestamp(ts: int, style: str = "F") -> str:
     return f"<t:{ts}:{style}>"
 
 
-def describe_booking(booking: Booking, server_name: str) -> str:
+def describe_booking(
+    booking: Booking, server_name: str, booked_by: str | None = None
+) -> str:
     return (
-        f"#{booking.id} **{server_name}** — <@{booking.user_id}> "
+        f"#{booking.id} **{server_name}** — {booked_by or f'<@{booking.user_id}>'} "
         f"{timestamp(booking.start_utc)} → {timestamp(booking.end_utc, 't')} ({timestamp(booking.start_utc, 'R')})"
     )
 
@@ -143,17 +172,21 @@ async def refuse_unavailable(
     if deps.service is None or not deps.config.enabled:
         await _reply(interaction, NOT_CONFIGURED_MESSAGE)
         return True
-    if interaction.guild_id != deps.config.guild_id:
+    if not deps.is_approved(interaction.guild_id):
         await _reply(interaction, WRONG_GUILD_MESSAGE)
         return True
     return False
 
 
-def booking_label(booking: Booking, deps: BookingCommandDeps) -> str:
+def booking_label(
+    booking: Booking, deps: BookingCommandDeps, viewer_guild_id: int | None = None
+) -> str:
     """Plain-text booking label for choices and select options, where Discord timestamps don't render."""
+    same_guild = booking.guild_id is None or booking.guild_id == viewer_guild_id
+    who = booking.user_name if same_guild else deps.guild_name(booking.guild_id)
     return (
         f"#{booking.id} {deps.server_name_for_key(booking.server_key)} "
-        f"{format_local(booking.start_utc, deps.config.timezone)} ({booking.user_name})"
+        f"{format_local(booking.start_utc, deps.config.timezone)} ({who})"
     )[:100]
 
 
@@ -167,7 +200,7 @@ async def book_and_reply(
     count: int = 1,
 ) -> bool:
     """Create a booking (or recurring series) and reply; True if it was created. Shared by /book and the panel."""
-    if not can_book(interaction.user, deps.config):
+    if not can_book(interaction.user, deps):
         await _reply(interaction, NOT_A_MEMBER_MESSAGE)
         return False
 
@@ -185,12 +218,17 @@ async def book_and_reply(
             end_utc=end_utc,
             recurrence=recurrence,
             count=count,
+            guild_id=interaction.guild_id,
         )
     except BookingOverlapError as exc:
         conflict = exc.conflict
+        if conflict.guild_id is None or conflict.guild_id == interaction.guild_id:
+            holder = f"<@{conflict.user_id}>'s booking #{conflict.id}"
+        else:
+            holder = f"a booking by **{deps.guild_name(conflict.guild_id)}**"
         await _reply(
             interaction,
-            f"❌ That overlaps <@{conflict.user_id}>'s booking #{conflict.id}: "
+            f"❌ That overlaps {holder}: "
             f"{timestamp(conflict.start_utc)} → {timestamp(conflict.end_utc, 't')}.",
         )
         return False
@@ -229,6 +267,7 @@ async def cancel_and_reply(
             booking_id,
             interaction.user.id,
             is_booking_admin(interaction.user, deps.config),
+            guild_admin_id(interaction.user),
         )
     except sqlite3.Error:
         logger.exception("Booking store failed while cancelling a booking")
@@ -293,7 +332,11 @@ def register_booking_commands(
             await _reply(interaction, "No active or upcoming bookings.")
             return
         lines = [
-            describe_booking(b, deps.server_name_for_key(b.server_key))
+            describe_booking(
+                b,
+                deps.server_name_for_key(b.server_key),
+                booker_text(b, interaction.guild_id, deps.guild_name),
+            )
             for b in live
         ]
         await _reply(interaction, fit_lines(lines))
@@ -317,10 +360,11 @@ def register_booking_commands(
         if (
             deps.service is None
             or not deps.config.enabled
-            or interaction.guild_id != deps.config.guild_id
+            or not deps.is_approved(interaction.guild_id)
         ):
             return []
         admin = is_booking_admin(interaction.user, deps.config)
+        admin_guild = guild_admin_id(interaction.user)
         try:
             live = await asyncio.to_thread(deps.service.list_live)
         except sqlite3.Error:
@@ -331,9 +375,9 @@ def register_booking_commands(
         needle = current.lower()
         choices = []
         for booking in live:
-            if not admin and booking.user_id != interaction.user.id:
+            if not booking.manageable_by(interaction.user.id, admin, admin_guild):
                 continue
-            label = booking_label(booking, deps)
+            label = booking_label(booking, deps, interaction.guild_id)
             if needle and needle not in label.lower():
                 continue
             choices.append(

@@ -40,12 +40,13 @@ CREATE TABLE IF NOT EXISTS bookings (
     end_utc INTEGER NOT NULL,
     created_at INTEGER NOT NULL,
     cancelled_at INTEGER,
-    cancelled_by INTEGER
+    cancelled_by INTEGER,
+    guild_id INTEGER
 );
 CREATE INDEX IF NOT EXISTS bookings_server_time ON bookings (server_key, start_utc, end_utc);
 """
 
-_COLUMNS = "id, server_key, user_id, user_name, start_utc, end_utc, created_at, cancelled_at, cancelled_by"
+_COLUMNS = "id, server_key, user_id, user_name, start_utc, end_utc, created_at, cancelled_at, cancelled_by, guild_id"
 _LIVE = "cancelled_at IS NULL AND end_utc > ?"
 
 
@@ -78,11 +79,24 @@ class Booking:
     created_at: int
     cancelled_at: int | None = None
     cancelled_by: int | None = None
+    # Discord guild the booking was made from (multi-guild slice 2); None only before migration.
+    guild_id: int | None = None
 
     def is_active(self, now_ts: int) -> bool:
         return (
             self.cancelled_at is None
             and self.start_utc <= now_ts < self.end_utc
+        )
+
+    def manageable_by(
+        self, user_id: int, is_admin: bool, admin_guild_id: int | None = None
+    ) -> bool:
+        """Who may cancel: the booker, a home-guild booking admin (`is_admin`), or an
+        Administrator of the guild the booking was made from (`admin_guild_id`)."""
+        return (
+            self.user_id == user_id
+            or is_admin
+            or (admin_guild_id is not None and self.guild_id == admin_guild_id)
         )
 
 
@@ -246,6 +260,9 @@ class BookingService:
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         with closing(self._connect()) as conn:
             conn.executescript(_SCHEMA)
+            columns = {row[1] for row in conn.execute("PRAGMA table_info(bookings)")}
+            if "guild_id" not in columns:  # stores created before multi-guild
+                conn.execute("ALTER TABLE bookings ADD COLUMN guild_id INTEGER")
 
     def now_ts(self) -> int:
         return int(self._clock().timestamp())
@@ -257,10 +274,11 @@ class BookingService:
         user_name: str,
         start_utc: int,
         end_utc: int,
+        guild_id: int | None = None,
     ) -> Booking:
         """Insert a booking unless it is invalid or overlaps a live booking on the same server."""
         return self.create_series(
-            server_key, user_id, user_name, start_utc, end_utc
+            server_key, user_id, user_name, start_utc, end_utc, guild_id=guild_id
         )[0]
 
     def create_series(
@@ -272,11 +290,13 @@ class BookingService:
         end_utc: int,
         recurrence: str = "none",
         count: int = 1,
+        guild_id: int | None = None,
     ) -> list[Booking]:
         """Insert `count` bookings `recurrence` apart, all or nothing.
 
         Every occurrence is validated and overlap-checked inside one transaction, so a
-        conflict on any of them leaves the store unchanged.
+        conflict on any of them leaves the store unchanged. Overlaps are checked per game
+        server across every guild: one calendar per server.
         """
         if recurrence not in RECURRENCE_DAYS:
             raise BookingError(f"Unknown recurrence {recurrence!r}.")
@@ -310,9 +330,9 @@ class BookingService:
                     conn.execute("ROLLBACK")
                     raise BookingOverlapError(_row_to_booking(row))
                 cursor = conn.execute(
-                    "INSERT INTO bookings (server_key, user_id, user_name, start_utc, end_utc, created_at) "
-                    "VALUES (?, ?, ?, ?, ?, ?)",
-                    (server_key, user_id, user_name, start, end, now),
+                    "INSERT INTO bookings (server_key, user_id, user_name, start_utc, end_utc, created_at, guild_id) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (server_key, user_id, user_name, start, end, now, guild_id),
                 )
                 bookings.append(
                     Booking(
@@ -323,6 +343,7 @@ class BookingService:
                         start,
                         end,
                         now,
+                        guild_id=guild_id,
                     )
                 )
             conn.execute("COMMIT")
@@ -407,8 +428,13 @@ class BookingService:
         return allowed, active
 
     def cancel(
-        self, booking_id: int, actor_id: int, is_admin: bool
+        self,
+        booking_id: int,
+        actor_id: int,
+        is_admin: bool,
+        admin_guild_id: int | None = None,
     ) -> Booking:
+        """Cancel if `Booking.manageable_by` allows it (booker, home admin, or booking guild's admin)."""
         booking = self.get(booking_id)
         if (
             booking is None
@@ -418,7 +444,7 @@ class BookingService:
             raise BookingNotFoundError(
                 f"Booking #{booking_id} was not found or has already ended."
             )
-        if booking.user_id != actor_id and not is_admin:
+        if not booking.manageable_by(actor_id, is_admin, admin_guild_id):
             raise BookingPermissionError(
                 f"Booking #{booking_id} is not yours."
             )
@@ -443,6 +469,14 @@ class BookingService:
                 (until_ts, since_ts),
             ).fetchall()
         return [_row_to_booking(row) for row in rows]
+
+    def claim_unowned(self, guild_id: int) -> int:
+        """Give bookings made before multi-guild (no guild) to `guild_id`; returns how many."""
+        with closing(self._connect()) as conn:
+            cursor = conn.execute(
+                "UPDATE bookings SET guild_id = ? WHERE guild_id IS NULL", (guild_id,)
+            )
+        return cursor.rowcount
 
     def reassign_server_key(self, old_key: str, new_key: str) -> int:
         """Move every booking from one server key to another; returns how many moved."""

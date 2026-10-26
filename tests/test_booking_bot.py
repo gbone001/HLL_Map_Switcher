@@ -284,18 +284,18 @@ class CommandTests(BookingBotTestCase):
     async def test_commands_refused_from_other_guild_or_dm(self):
         foreign_admin = member(ADMIN_ID, administrator=True, guild_id=OTHER_GUILD)
         reply = await self.run_book(foreign_admin)
-        self.assertIn("home Discord", reply)
+        self.assertIn("isn't set up", reply)
 
         booking = self.service.create("server1", BOOKER_ID, "booker", T0 + HOUR, T0 + 2 * HOUR)
         cancel = interaction_for(foreign_admin)
         await self.tree.get_command("cancel_booking").callback(cancel, booking_id=booking.id)
-        self.assertIn("home Discord", cancel.response.sent[-1])
+        self.assertIn("isn't set up", cancel.response.sent[-1])
         self.assertEqual(len(self.service.list_live()), 1)
 
         dm = interaction_for(mock.MagicMock(spec=discord.User))
         dm.guild_id = None
         await self.tree.get_command("bookings").callback(dm, server=None)
-        self.assertIn("home Discord", dm.response.sent[-1])
+        self.assertIn("isn't set up", dm.response.sent[-1])
 
     async def test_bookings_reply_stays_under_discord_limit(self):
         for hour in range(30):
@@ -540,3 +540,73 @@ class PanelAndRefreshTests(BookingBotTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+GUEST_GUILD = 5555
+
+
+class GuestGuildTests(CommandTests):
+    """Multi-guild slice 2: approved guest guilds book on the shared calendar."""
+
+    def setUp(self):
+        super().setUp()
+        self.tree = app_commands.CommandTree(discord.Client(intents=discord.Intents.none()))
+        register_booking_commands(
+            self.tree,
+            BookingCommandDeps(
+                service=self.service,
+                config=ENABLED_CONFIG,
+                servers=lambda: [(0, "Server One")],
+                server_key=lambda index: "server1",
+                server_name_for_key=lambda key: "Server One",
+                on_change=self.on_change,
+                registry=bot.GuildRegistry.from_env(
+                    {"DISCORD_GUILD_ID": str(HOME_GUILD), "BOOKING_GUILD_IDS": str(GUEST_GUILD)}
+                ),
+                guild_name={HOME_GUILD: "Home", GUEST_GUILD: "Guest Clan"}.get,
+            ),
+        )
+        self.clock.ts = T0 - 24 * HOUR
+
+    async def test_guest_member_books_and_the_booking_records_their_guild(self):
+        reply = await self.run_book(member(BOOKER_ID, guild_id=GUEST_GUILD))
+
+        self.assertIn("booked", reply)
+        self.assertEqual(self.service.list_live()[0].guild_id, GUEST_GUILD)
+
+    async def test_cross_guild_overlap_names_the_guild_not_the_member(self):
+        await self.run_book(member(BOOKER_ID, guild_id=GUEST_GUILD))
+
+        reply = await self.run_book(member(OTHER_ID), start="2027-01-15 10:00")
+
+        self.assertIn("a booking by **Guest Clan**", reply)
+        self.assertNotIn(f"<@{BOOKER_ID}>", reply)
+
+    async def test_bookings_list_mentions_members_only_inside_their_guild(self):
+        await self.run_book(member(BOOKER_ID, guild_id=GUEST_GUILD))
+
+        for guild_id, expected in ((GUEST_GUILD, f"<@{BOOKER_ID}>"), (HOME_GUILD, "**Guest Clan**")):
+            interaction = interaction_for(member(OTHER_ID, guild_id=guild_id))
+            await self.tree.get_command("bookings").callback(interaction, server=None)
+            self.assertIn(expected, interaction.response.sent[-1])
+
+    async def cancel(self, user, booking_id):
+        interaction = interaction_for(user)
+        await self.tree.get_command("cancel_booking").callback(interaction, booking_id=booking_id)
+        return interaction.response.sent[-1]
+
+    async def test_guest_admin_cancels_own_guild_bookings_only(self):
+        home = self.service.create("server1", BOOKER_ID, "b", T0 + HOUR, T0 + 2 * HOUR, guild_id=HOME_GUILD)
+        guest = self.service.create("server1", OTHER_ID, "o", T0 + 3 * HOUR, T0 + 4 * HOUR, guild_id=GUEST_GUILD)
+        guest_admin = member(ADMIN_ID, administrator=True, guild_id=GUEST_GUILD)
+
+        self.assertIn("not yours", await self.cancel(guest_admin, home.id))
+        self.assertIn("Cancelled", await self.cancel(guest_admin, guest.id))
+
+    async def test_home_booking_admin_cancels_any_guilds_booking(self):
+        guest = self.service.create("server1", OTHER_ID, "o", T0 + HOUR, T0 + 2 * HOUR, guild_id=GUEST_GUILD)
+
+        self.assertIn("Cancelled", await self.cancel(member(ADMIN_ID, role_ids=[ADMIN_ROLE]), guest.id))
+
+    async def test_unapproved_guild_is_refused(self):
+        self.assertIn("isn't set up", await self.run_book(member(BOOKER_ID, guild_id=OTHER_GUILD)))

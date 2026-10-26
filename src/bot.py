@@ -11,6 +11,7 @@ from dotenv import load_dotenv
 
 from commands.booking import (
     BookingCommandDeps,
+    booker_text,
     is_booking_admin,
     register_booking_commands,
 )
@@ -180,6 +181,18 @@ else:
     print(f"Server booking disabled: {booking_config.disabled_reason}")
 
 
+def _guild_name(guild_id: int | None) -> str:
+    guild = bot.get_guild(guild_id) if guild_id is not None else None
+    return guild.name if guild is not None else "another Discord"
+
+
+def _booked_by(booking: Booking, viewer_guild_id: int | None = None) -> str:
+    """Booker as shown to a viewing guild (the home guild for the shared panel)."""
+    return booker_text(
+        booking, viewer_guild_id or guild_registry.home_guild_id, _guild_name
+    )
+
+
 # Shared by the booking slash commands and the panel's booking buttons.
 booking_deps = BookingCommandDeps(
     service=booking_service,
@@ -188,7 +201,18 @@ booking_deps = BookingCommandDeps(
     server_key=api_client.get_server_key,
     server_name_for_key=api_client.get_server_name_for_key,
     on_change=lambda: refresh_main_embed(),
+    registry=guild_registry,
+    guild_name=_guild_name,
 )
+
+if booking_service is not None and guild_registry.home_guild_id is not None:
+    try:
+        _claimed = booking_service.claim_unowned(guild_registry.home_guild_id)
+    except Exception as exc:
+        print(f"Could not assign older bookings to the home guild: {exc}")
+    else:
+        if _claimed:
+            print(f"Assigned {_claimed} older booking(s) to the home guild.")
 
 def _orphaned_booking_keys() -> set[str]:
     """Server keys of live bookings that match no configured server (e.g. after SERVER{N}_* changes)."""
@@ -278,7 +302,7 @@ async def _deny_if_booked(
             )
         else:
             message = (
-                f"🔒 **{server_name}** is booked by <@{active.user_id}> until <t:{active.end_utc}:t>. "
+                f"🔒 **{server_name}** is booked by {_booked_by(active, interaction.guild_id)} until <t:{active.end_utc}:t>. "
                 "Only they or a booking admin can change it right now."
             )
         print(
@@ -720,12 +744,12 @@ def _panel_booking_lines() -> dict[int, list[str]]:
             )
             if active is not None:
                 lines[index] = [
-                    f"   🔒 Booked by <@{active.user_id}> until <t:{active.end_utc}:t> (<t:{active.end_utc}:R>)"
+                    f"   🔒 Booked by {_booked_by(active)} until <t:{active.end_utc}:t> (<t:{active.end_utc}:R>)"
                 ]
                 continue
             if upcoming is not None:
                 lines[index] = [
-                    f"   📅 Next booking: <@{upcoming.user_id}> <t:{upcoming.start_utc}:f> (<t:{upcoming.start_utc}:R>)"
+                    f"   📅 Next booking: {_booked_by(upcoming)} <t:{upcoming.start_utc}:f> (<t:{upcoming.start_utc}:R>)"
                 ]
     except Exception as exc:
         print(f"Could not read bookings for the panel: {exc}")
@@ -752,7 +776,7 @@ def _panel_schedule_lines() -> list[str] | None:
     for booking in bookings:
         line = (
             f"<t:{booking.start_utc}:f> → <t:{booking.end_utc}:t> · "
-            f"**{api_client.get_server_name_for_key(booking.server_key)}** · <@{booking.user_id}>"
+            f"**{api_client.get_server_name_for_key(booking.server_key)}** · {_booked_by(booking)}"
         )
         if booking.end_utc <= now:
             line = f"~~{line}~~"

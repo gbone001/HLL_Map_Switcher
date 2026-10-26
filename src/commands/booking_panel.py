@@ -20,11 +20,13 @@ from commands.booking import (
     _defer,
     _reply,
     book_and_reply,
+    booker_text,
     booking_label,
     can_book,
     cancel_and_reply,
     describe_booking,
     fit_lines,
+    guild_admin_id,
     is_booking_admin,
     refuse_unavailable,
 )
@@ -65,7 +67,7 @@ async def open_book_panel(
 ) -> None:
     if await refuse_unavailable(interaction, deps):
         return
-    if not can_book(interaction.user, deps.config):
+    if not can_book(interaction.user, deps):
         await _reply(interaction, NOT_A_MEMBER_MESSAGE)
         return
     view = BookingPickerView(deps)
@@ -425,6 +427,8 @@ async def open_manage_panel(
         bookings,
         interaction.user.id,
         is_booking_admin(interaction.user, deps.config),
+        viewer_guild_id=interaction.guild_id,
+        admin_guild_id=guild_admin_id(interaction.user),
     )
     message = await interaction.followup.send(
         embed=view.embed,
@@ -443,16 +447,24 @@ class ManageBookingsView(_SelfClosingView):
         bookings: list[Booking],
         user_id: int,
         is_admin: bool,
+        viewer_guild_id: int | None = None,
+        admin_guild_id: int | None = None,
     ):
         super().__init__(timeout=300)
         self.deps = deps
         self.user_id = user_id
         self.is_admin = is_admin
+        self.viewer_guild_id = viewer_guild_id
+        self.admin_guild_id = admin_guild_id
         self._show(bookings)
 
     def _show(self, bookings: list[Booking]) -> None:
         lines = [
-            describe_booking(b, self.deps.server_name_for_key(b.server_key))
+            describe_booking(
+                b,
+                self.deps.server_name_for_key(b.server_key),
+                booker_text(b, self.viewer_guild_id, self.deps.guild_name),
+            )
             for b in bookings
         ]
         self.embed = discord.Embed(
@@ -461,13 +473,16 @@ class ManageBookingsView(_SelfClosingView):
             color=0x2F3136,
         )
         manageable = [
-            b for b in bookings if self.is_admin or b.user_id == self.user_id
+            b
+            for b in bookings
+            if b.manageable_by(self.user_id, self.is_admin, self.admin_guild_id)
         ][:25]
         self.booking_select = _DeferSelect(
             placeholder="Select one of your bookings to cancel...",
             options=[
                 discord.SelectOption(
-                    label=booking_label(b, self.deps), value=str(b.id)
+                    label=booking_label(b, self.deps, self.viewer_guild_id),
+                    value=str(b.id),
                 )
                 for b in manageable
             ],

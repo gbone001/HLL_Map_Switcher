@@ -366,3 +366,38 @@ class ScheduleTests(BookingServiceTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class GuildColumnTests(unittest.TestCase):
+    def test_old_store_gains_guild_column_and_old_rows_can_be_claimed(self):
+        import sqlite3
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Path(tmp) / "bookings.db"
+            conn = sqlite3.connect(db)
+            conn.executescript(
+                "CREATE TABLE bookings (id INTEGER PRIMARY KEY AUTOINCREMENT, server_key TEXT NOT NULL, "
+                "user_id INTEGER NOT NULL, user_name TEXT NOT NULL, start_utc INTEGER NOT NULL, "
+                "end_utc INTEGER NOT NULL, created_at INTEGER NOT NULL, cancelled_at INTEGER, cancelled_by INTEGER);"
+                f"INSERT INTO bookings (server_key, user_id, user_name, start_utc, end_utc, created_at) "
+                f"VALUES ('server1', 1, 'u', {T0 + HOUR}, {T0 + 2 * HOUR}, {T0});"
+            )
+            conn.commit()
+            conn.close()
+
+            service = BookingService(db, clock=FakeClock())
+            self.assertIsNone(service.list_live()[0].guild_id)
+            self.assertEqual(service.claim_unowned(42), 1)
+            self.assertEqual(service.claim_unowned(42), 0)
+            self.assertEqual(service.list_live()[0].guild_id, 42)
+
+    def test_manageable_by_booker_home_admin_or_booking_guild_admin(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            service = BookingService(Path(tmp) / "b.db", clock=FakeClock())
+            booking = service.create("server1", 1, "u", T0 + HOUR, T0 + 2 * HOUR, guild_id=7)
+
+            self.assertTrue(booking.manageable_by(1, False))
+            self.assertTrue(booking.manageable_by(2, True))
+            self.assertTrue(booking.manageable_by(2, False, admin_guild_id=7))
+            self.assertFalse(booking.manageable_by(2, False, admin_guild_id=8))
+            self.assertFalse(booking.manageable_by(2, False))
