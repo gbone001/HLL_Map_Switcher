@@ -121,7 +121,8 @@ class OffEventLoopTests(unittest.IsolatedAsyncioTestCase):
         with mock.patch.object(bot.server_control, "get_status", side_effect=SlowStatus(delay=0)):
             embed, view = await bot.build_panel()
 
-        self.assertIn("Issues detected", embed.description)
+        self.assertIn("CRCON unavailable", embed.description)
+        self.assertEqual(embed.color.value, bot.PANEL_COLOR_OUTAGE)
         crcon_buttons = [
             child for child in view.children if getattr(child, "custom_id", None) in bot.CRCON_PANEL_DEPENDENT_BUTTONS
         ]

@@ -506,7 +506,9 @@ class PanelAndRefreshTests(BookingBotTestCase):
 
         embed = bot.build_main_embed(None, statuses, bot._panel_booking_lines())
 
-        self.assertIn("Booked by", embed.description)
+        server_card = embed.fields[0]
+        self.assertTrue(server_card.name.startswith("🔒"))
+        self.assertIn("Booked by", server_card.value)
 
     async def test_refresher_retries_after_failed_check_or_refresh(self):
         refresh = mock.AsyncMock(side_effect=[RuntimeError("discord 503"), None])
@@ -541,12 +543,13 @@ class PanelAndRefreshTests(BookingBotTestCase):
         with mock.patch.object(bot, "booking_service", None):
             self.assertIsNone(bot._panel_schedule_lines())
         embed = bot.build_main_embed(None, {}, None, None)
-        self.assertEqual(embed.fields, [])
+        self.assertFalse([f for f in embed.fields if f.name.startswith("📅")])
 
     def test_empty_schedule_says_so(self):
         embed = bot.build_main_embed(None, {}, None, [])
 
-        self.assertEqual(embed.fields[0].value, "No bookings.")
+        schedule = [f for f in embed.fields if f.name.startswith("📅")]
+        self.assertIn("No bookings", schedule[0].value)
 
     def test_long_schedule_fits_discord_limits(self):
         lines = [f"<t:{T0 + i}:f> → <t:{T0 + i + 60}:t> · **Server One** · <@123456789012345678>" for i in range(200)]

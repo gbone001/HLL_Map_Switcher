@@ -575,105 +575,86 @@ def _format_time_remaining(
     return f"{minutes}:{secs:02d}"
 
 
-def _format_current_objectives(objectives: list[str]) -> str:
-    if not objectives:
-        return "Unknown"
-    return " -> ".join(objectives)
-
-
-def _status_badge(status: GameStatus) -> str:
-    if status.transport == "direct_rcon":
-        return "Direct RCON Fallback"
-    return "CRCON HTTP"
-
-
 # ============================================================
 # Embed building helpers (extracted from build_main_embed)
 # ============================================================
 
 
-def _build_server_status_lines(
+# Embed accent colour shows the panel's state at a glance.
+PANEL_COLOR_IDLE = 0x5865F2  # Discord blurple: nothing booked right now
+PANEL_COLOR_LIVE = 0x57F287  # green: a booking is live and controls are shown
+PANEL_COLOR_OUTAGE = 0xED4245  # red: CRCON is unreachable for the target server(s)
+
+
+def _build_server_fields(
     servers: list[tuple[int, str]],
     statuses: dict[int, ControlResult],
-    focused_server_index: int | None,
-    current_objectives_state: dict[tuple[int, str], list[str]],
     dynamic_weather_state: dict[tuple[int, str], bool],
     booking_lines: dict[int, list[str]] | None = None,
-) -> tuple[list[str], list[str]]:
-    """Build server status lines and collect CRCON-degraded server names."""
-    server_lines: list[str] = []
-    crcon_http_degraded_servers: list[str] = []
+) -> tuple[list[tuple[str, str]], list[str]]:
+    """One card (field name, value) per server, plus the servers whose CRCON HTTP is degraded.
 
-    for position, (index, server_name) in enumerate(servers, start=1):
-        selected_prefix = (
-            "**[SELECTED]** " if focused_server_index == index else ""
-        )
+    Card layout: status icon + name; the map in bold (primary); players, time left and
+    weather as small subtext (secondary); then the booking line. Details that rarely matter
+    (transport, unknown weather) are shown only when they are unusual.
+    """
+    fields: list[tuple[str, str]] = []
+    degraded: list[str] = []
+
+    for index, server_name in servers:
         status_result = statuses.get(index)
-        server_lines.append(f"{position}. {selected_prefix}{server_name}")
-        server_lines.extend((booking_lines or {}).get(index, []))
+        lines: list[str] = []
+        icon = "🟢"
 
-        if status_result is None:
-            server_lines.append("   Status: ⚠️ Status not loaded.")
-            crcon_http_degraded_servers.append(server_name)
-            continue
+        if status_result is None or not status_result.success:
+            icon = "⚠️"
+            lines.append(
+                status_result.message if status_result is not None else "Status not loaded."
+            )
+            degraded.append(server_name)
+        else:
+            status = (status_result.data or {}).get("status")
+            if not isinstance(status, GameStatus):
+                icon = "⚠️"
+                lines.append("Status unavailable.")
+            else:
+                pretty_name = status.current_map or "Unknown map"
+                allied = status.allied_players if status.allied_players is not None else "?"
+                axis = status.axis_players if status.axis_players is not None else "?"
+                time_left = _format_time_remaining(
+                    status.time_remaining_seconds, status.raw_time_remaining
+                )
+                details = [f"👥 {allied} v {axis}", f"⏱ {time_left} left"]
+                known_weather = dynamic_weather_state.get((index, pretty_name))
+                if known_weather is not None:
+                    details.append("🌦 weather on" if known_weather else "🌦 weather off")
+                lines.append(f"**{pretty_name}**")
+                lines.append("-# " + " · ".join(details))
+                if status.transport != "crcon_http":
+                    lines.append("-# Using direct RCON (CRCON HTTP unavailable)")
+                    degraded.append(server_name)
+                if status_result.warning:
+                    lines.append(f"-# ⚠️ {status_result.warning}")
 
-        if not status_result.success:
-            server_lines.append(f"   Status: ⚠️ {status_result.message}")
-            crcon_http_degraded_servers.append(server_name)
-            continue
+        booking = (booking_lines or {}).get(index, [])
+        if booking:
+            lines.append("")
+            lines.extend(booking)
+            if booking[0].startswith("🔒"):
+                icon = "🔒"
+        fields.append((f"{icon} {server_name}", "\n".join(lines)[:1024]))
 
-        status = (status_result.data or {}).get("status")
-        if not isinstance(status, GameStatus):
-            server_lines.append("   Status: ⚠️ Status payload unavailable.")
-            continue
-
-        pretty_name = status.current_map or "Unknown"
-        allied = (
-            status.allied_players
-            if status.allied_players is not None
-            else "??"
-        )
-        axis = status.axis_players if status.axis_players is not None else "??"
-        time_remaining = _format_time_remaining(
-            status.time_remaining_seconds,
-            status.raw_time_remaining,
-        )
-
-        known_objectives = current_objectives_state.get(
-            (index, str(pretty_name))
-        )
-        if known_objectives is not None:
-            _format_current_objectives(known_objectives)
-
-        dynamic_weather_text = "Unknown"
-        known_state = dynamic_weather_state.get((index, pretty_name))
-        if known_state is not None:
-            dynamic_weather_text = "Enabled" if known_state else "Disabled"
-
-        server_lines.append(f"   Map: {pretty_name}")
-        server_lines.append(
-            f"   Allied: {allied} | Axis: {axis} | Time Remaining: {time_remaining}"
-        )
-        server_lines.append(f"   Dynamic Weather: {dynamic_weather_text}")
-        server_lines.append(f"   Status Source: {_status_badge(status)}")
-        if status_result.warning:
-            server_lines.append(f"   Warning: {status_result.warning}")
-        if status.transport != "crcon_http":
-            crcon_http_degraded_servers.append(server_name)
-
-    return server_lines, crcon_http_degraded_servers
+    return fields, degraded
 
 
 def _build_crcon_warning_block(crcon_http_degraded_servers: list[str]) -> str:
-    """Build the CRCON outage warning block for the embed description."""
+    """One-line outage notice for the top of the embed."""
     if not crcon_http_degraded_servers:
         return ""
-    affected_servers = ", ".join(sorted(set(crcon_http_degraded_servers)))
+    affected = ", ".join(sorted(set(crcon_http_degraded_servers)))
     return (
-        "**CRCON API Status:** ⚠️ Issues detected\n"
-        f"Affected server(s): {affected_servers}\n"
-        "Panel controls disabled while CRCON is down: Set Objectives, Dynamic Weather, "
-        "Remove Admin Cam User, Add Admin Cam Access.\n\n"
+        f"⚠️ **CRCON unavailable** · {affected}\n"
+        "-# Objectives, weather and admin cam are paused until it's back."
     )
 
 
@@ -693,15 +674,6 @@ def _build_selected_server_label(
     if focused_server_index is not None:
         return f"Unknown ({focused_server_index})"
     return servers[0][1]
-
-
-def _get_updated_at_text(servers: list[tuple[int, str]]) -> str:
-    """Generate the AEST timestamp for the embed footer."""
-    if not servers:
-        return ""
-    aest = timezone(timedelta(hours=10), name="AEST")
-    updated_at = datetime.now(aest)
-    return f"Updated as at {updated_at.strftime('%d %B %Y - %H:%M:%S')} AEST"
 
 
 def _get_server_env_value(
@@ -792,12 +764,12 @@ def _panel_booking_lines(viewer_guild_id: int | None = None) -> dict[int, list[s
             )
             if active is not None:
                 lines[index] = [
-                    f"   🔒 Booked by {_booked_by(active, viewer_guild_id)} until <t:{active.end_utc}:t> (<t:{active.end_utc}:R>)"
+                    f"🔒 Booked by {_booked_by(active, viewer_guild_id)} · until <t:{active.end_utc}:t> (<t:{active.end_utc}:R>)"
                 ]
                 continue
             if upcoming is not None:
                 lines[index] = [
-                    f"   📅 Next booking: {_booked_by(upcoming, viewer_guild_id)} <t:{upcoming.start_utc}:f> (<t:{upcoming.start_utc}:R>)"
+                    f"📅 Next booking <t:{upcoming.start_utc}:R> · {_booked_by(upcoming, viewer_guild_id)}"
                 ]
     except Exception as exc:
         print(f"Could not read bookings for the panel: {exc}")
@@ -842,9 +814,13 @@ _SCHEDULE_MAX_CHARS = 3072
 
 def _add_schedule_fields(embed: discord.Embed, lines: list[str]) -> None:
     """Append the booking schedule as one or more fields, trimmed to fit Discord's embed limits."""
-    title = f"📅 Bookings: today + next {SCHEDULE_DAYS - 1} days"
+    title = f"📅 Schedule · today + {SCHEDULE_DAYS - 1} days"
     if not lines:
-        embed.add_field(name=title, value="No bookings.", inline=False)
+        embed.add_field(
+            name=title,
+            value="-# No bookings yet. Use 📅 Book to reserve a server.",
+            inline=False,
+        )
         return
 
     budget = min(_SCHEDULE_MAX_CHARS, _EMBED_TOTAL_LIMIT - len(embed) - 200)
@@ -895,11 +871,12 @@ async def build_panel(
         focused_server_index, statuses, booking_lines, schedule_lines
     )
     if not controls_unlocked:
-        embed.add_field(
-            name="🔒 Server controls hidden",
-            value="Map, timer and admin controls appear while a booking is live. Use 📅 Book Server.",
-            inline=False,
+        hidden_note = "-# 🔒 Map, timer and admin controls appear while a booking is live. Use 📅 Book."
+        embed.description = (
+            f"{embed.description}\n{hidden_note}" if embed.description else hidden_note
         )
+    elif embed.color.value != PANEL_COLOR_OUTAGE:
+        embed.color = PANEL_COLOR_LIVE
     crcon_outage, _ = _panel_crcon_outage_state(statuses, focused_server_index)
     view = GameModeView(
         focused_server_index=focused_server_index,
@@ -1001,43 +978,27 @@ def build_main_embed(
 ) -> discord.Embed:
     """Render the panel embed from statuses already fetched by fetch_server_statuses()."""
     servers = api_client.get_servers()
-
-    server_lines, crcon_http_degraded_servers = _build_server_status_lines(
-        servers=servers,
-        statuses=statuses,
-        focused_server_index=focused_server_index,
-        current_objectives_state=_current_objectives_state,
-        dynamic_weather_state=_dynamic_weather_state,
-        booking_lines=booking_lines,
+    fields, degraded = _build_server_fields(
+        servers, statuses, _dynamic_weather_state, booking_lines
     )
 
-    selected_server_label = _build_selected_server_label(
-        servers, focused_server_index
-    )
-    updated_at_text = _get_updated_at_text(servers)
-
-    crcon_warning_block = _build_crcon_warning_block(
-        crcon_http_degraded_servers
-    )
-
-    description = "Click the buttons below to manage the server.\n\n"
-    description += (
-        f"**Currently Selected Server:** {selected_server_label}\n\n"
-    )
-    description += crcon_warning_block
-    description += "**Available Servers:**\n" + "\n".join(server_lines)
-
-    if updated_at_text:
-        description += f"\n\n{updated_at_text}"
+    notes = []
+    warning = _build_crcon_warning_block(degraded)
+    if warning:
+        notes.append(warning)
+    if len(servers) > 1:
+        selected = _build_selected_server_label(servers, focused_server_index)
+        notes.append(f"-# Controls target **{selected}** · switch with 🔁 Server")
 
     embed = discord.Embed(
         title=MAIN_EMBED_TITLE,
-        description=description,
-        color=0x2F3136,
+        description="\n".join(notes) or None,
+        color=PANEL_COLOR_OUTAGE if warning else PANEL_COLOR_IDLE,
+        timestamp=discord.utils.utcnow(),
     )
-    embed.set_footer(
-        text="Buttons stay active across restarts. Note: When you choose the last objective it will set the map to the selected objectives immediately."
-    )
+    for name, value in fields:
+        embed.add_field(name=name, value=value or "\u200b", inline=True)
+    embed.set_footer(text="The last objective you pick applies the layout immediately · Updated")
     if schedule_lines is not None:
         _add_schedule_fields(embed, schedule_lines)
     return embed
