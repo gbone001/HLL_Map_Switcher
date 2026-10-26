@@ -100,6 +100,15 @@ class Booking:
         )
 
 
+@dataclass(frozen=True)
+class ControlDecision:
+    """Result of BookingService.control_check; `reason` lets the caller word a denial."""
+
+    allowed: bool
+    active: Booking | None
+    reason: str
+
+
 DEFAULT_MAX_HOURS = 24
 DEFAULT_MAX_DAYS_AHEAD = 90
 DEFAULT_PANEL_REFRESH_TIME = time(6, 0)
@@ -415,17 +424,46 @@ class BookingService:
         return summary
 
     def control_check(
-        self, server_key: str, user_id: int, is_admin: bool
-    ) -> tuple[bool, Booking | None]:
-        """(allowed, live booking) for a control write to this server right now.
+        self,
+        server_key: str,
+        user_id: int,
+        is_admin: bool,
+        *,
+        guild_id: int | None = None,
+        home_guild_id: int | None = None,
+        admin_guild_id: int | None = None,
+        action: str = "control",
+    ) -> ControlDecision:
+        """May this user write to this game server right now? (multi-guild slice 3)
 
-        Only the holder of the server's live booking may control it; booking admins always
-        may. With no live booking on this server nobody else can, even if they hold a
-        booking on a different server.
+        Rules, in order:
+        1. A home booking admin (`is_admin`) may always.
+        2. Admin cam (`action="admin_cam"`) is home-guild only.
+        3. With no live booking on this server, nobody else may.
+        4. During a booking, only requests from the booking's guild count, and then only
+           from the booker or that guild's Administrators (`admin_guild_id`).
+        `guild_id` is where the request comes from. Without guilds (single-guild tests and
+        setups) rules 2 and 4's guild match are satisfied trivially.
         """
         active = self.active_for(server_key)
-        allowed = is_admin or (active is not None and active.user_id == user_id)
-        return allowed, active
+        if is_admin:
+            return ControlDecision(True, active, "admin")
+        if (
+            action == "admin_cam"
+            and home_guild_id is not None
+            and guild_id != home_guild_id
+        ):
+            return ControlDecision(False, active, "admin_cam_home_only")
+        if active is None:
+            return ControlDecision(False, None, "unbooked")
+        if active.guild_id is not None and guild_id is not None and active.guild_id != guild_id:
+            reason = "booked_from_other_guild" if active.user_id == user_id else "booked"
+            return ControlDecision(False, active, reason)
+        if active.user_id == user_id:
+            return ControlDecision(True, active, "booker")
+        if admin_guild_id is not None and admin_guild_id == active.guild_id:
+            return ControlDecision(True, active, "booking_guild_admin")
+        return ControlDecision(False, active, "booked")
 
     def cancel(
         self,

@@ -191,20 +191,48 @@ class ActiveAndLockTests(BookingServiceTestCase):
         self.assertNotIn(later.id, [b.id for pair in summary.values() for b in pair if b])
 
     def test_control_check_rules(self):
+        """Decision table for multi-guild slice 3 (docs/multi-guild-slices.md)."""
+        HOME, GUEST, THIRD = 10, 20, 30
+        BOOKER, OTHER = 1, 2
+        booking = self.service.create("server1", BOOKER, "u", T0, T0 + HOUR, guild_id=GUEST)
+
+        def check(user, guild, *, admin=False, guild_admin=None, server="server1", action="control"):
+            decision = self.service.control_check(
+                server, user, admin, guild_id=guild, home_guild_id=HOME,
+                admin_guild_id=guild_admin, action=action,
+            )
+            return decision.allowed, decision.reason
+
+        cases = [
+            # (description, kwargs, expected (allowed, reason))
+            ("booker from the booking guild", dict(user=BOOKER, guild=GUEST), (True, "booker")),
+            ("booking guild's admin", dict(user=OTHER, guild=GUEST, guild_admin=GUEST), (True, "booking_guild_admin")),
+            ("booking guild member, not booker", dict(user=OTHER, guild=GUEST), (False, "booked")),
+            ("home member during a guest booking", dict(user=OTHER, guild=HOME), (False, "booked")),
+            ("home guild admin (not booking admin)", dict(user=OTHER, guild=HOME, guild_admin=HOME), (False, "booked")),
+            ("third guild's admin", dict(user=OTHER, guild=THIRD, guild_admin=THIRD), (False, "booked")),
+            ("booker acting from another guild", dict(user=BOOKER, guild=HOME), (False, "booked_from_other_guild")),
+            ("home booking admin overrides", dict(user=OTHER, guild=HOME, admin=True), (True, "admin")),
+            ("admin cam from the booking guest guild", dict(user=BOOKER, guild=GUEST, action="admin_cam"), (False, "admin_cam_home_only")),
+            ("admin cam by home booking admin", dict(user=OTHER, guild=HOME, admin=True, action="admin_cam"), (True, "admin")),
+            ("unbooked server, booker of another server", dict(user=BOOKER, guild=GUEST, server="server2"), (False, "unbooked")),
+            ("unbooked server, home booking admin", dict(user=OTHER, guild=HOME, admin=True, server="server2"), (True, "admin")),
+        ]
+        for description, kwargs, expected in cases:
+            with self.subTest(description):
+                self.assertEqual(check(**kwargs), expected)
+
+        self.clock.ts = T0 + HOUR  # booking over
+        self.assertEqual(check(BOOKER, GUEST), (False, "unbooked"))
+
+    def test_control_check_without_guilds_keeps_single_guild_rules(self):
         booking = self.book(0, 1, user_id=1)
 
-        self.assertEqual(self.service.control_check("server1", user_id=1, is_admin=False), (True, booking))
-        self.assertEqual(self.service.control_check("server1", user_id=2, is_admin=False), (False, booking))
-        self.assertEqual(self.service.control_check("server1", user_id=2, is_admin=True), (True, booking))
-        # The booker's slot on server1 gives no control over server2.
-        self.assertEqual(self.service.control_check("server2", user_id=1, is_admin=False), (False, None))
-        self.assertEqual(self.service.control_check("server2", user_id=2, is_admin=True), (True, None))
+        self.assertTrue(self.service.control_check("server1", 1, False).allowed)
+        self.assertFalse(self.service.control_check("server1", 2, False).allowed)
+        self.assertTrue(self.service.control_check("server1", 2, True).allowed)
+        self.assertEqual(self.service.control_check("server1", 1, False).active, booking)
 
-        self.clock.ts = T0 + HOUR
-        self.assertEqual(self.service.control_check("server1", user_id=1, is_admin=False), (False, None))
-
-
-class CancelTests(BookingServiceTestCase):
     def test_owner_can_cancel(self):
         booking = self.book(1, 1, user_id=1)
 

@@ -209,6 +209,43 @@ class GuardAtWriteSiteTests(BookingBotTestCase):
         self.assertIsNone(interaction.response.edited[0]["view"])
 
 
+class GuildLockTests(BookingBotTestCase):
+    """Multi-guild slice 3: the lock checks which guild a request comes from."""
+
+    GUEST = 5555
+
+    def setUp(self):
+        super().setUp()
+        patch = mock.patch.object(
+            bot,
+            "guild_registry",
+            bot.GuildRegistry.from_env({"DISCORD_GUILD_ID": str(HOME_GUILD), "BOOKING_GUILD_IDS": str(self.GUEST)}),
+        )
+        patch.start()
+        self.addCleanup(patch.stop)
+        self.service.create(self.server_key, BOOKER_ID, "booker", T0 - 60, T0 + HOUR, guild_id=self.GUEST)
+
+    async def test_guest_booker_controls_from_their_own_guild_only(self):
+        allowed = interaction_for(member(BOOKER_ID, guild_id=self.GUEST))
+        self.assertFalse(await bot._deny_if_booked(allowed, 0))
+
+        from_home = interaction_for(member(BOOKER_ID))
+        self.assertTrue(await bot._deny_if_booked(from_home, 0))
+        self.assertIn("Control it from that Discord", from_home.response.sent[-1])
+
+    async def test_admin_cam_is_home_guild_only_even_for_the_booker(self):
+        interaction = interaction_for(member(BOOKER_ID, guild_id=self.GUEST))
+
+        self.assertTrue(await bot._deny_if_booked(interaction, 0, action="admin_cam"))
+        self.assertIn("home Discord", interaction.response.sent[-1])
+
+    async def test_home_booking_admin_overrides_a_guest_booking(self):
+        interaction = interaction_for(member(ADMIN_ID, role_ids=[ADMIN_ROLE]))
+
+        self.assertFalse(await bot._deny_if_booked(interaction, 0))
+        self.assertFalse(await bot._deny_if_booked(interaction, 0, action="admin_cam"))
+
+
 class GuardCoverageTests(unittest.TestCase):
     """Realized-conformance check for R6: every control write in bot.py is preceded by the guard."""
 

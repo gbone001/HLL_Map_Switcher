@@ -1,4 +1,5 @@
 import asyncio
+import functools
 import json
 import os
 import sys
@@ -12,6 +13,7 @@ from dotenv import load_dotenv
 from commands.booking import (
     BookingCommandDeps,
     booker_text,
+    guild_admin_id,
     is_booking_admin,
     register_booking_commands,
 )
@@ -23,6 +25,7 @@ from services.booking import (
     Booking,
     BookingConfig,
     BookingService,
+    ControlDecision,
     schedule_window,
 )
 from services.server_control import (
@@ -260,15 +263,38 @@ if booking_service is not None:
 
 
 async def _booking_control_check(
-    interaction: discord.Interaction, server_index: int
-) -> tuple[bool, Booking | None]:
+    interaction: discord.Interaction, server_index: int, action: str
+) -> ControlDecision:
     if booking_service is None:
-        return True, None
+        return ControlDecision(True, None, "booking_disabled")
     return await asyncio.to_thread(
-        booking_service.control_check,
-        api_client.get_server_key(server_index),
-        interaction.user.id,
-        is_booking_admin(interaction.user, booking_config),
+        functools.partial(
+            booking_service.control_check,
+            api_client.get_server_key(server_index),
+            interaction.user.id,
+            is_booking_admin(interaction.user, booking_config),
+            guild_id=interaction.guild_id,
+            home_guild_id=guild_registry.home_guild_id,
+            admin_guild_id=guild_admin_id(interaction.user),
+            action=action,
+        )
+    )
+
+
+def _denial_message(decision: ControlDecision, server_name: str, viewer_guild_id: int | None) -> str:
+    active = decision.active
+    if decision.reason == "admin_cam_home_only":
+        return "🔒 Admin cam is managed from the bot's home Discord."
+    if active is None:
+        return f"🔒 **{server_name}** has no live booking. Book it with 📅 Book to control it."
+    if decision.reason == "booked_from_other_guild":
+        return (
+            f"🔒 Your booking on **{server_name}** was made in **{_guild_name(active.guild_id)}**. "
+            "Control it from that Discord's panel."
+        )
+    return (
+        f"🔒 **{server_name}** is booked by {_booked_by(active, viewer_guild_id)} until <t:{active.end_utc}:t>. "
+        "Only the booker, that Discord's admins, or a booking admin can change it right now."
     )
 
 
@@ -277,16 +303,19 @@ async def _deny_if_booked(
     server_index: int,
     *,
     edit_flow: bool = False,
+    action: str = "control",
 ) -> bool:
     """Booking guard for control writes: True (and tell the user) unless they may control this server.
 
-    Only the holder of this server's live booking (or a booking admin) may write to it; a
-    booking on another server gives no control here. Called right before each write rather
-    than when a flow opens, so a flow cannot finish after its booking has ended.
+    Rules live in BookingService.control_check: home booking admins always; admin cam
+    (`action="admin_cam"`) home guild only; otherwise only during a live booking on this
+    server, from the booking's guild, by the booker or that guild's admins. Called right
+    before each write rather than when a flow opens, so a flow cannot finish after its
+    booking has ended.
     """
     server_name = api_client.get_server_name(server_index)
     try:
-        allowed, active = await _booking_control_check(interaction, server_index)
+        decision = await _booking_control_check(interaction, server_index, action)
     except Exception as exc:
         # Fail closed: without the booking store we can't tell whether someone holds the server.
         print(
@@ -294,20 +323,13 @@ async def _deny_if_booked(
         )
         message = "❌ Could not check server bookings, so nothing was changed. Try again shortly."
     else:
-        if allowed:
+        if decision.allowed:
             return False
-        if active is None:
-            message = (
-                f"🔒 **{server_name}** has no live booking. Book it with 📅 Book to control it."
-            )
-        else:
-            message = (
-                f"🔒 **{server_name}** is booked by {_booked_by(active, interaction.guild_id)} until <t:{active.end_utc}:t>. "
-                "Only they or a booking admin can change it right now."
-            )
+        message = _denial_message(decision, server_name, interaction.guild_id)
         print(
-            f"Booking guard blocked user {interaction.user.id} on server index {server_index} "
-            f"(live booking: {active.id if active else 'none'})"
+            f"Booking guard blocked user {interaction.user.id} from guild {interaction.guild_id} "
+            f"on server index {server_index} ({action}: {decision.reason}, "
+            f"live booking: {decision.active.id if decision.active else 'none'})"
         )
     if edit_flow:
         await update_interaction_message(
@@ -1229,7 +1251,7 @@ class AddAdminCamModal(discord.ui.Modal, title="ADD ADMIN CAM ACCESS"):
             )
             return
 
-        if await _deny_if_booked(interaction, self.server_index):
+        if await _deny_if_booked(interaction, self.server_index, action="admin_cam"):
             return
 
         try:
@@ -1344,7 +1366,7 @@ class RemoveAdminCamConfirmView(discord.ui.View):
             return
 
         if await _deny_if_booked(
-            interaction, self.server_index, edit_flow=True
+            interaction, self.server_index, edit_flow=True, action="admin_cam"
         ):
             return
 
