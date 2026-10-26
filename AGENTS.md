@@ -69,6 +69,7 @@
 - Keep server discovery and server-name resolution inside `src/utils/api_client.py` or a future dedicated service module.
 - Keep HTTP-first / direct-RCON-fallback orchestration inside `src/services/server_control.py`.
 - Every new control write in `src/bot.py` must call `_deny_if_booked(...)` immediately before the write so the booking lock covers it.
+- Game-control panel buttons (`BOOKING_GATED_BUTTONS`: map, objectives, weather, timers, team switch, admin cam) are only shown while a booking is live on the focused server (`_panel_controls_unlocked`); new control buttons belong in that set.
 - The booking refresh loop must stay display-only; it must never call `ServerControlService`.
 - Keep Discord responses admin-friendly and short. Panel interactions should acknowledge quickly before doing slow network work.
 - Any new networked Discord interaction should be async-safe and avoid the `This interaction failed` pattern by deferring or responding immediately before slow work.

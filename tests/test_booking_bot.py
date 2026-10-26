@@ -412,6 +412,22 @@ class PanelAndRefreshTests(BookingBotTestCase):
         self.clock.ts = T0 + 2 * HOUR
         self.assertEqual(bot._panel_booking_lines(), {})
 
+    def test_game_controls_show_only_while_a_booking_is_live(self):
+        def gated_ids(show):
+            view = bot.GameModeView(show_controls=show)
+            return {c.custom_id for c in view.children} & bot.BOOKING_GATED_BUTTONS
+
+        self.assertFalse(bot._panel_controls_unlocked(0))
+        self.assertEqual(gated_ids(False), set())
+        self.assertEqual(gated_ids(True), bot.BOOKING_GATED_BUTTONS)
+
+        self.book_now()
+        self.assertTrue(bot._panel_controls_unlocked(0))
+        self.assertTrue(bot._panel_controls_unlocked(None))
+
+        with mock.patch.object(bot, "booking_service", None):
+            self.assertTrue(bot._panel_controls_unlocked(0))
+
     def test_embed_includes_booking_lines(self):
         self.book_now()
         statuses = {0: ControlResult(success=False, transport=None, message="CRCON down")}

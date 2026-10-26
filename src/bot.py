@@ -366,11 +366,47 @@ def _stop_cache_cleanup_task() -> None:
         _cache_cleanup_task.cancel()
 
 
+# Panel buttons as (emoji, short name). Discord sizes buttons to their label, so names are kept
+# short and padded to one width with blank braille characters (which Discord doesn't trim),
+# giving an even grid of four buttons per row.
+PANEL_BUTTONS = {
+    "persistent:change_server": ("🔁", "Server"),
+    "persistent:book_server": ("📅", "Book"),
+    "persistent:manage_bookings": ("📋", "Bookings"),
+    "persistent:refresh_status": ("🔄", "Refresh"),
+    "persistent:open_map_changer": ("🗺️", "Map"),
+    "persistent:set_objectives": ("🎯", "Objectives"),
+    "persistent:set_dynamic_weather": ("🌦", "Weather"),
+    "persistent:set_warfare_match_timer": ("⏱", "Match Time"),
+    "persistent:set_warfare_warmup_timer": ("🔥", "Warm Up"),
+    "persistent:set_team_switch_cooldown": ("↔️", "Team Swap"),
+    "persistent:add_admin_cam_access": ("🎥", "Add Cam"),
+    "persistent:remove_admin_cam_access": ("🗑️", "Remove Cam"),
+}
+PANEL_LABEL_WIDTH = 12
+_BLANK = "\u2800"
+
+
+def panel_label(custom_id: str, emoji: str | None = None) -> str:
+    default_emoji, name = PANEL_BUTTONS[custom_id]
+    padding = max(0, PANEL_LABEL_WIDTH - len(name))
+    left, right = padding // 2, padding - padding // 2
+    return f"{_BLANK * left}{emoji or default_emoji} {name}{_BLANK * right}"
+
+
 CRCON_PANEL_DEPENDENT_BUTTONS = {
     "persistent:set_objectives",
     "persistent:set_dynamic_weather",
     "persistent:remove_admin_cam_access",
     "persistent:add_admin_cam_access",
+}
+
+# Game-control buttons, shown on the panel only while a booking is live (see _panel_controls_unlocked).
+BOOKING_GATED_BUTTONS = CRCON_PANEL_DEPENDENT_BUTTONS | {
+    "persistent:open_map_changer",
+    "persistent:set_warfare_match_timer",
+    "persistent:set_warfare_warmup_timer",
+    "persistent:set_team_switch_cooldown",
 }
 
 CRCON_PANEL_DEFAULT_BUTTON_STYLES = {
@@ -381,10 +417,7 @@ CRCON_PANEL_DEFAULT_BUTTON_STYLES = {
 }
 
 CRCON_PANEL_DEFAULT_BUTTON_LABELS = {
-    "persistent:set_objectives": "🎯 Set Objectives",
-    "persistent:set_dynamic_weather": "🌦 Dynamic Weather",
-    "persistent:remove_admin_cam_access": "🗑️ REMOVE ADMIN CAM USER",
-    "persistent:add_admin_cam_access": "🎥 ADD ADMIN CAM ACCESS",
+    custom_id: panel_label(custom_id) for custom_id in CRCON_PANEL_DEPENDENT_BUTTONS
 }
 
 
@@ -713,19 +746,51 @@ def _add_schedule_fields(embed: discord.Embed, lines: list[str]) -> None:
 async def build_panel(
     focused_server_index: int | None = None,
 ) -> tuple[discord.Embed, "GameModeView"]:
-    statuses, booking_lines, schedule_lines = await asyncio.gather(
+    statuses, booking_lines, schedule_lines, controls_unlocked = await asyncio.gather(
         fetch_server_statuses(),
         asyncio.to_thread(_panel_booking_lines),
         asyncio.to_thread(_panel_schedule_lines),
+        asyncio.to_thread(_panel_controls_unlocked, focused_server_index),
     )
     embed = build_main_embed(
         focused_server_index, statuses, booking_lines, schedule_lines
     )
+    if not controls_unlocked:
+        embed.add_field(
+            name="🔒 Server controls hidden",
+            value="Map, timer and admin controls appear while a booking is live. Use 📅 Book Server.",
+            inline=False,
+        )
     crcon_outage, _ = _panel_crcon_outage_state(statuses, focused_server_index)
     view = GameModeView(
-        focused_server_index=focused_server_index, crcon_outage=crcon_outage
+        focused_server_index=focused_server_index,
+        crcon_outage=crcon_outage,
+        show_controls=controls_unlocked,
     )
     return embed, view
+
+
+def _panel_controls_unlocked(focused_server_index: int | None) -> bool:
+    """Show game controls only while a booking is live on the focused server.
+
+    With no focused server (and several configured) any live booking unlocks them. Booking
+    off means no gating. A store failure hides them; writes fail closed in _deny_if_booked anyway.
+    """
+    if booking_service is None:
+        return True
+    servers = [index for index, _ in api_client.get_servers()]
+    if focused_server_index in servers:
+        targets = [focused_server_index]
+    else:
+        targets = servers
+    try:
+        return any(
+            booking_service.active_for(api_client.get_server_key(index))
+            for index in targets
+        )
+    except Exception as exc:
+        print(f"Could not read bookings to gate panel controls: {exc}")
+        return False
 
 
 def _server_has_crcon_http(
@@ -1266,9 +1331,14 @@ class GameModeView(PersistentView):
         self,
         focused_server_index: int | None = None,
         crcon_outage: bool = False,
+        show_controls: bool = True,
     ):
         super().__init__()
         self.focused_server_index = focused_server_index
+        if not show_controls:
+            for child in list(self.children):
+                if getattr(child, "custom_id", None) in BOOKING_GATED_BUTTONS:
+                    self.remove_item(child)
         self._apply_crcon_panel_state(crcon_outage)
 
     def _apply_crcon_panel_state(self, disable_crcon_controls: bool) -> None:
@@ -1289,7 +1359,7 @@ class GameModeView(PersistentView):
 
             if disable_crcon_controls:
                 child.style = discord.ButtonStyle.danger
-                child.label = f"OFFLINE - {default_label}"
+                child.label = panel_label(custom_id, emoji="⛔")
             else:
                 child.style = default_style
                 child.label = default_label
@@ -1360,7 +1430,7 @@ class GameModeView(PersistentView):
         )
 
     @discord.ui.button(
-        label="🔁 Change Server",
+        label=panel_label("persistent:change_server"),
         style=discord.ButtonStyle.secondary,
         custom_id="persistent:change_server",
         row=0,
@@ -1392,7 +1462,7 @@ class GameModeView(PersistentView):
         )
 
     @discord.ui.button(
-        label="📅 Book Server",
+        label=panel_label("persistent:book_server"),
         style=discord.ButtonStyle.success,
         custom_id="persistent:book_server",
         row=0,
@@ -1403,7 +1473,7 @@ class GameModeView(PersistentView):
         await open_book_panel(interaction, booking_deps)
 
     @discord.ui.button(
-        label="📋 Manage Bookings",
+        label=panel_label("persistent:manage_bookings"),
         style=discord.ButtonStyle.primary,
         custom_id="persistent:manage_bookings",
         row=0,
@@ -1414,7 +1484,7 @@ class GameModeView(PersistentView):
         await open_manage_panel(interaction, booking_deps)
 
     @discord.ui.button(
-        label="🔄 Refresh Status",
+        label=panel_label("persistent:refresh_status"),
         style=discord.ButtonStyle.success,
         custom_id="persistent:refresh_status",
         row=0,
@@ -1429,7 +1499,7 @@ class GameModeView(PersistentView):
         )
 
     @discord.ui.button(
-        label="🗺️ Change Map",
+        label=panel_label("persistent:open_map_changer"),
         style=discord.ButtonStyle.primary,
         custom_id="persistent:open_map_changer",
         row=1,
@@ -1487,7 +1557,7 @@ class GameModeView(PersistentView):
         )
 
     @discord.ui.button(
-        label="🎯 Set Objectives",
+        label=panel_label("persistent:set_objectives"),
         style=discord.ButtonStyle.secondary,
         custom_id="persistent:set_objectives",
         row=1,
@@ -1543,7 +1613,7 @@ class GameModeView(PersistentView):
         )
 
     @discord.ui.button(
-        label="🌦 Dynamic Weather",
+        label=panel_label("persistent:set_dynamic_weather"),
         style=discord.ButtonStyle.secondary,
         custom_id="persistent:set_dynamic_weather",
         row=1,
@@ -1599,10 +1669,10 @@ class GameModeView(PersistentView):
         )
 
     @discord.ui.button(
-        label="⏱ Warfare Match Timer",
+        label=panel_label("persistent:set_warfare_match_timer"),
         style=discord.ButtonStyle.primary,
         custom_id="persistent:set_warfare_match_timer",
-        row=2,
+        row=1,
     )
     async def set_warfare_match_timer(
         self, interaction: discord.Interaction, button: discord.ui.Button
@@ -1615,7 +1685,7 @@ class GameModeView(PersistentView):
         )
 
     @discord.ui.button(
-        label="🔥 Warfare Warm Up Timer",
+        label=panel_label("persistent:set_warfare_warmup_timer"),
         style=discord.ButtonStyle.primary,
         custom_id="persistent:set_warfare_warmup_timer",
         row=2,
@@ -1631,7 +1701,7 @@ class GameModeView(PersistentView):
         )
 
     @discord.ui.button(
-        label="↔️ Team Switch Cooldown",
+        label=panel_label("persistent:set_team_switch_cooldown"),
         style=discord.ButtonStyle.primary,
         custom_id="persistent:set_team_switch_cooldown",
         row=2,
@@ -1670,10 +1740,10 @@ class GameModeView(PersistentView):
         )
 
     @discord.ui.button(
-        label="🗑️ REMOVE ADMIN CAM USER",
+        label=panel_label("persistent:remove_admin_cam_access"),
         style=discord.ButtonStyle.secondary,
         custom_id="persistent:remove_admin_cam_access",
-        row=3,
+        row=2,
     )
     async def remove_admin_cam_access(
         self, interaction: discord.Interaction, button: discord.ui.Button
@@ -1746,10 +1816,10 @@ class GameModeView(PersistentView):
         )
 
     @discord.ui.button(
-        label="🎥 ADD ADMIN CAM ACCESS",
+        label=panel_label("persistent:add_admin_cam_access"),
         style=discord.ButtonStyle.danger,
         custom_id="persistent:add_admin_cam_access",
-        row=3,
+        row=2,
     )
     async def add_admin_cam_access(
         self, interaction: discord.Interaction, button: discord.ui.Button
