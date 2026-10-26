@@ -233,17 +233,24 @@ class GuildLockTests(BookingBotTestCase):
         self.assertTrue(await bot._deny_if_booked(from_home, 0))
         self.assertIn("Control it from that Discord", from_home.response.sent[-1])
 
-    async def test_admin_cam_is_home_guild_only_even_for_the_booker(self):
+    async def test_booking_guild_can_add_admin_cam_during_its_slot(self):
+        """Admin cam follows the booking like every other control (repo owner, 2026-10-27)."""
         interaction = interaction_for(member(BOOKER_ID, guild_id=self.GUEST))
+        modal = bot.AddAdminCamModal(0)
+        modal.player_id._value = "76561198000000000"
 
-        self.assertTrue(await bot._deny_if_booked(interaction, 0, action="admin_cam"))
-        self.assertIn("home Discord", interaction.response.sent[-1])
+        with mock.patch.object(bot, "_get_http_client", return_value=mock.MagicMock()),                 mock.patch.object(bot, "_run_server_write", mock.AsyncMock(return_value=True)) as write:
+            await modal.on_submit(interaction)
+
+        write.assert_awaited_once()
+
+        home_member = interaction_for(member(OTHER_ID))
+        self.assertTrue(await bot._deny_if_booked(home_member, 0))
 
     async def test_home_booking_admin_overrides_a_guest_booking(self):
         interaction = interaction_for(member(ADMIN_ID, role_ids=[ADMIN_ROLE]))
 
         self.assertFalse(await bot._deny_if_booked(interaction, 0))
-        self.assertFalse(await bot._deny_if_booked(interaction, 0, action="admin_cam"))
 
 
 class GuardCoverageTests(unittest.TestCase):

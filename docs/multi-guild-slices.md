@@ -46,21 +46,20 @@ shaping: true
 ### 3 — Lock by guild
 - `control_check(server_key, guild_id, user, admin scope)` is decided in this order:
   1. home booking admin → allow
-  2. admin cam from a guest guild → deny
-  3. no live booking → deny
-  4. live booking → allow only the booker or an Administrator of the booking's guild
+  2. no live booking → deny
+  3. live booking → allow only the booker or an Administrator of the booking's guild
+- Admin cam follows the same rule (R5, re-decided 2026-10-27).
 - It stays at all 8 write sites; the AST coverage test still applies.
 - A decision-table test covers every row of the rule above.
 - **Demo:**
   1. During B's booking: B's booker changes the map ✅; a home member is denied with "Booked by **B**"; a home booking admin overrides ✅.
-  2. Admin cam from B is denied.
+  2. B's booker adds admin cam during the slot ✅.
 
 ### 4 — One panel per guild
 - `data/panel_message.json` becomes `guild_id → (channel_id, message_id)`. The existing single entry migrates to the home guild.
 - `/setup_panel` and `/repost_button` act on the caller's guild only.
 - Refreshes (booking changes, booking start/end, Refresh button) update every guild's panel, fetching CRCON status once.
 - Guest panels:
-  - omit the admin cam buttons
   - show "Booked by **Guild**" for other guilds' bookings
   - show "@user" inside the booking guild
 - **Demo:** panels in home and B; B books; both panels update, each with its own wording.
@@ -73,6 +72,7 @@ shaping: true
 ## Accepted limits
 - Removing a guild strands its future bookings: they are hidden and ignored, with no transfer.
 - One panel per guild.
+- Admin cam access a guest adds outlives their booking until someone removes it (no auto-revoke).
 - Per-guild command sync suits a handful of guilds; past about 10, switch to global sync.
 - No per-guild fair-use limits (M9, below the cut).
 

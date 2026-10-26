@@ -196,10 +196,9 @@ class ActiveAndLockTests(BookingServiceTestCase):
         BOOKER, OTHER = 1, 2
         booking = self.service.create("server1", BOOKER, "u", T0, T0 + HOUR, guild_id=GUEST)
 
-        def check(user, guild, *, admin=False, guild_admin=None, server="server1", action="control"):
+        def check(user, guild, *, admin=False, guild_admin=None, server="server1"):
             decision = self.service.control_check(
-                server, user, admin, guild_id=guild, home_guild_id=HOME,
-                admin_guild_id=guild_admin, action=action,
+                server, user, admin, guild_id=guild, admin_guild_id=guild_admin,
             )
             return decision.allowed, decision.reason
 
@@ -213,8 +212,6 @@ class ActiveAndLockTests(BookingServiceTestCase):
             ("third guild's admin", dict(user=OTHER, guild=THIRD, guild_admin=THIRD), (False, "booked")),
             ("booker acting from another guild", dict(user=BOOKER, guild=HOME), (False, "booked_from_other_guild")),
             ("home booking admin overrides", dict(user=OTHER, guild=HOME, admin=True), (True, "admin")),
-            ("admin cam from the booking guest guild", dict(user=BOOKER, guild=GUEST, action="admin_cam"), (False, "admin_cam_home_only")),
-            ("admin cam by home booking admin", dict(user=OTHER, guild=HOME, admin=True, action="admin_cam"), (True, "admin")),
             ("unbooked server, booker of another server", dict(user=BOOKER, guild=GUEST, server="server2"), (False, "unbooked")),
             ("unbooked server, home booking admin", dict(user=OTHER, guild=HOME, admin=True, server="server2"), (True, "admin")),
         ]

@@ -18,11 +18,12 @@ Extends the server booking bet ([booking-shaping.md](booking-shaping.md), branch
 | R2 | **During a booking:** the booker, plus Administrators of the booking's guild; home-guild booking admins always override | M2 / C2–C3 "booking guild's role members" (`BOOKING_ROLE_ID` was removed: any approved-guild member may book) |
 | R3 | **Approval:** allow-list in one variable, `BOOKING_GUILD_IDS`, next to `DISCORD_GUILD_ID` (home). Unlisted guilds are left | A1's `GUILD{N}_ID` / `GUILD{N}_CHANNEL_ID` / `GUILD{N}_BOOKING_ROLE_ID` |
 | R4 | **Game servers:** every approved guild sees and can book every game server | — (new; per-guild server lists deferred) |
-| R5 | **Admin cam:** home guild only; guest panels omit the buttons | M7 (unchanged, restated) |
+| R5 | **Admin cam:** follows the booking like every other control. The booking guild's booker and Administrators may add or remove admin cam during their slot (re-decided by the repo owner later on 2026-10-27; first recorded as home-only) | M7 / C4 admin cam owner-only |
 
 Consequences for the parts:
 - **A1:** the registry is `DISCORD_GUILD_ID` + `BOOKING_GUILD_IDS`. There are no per-guild channel or role variables.
-- **A4:** the lock is `control_check` plus the guild: the guild must match the booking's guild, or the request must come from a home-guild booking admin.
+- **A4:** the lock is `control_check` plus the guild: the guild must match the booking's guild, or the request must come from a home-guild booking admin. Admin cam has no special case.
+- **Accepted uncertainty (R5):** admin cam access is stored on the game server and outlives the booking. Access a guest adds stays after their slot until someone removes it. Auto-revoke at booking end is a separate bet.
 - **A5:** guest guild Administrators manage their own guild's bookings. Home-guild Administrators and `BOOKING_ADMIN_ROLE_ID` holders are booking admins everywhere.
 - **A6:** panels are saved per guild in `data/panel_message.json` (on the Railway volume) and created with `/setup_panel`. This replaces the in-memory map and history scan (G1), because the bot lacks Read Message History.
 
