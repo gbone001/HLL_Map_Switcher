@@ -442,6 +442,15 @@ class BookingService:
             ).fetchall()
         return [_row_to_booking(row) for row in rows]
 
+    def reassign_server_key(self, old_key: str, new_key: str) -> int:
+        """Move every booking from one server key to another; returns how many moved."""
+        with closing(self._connect()) as conn:
+            cursor = conn.execute(
+                "UPDATE bookings SET server_key = ? WHERE server_key = ?",
+                (new_key, old_key),
+            )
+        return cursor.rowcount
+
     def has_boundary_between(self, since_ts: int, until_ts: int) -> bool:
         """Did any non-cancelled booking start or end in (since, until]?"""
         with closing(self._connect()) as conn:

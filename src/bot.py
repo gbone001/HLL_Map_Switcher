@@ -197,7 +197,25 @@ def _orphaned_booking_keys() -> set[str]:
     } - known
 
 
+def _adopt_single_server_bookings() -> int:
+    """Moving from single-server (CRCON_*) to SERVER{N}_* config renames the first server's
+    booking key from 'default' to 'server1'. Carry its bookings across so they keep locking it."""
+    if booking_service is None:
+        return 0
+    keys = {api_client.get_server_key(index) for index, _ in api_client.get_servers()}
+    if "default" in keys or "server1" not in keys:
+        return 0
+    return booking_service.reassign_server_key("default", "server1")
+
+
 if booking_service is not None:
+    try:
+        _moved = _adopt_single_server_bookings()
+    except Exception as exc:
+        print(f"Could not move single-server bookings to server1: {exc}")
+    else:
+        if _moved:
+            print(f"Moved {_moved} booking(s) from the single-server key to server1.")
     try:
         _orphaned = _orphaned_booking_keys()
     except Exception as exc:

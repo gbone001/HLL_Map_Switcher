@@ -394,6 +394,22 @@ class BookingWiringTests(BookingBotTestCase):
             self.assertIsNone(bot.bot.tree.get_command(name))
         self.assertIsNone(bot.booking_refresher)
 
+    def test_single_server_bookings_move_to_server1_in_multi_server_mode(self):
+        old = self.service.create("default", BOOKER_ID, "booker", T0 + HOUR, T0 + 2 * HOUR)
+        keys = {0: "server1", 1: "server2"}
+        with mock.patch.object(bot.api_client, "get_servers", return_value=[(0, "US"), (1, "AU")]), \
+                mock.patch.object(bot.api_client, "get_server_key", side_effect=keys.get):
+            self.assertEqual(bot._adopt_single_server_bookings(), 1)
+            self.assertEqual(bot._adopt_single_server_bookings(), 0)
+
+        self.assertEqual(self.service.get(old.id).server_key, "server1")
+
+    def test_single_server_mode_leaves_bookings_alone(self):
+        self.service.create("default", BOOKER_ID, "booker", T0 + HOUR, T0 + 2 * HOUR)
+        with mock.patch.object(bot.api_client, "get_servers", return_value=[(0, "US")]), \
+                mock.patch.object(bot.api_client, "get_server_key", return_value="default"):
+            self.assertEqual(bot._adopt_single_server_bookings(), 0)
+
     def test_orphaned_booking_keys_reports_unconfigured_servers(self):
         self.book_now()
         self.service.create("server99", BOOKER_ID, "booker", T0 + HOUR, T0 + 2 * HOUR)
