@@ -17,6 +17,8 @@ from discord import app_commands
 
 from services.guild_registry import GuildRegistry
 from services.booking import (
+    BookingGroup,
+    group_by_series,
     DURATION_HINT,
     EVENT_NAME_MAX_LENGTH,
     START_FORMAT_HINT,
@@ -180,6 +182,30 @@ async def refuse_unavailable(
     return False
 
 
+def describe_group(group: BookingGroup, server_name: str, booked_by: str) -> str:
+    """One line per booking, or one line for a whole repeating series."""
+    if not group.is_series:
+        return describe_booking(group.first, server_name, booked_by)
+    first = group.first
+    named = f" *{discord.utils.escape_markdown(first.event_name)}*" if first.event_name else ""
+    remaining = len(group.bookings)
+    return (
+        f"#{first.series_id} 🔁 **{server_name}**{named} — {booked_by} · "
+        f"{group.recurrence_label}, {remaining} date{'s' if remaining != 1 else ''} left · "
+        f"next {timestamp(first.start_utc)} → {timestamp(first.end_utc, 't')}"
+    )
+
+
+def group_label(
+    group: BookingGroup, deps: BookingCommandDeps, viewer_guild_id: int | None = None
+) -> str:
+    """Plain-text label for a select option or autocomplete choice."""
+    label = booking_label(group.first, deps, viewer_guild_id)
+    if group.is_series:
+        label = f"🔁 {label} · {group.recurrence_label.lower()}, {len(group.bookings)} left"
+    return label[:100]
+
+
 def booking_label(
     booking: Booking, deps: BookingCommandDeps, viewer_guild_id: int | None = None
 ) -> str:
@@ -262,13 +288,17 @@ async def book_and_reply(
 
 
 async def cancel_and_reply(
-    interaction: discord.Interaction, deps: BookingCommandDeps, booking_id: int
+    interaction: discord.Interaction,
+    deps: BookingCommandDeps,
+    booking_id: int,
+    whole_series: bool = False,
 ) -> bool:
-    """Cancel a booking and reply; True if it was cancelled. Shared by /cancel_booking and the panel."""
+    """Cancel a booking (or, with `whole_series`, every remaining date of its series) and
+    reply; True if anything was cancelled. Shared by /cancel_booking and the panel."""
     await _defer(interaction)
     try:
-        booking = await asyncio.to_thread(
-            deps.service.cancel,
+        cancelled = await asyncio.to_thread(
+            deps.service.cancel_series if whole_series else deps.service.cancel,
             booking_id,
             interaction.user.id,
             is_booking_admin(interaction.user, deps.config),
@@ -281,10 +311,14 @@ async def cancel_and_reply(
     except BookingError as exc:
         await _reply(interaction, f"❌ {exc}")
         return False
-    await _reply(
-        interaction,
-        f"✅ Cancelled booking #{booking.id} on **{deps.server_name_for_key(booking.server_key)}**.",
-    )
+    cancelled = cancelled if isinstance(cancelled, list) else [cancelled]
+    first = cancelled[0]
+    server = deps.server_name_for_key(first.server_key)
+    if len(cancelled) > 1:
+        message = f"✅ Cancelled series #{first.series_id} on **{server}** ({len(cancelled)} dates)."
+    else:
+        message = f"✅ Cancelled booking #{first.id} on **{server}**."
+    await _reply(interaction, message)
     await _notify_change(deps)
     return True
 
@@ -341,12 +375,12 @@ def register_booking_commands(
             await _reply(interaction, "No active or upcoming bookings.")
             return
         lines = [
-            describe_booking(
-                b,
-                deps.server_name_for_key(b.server_key),
-                booker_text(b, interaction.guild_id, deps.guild_name),
+            describe_group(
+                group,
+                deps.server_name_for_key(group.first.server_key),
+                booker_text(group.first, interaction.guild_id, deps.guild_name),
             )
-            for b in live
+            for group in group_by_series(live)
         ]
         await _reply(interaction, fit_lines(lines))
 
@@ -354,13 +388,47 @@ def register_booking_commands(
         name="cancel_booking",
         description="Cancel one of your bookings (admins can cancel any)",
     )
-    @app_commands.describe(booking_id="Booking to cancel")
+    @app_commands.describe(
+        booking_id="Booking to cancel (🔁 marks a repeating series)",
+        series="For a repeating booking: cancel every remaining date, not just this one",
+    )
     async def cancel_booking(
-        interaction: discord.Interaction, booking_id: int
+        interaction: discord.Interaction, booking_id: int, series: bool = True
     ):
         if await refuse_unavailable(interaction, deps):
             return
-        await cancel_and_reply(interaction, deps, booking_id)
+        await cancel_and_reply(interaction, deps, booking_id, whole_series=series)
+
+    @tree.command(
+        name="clear_bookings",
+        description="Cancel every active and upcoming booking (booking admins only)",
+    )
+    @app_commands.describe(confirm="Set to True to cancel every booking on every server")
+    async def clear_bookings(interaction: discord.Interaction, confirm: bool = False):
+        if await refuse_unavailable(interaction, deps):
+            return
+        if not is_booking_admin(interaction.user, deps.config):
+            await _reply(interaction, "❌ Only booking admins can clear bookings.")
+            return
+        if not confirm:
+            await _reply(
+                interaction,
+                "This cancels **every** active and upcoming booking on every server. "
+                "Run `/clear_bookings confirm:True` to go ahead.",
+            )
+            return
+        await _defer(interaction)
+        try:
+            cleared = await asyncio.to_thread(
+                deps.service.cancel_all_live, interaction.user.id
+            )
+        except sqlite3.Error:
+            logger.exception("Booking store failed during /clear_bookings")
+            await _reply(interaction, STORE_ERROR_MESSAGE)
+            return
+        logger.warning("User %s cleared %s booking(s)", interaction.user.id, cleared)
+        await _reply(interaction, f"✅ Cancelled {cleared} booking(s).")
+        await _notify_change(deps)
 
     @cancel_booking.autocomplete("booking_id")
     async def cancel_booking_autocomplete(
@@ -383,13 +451,13 @@ def register_booking_commands(
             return []
         needle = current.lower()
         choices = []
-        for booking in live:
-            if not booking.manageable_by(interaction.user.id, admin, admin_guild):
+        for group in group_by_series(live):
+            if not group.first.manageable_by(interaction.user.id, admin, admin_guild):
                 continue
-            label = booking_label(booking, deps, interaction.guild_id)
+            label = group_label(group, deps, interaction.guild_id)
             if needle and needle not in label.lower():
                 continue
             choices.append(
-                app_commands.Choice(name=label[:100], value=booking.id)
+                app_commands.Choice(name=label, value=group.first.id)
             )
         return choices[:25]

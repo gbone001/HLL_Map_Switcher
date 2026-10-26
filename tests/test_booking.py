@@ -463,3 +463,52 @@ class EventNameTests(unittest.TestCase):
                 service.create("server1", 1, "u", T0 + HOUR, T0 + 2 * HOUR, event_name="Night ops").event_name,
                 "Night ops",
             )
+
+
+class SeriesParentTests(BookingServiceTestCase):
+    def test_series_dates_point_at_the_first_date_and_singles_have_no_series(self):
+        series = self.service.create_series("server1", 1, "u", T0 + HOUR, T0 + 2 * HOUR, "weekly", 3)
+        single = self.service.create("server2", 1, "u", T0 + HOUR, T0 + 2 * HOUR)
+
+        parent = series[0].id
+        self.assertEqual([b.series_id for b in series], [parent] * 3)
+        self.assertEqual([self.service.get(b.id).series_id for b in series], [parent] * 3)
+        self.assertEqual({b.recurrence for b in series}, {"weekly"})
+        self.assertFalse(single.is_recurring)
+        self.assertIsNone(single.recurrence)
+
+    def test_group_by_series_collapses_each_series(self):
+        from services.booking import group_by_series
+
+        self.service.create_series("server1", 1, "u", T0 + HOUR, T0 + 2 * HOUR, "daily", 3)
+        self.service.create("server2", 1, "u", T0 + 3 * HOUR, T0 + 4 * HOUR)
+
+        groups = group_by_series(self.service.list_live())
+
+        self.assertEqual([(g.is_series, len(g.bookings)) for g in groups], [(True, 3), (False, 1)])
+        self.assertEqual(groups[0].recurrence_label, "Daily")
+
+    def test_cancel_series_cancels_remaining_dates_for_the_owner_only(self):
+        series = self.service.create_series("server1", 1, "u", T0 + HOUR, T0 + 2 * HOUR, "weekly", 3)
+
+        with self.assertRaises(BookingPermissionError):
+            self.service.cancel_series(series[1].id, actor_id=2, is_admin=False)
+        cancelled = self.service.cancel_series(series[1].id, actor_id=1, is_admin=False)
+
+        self.assertEqual([b.id for b in cancelled], [b.id for b in series])
+        self.assertEqual(self.service.list_live(), [])
+        with self.assertRaises(BookingNotFoundError):
+            self.service.cancel_series(series[0].id, actor_id=1, is_admin=False)
+
+    def test_cancel_series_on_a_single_booking_cancels_just_it(self):
+        single = self.service.create("server1", 1, "u", T0 + HOUR, T0 + 2 * HOUR)
+
+        self.assertEqual([b.id for b in self.service.cancel_series(single.id, 1, False)], [single.id])
+
+    def test_cancel_all_live_keeps_ended_bookings(self):
+        self.service.create("server1", 1, "u", T0, T0 + 60)
+        self.service.create_series("server2", 1, "u", T0 + HOUR, T0 + 2 * HOUR, "daily", 2)
+        self.clock.ts = T0 + 120  # the first booking has ended
+
+        self.assertEqual(self.service.cancel_all_live(actor_id=9), 2)
+        self.assertEqual(self.service.list_live(), [])

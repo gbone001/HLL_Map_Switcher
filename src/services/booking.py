@@ -42,12 +42,14 @@ CREATE TABLE IF NOT EXISTS bookings (
     cancelled_at INTEGER,
     cancelled_by INTEGER,
     guild_id INTEGER,
-    event_name TEXT
+    event_name TEXT,
+    series_id INTEGER,
+    recurrence TEXT
 );
 CREATE INDEX IF NOT EXISTS bookings_server_time ON bookings (server_key, start_utc, end_utc);
 """
 
-_COLUMNS = "id, server_key, user_id, user_name, start_utc, end_utc, created_at, cancelled_at, cancelled_by, guild_id, event_name"
+_COLUMNS = "id, server_key, user_id, user_name, start_utc, end_utc, created_at, cancelled_at, cancelled_by, guild_id, event_name, series_id, recurrence"
 _LIVE = "cancelled_at IS NULL AND end_utc > ?"
 
 
@@ -84,6 +86,13 @@ class Booking:
     guild_id: int | None = None
     # Optional name the booker gave the event, e.g. "Scrim vs 1st Para".
     event_name: str | None = None
+    # Repeating bookings: every date carries the parent (first date's) ID and the pattern.
+    series_id: int | None = None
+    recurrence: str | None = None
+
+    @property
+    def is_recurring(self) -> bool:
+        return self.series_id is not None
 
     def is_active(self, now_ts: int) -> bool:
         return (
@@ -110,6 +119,37 @@ class ControlDecision:
     allowed: bool
     active: Booking | None
     reason: str
+
+
+RECURRENCE_LABELS = {"daily": "Daily", "weekly": "Weekly", "biweekly": "Every 2 weeks"}
+
+
+@dataclass(frozen=True)
+class BookingGroup:
+    """A single booking, or every remaining date of one repeating series (earliest first)."""
+
+    bookings: tuple[Booking, ...]
+
+    @property
+    def first(self) -> Booking:
+        return self.bookings[0]
+
+    @property
+    def is_series(self) -> bool:
+        return self.first.is_recurring
+
+    @property
+    def recurrence_label(self) -> str:
+        return RECURRENCE_LABELS.get(self.first.recurrence or "", "Repeats")
+
+
+def group_by_series(bookings: list[Booking]) -> list[BookingGroup]:
+    """Collapse each series into one group, keeping the order of each group's first date."""
+    groups: dict[object, list[Booking]] = {}
+    for booking in bookings:
+        key = ("series", booking.series_id) if booking.is_recurring else ("one", booking.id)
+        groups.setdefault(key, []).append(booking)
+    return [BookingGroup(tuple(items)) for items in groups.values()]
 
 
 DEFAULT_MAX_HOURS = 24
@@ -288,6 +328,9 @@ class BookingService:
                 conn.execute("ALTER TABLE bookings ADD COLUMN guild_id INTEGER")
             if "event_name" not in columns:  # stores created before event names
                 conn.execute("ALTER TABLE bookings ADD COLUMN event_name TEXT")
+            if "series_id" not in columns:  # stores created before booking series
+                conn.execute("ALTER TABLE bookings ADD COLUMN series_id INTEGER")
+                conn.execute("ALTER TABLE bookings ADD COLUMN recurrence TEXT")
 
     def now_ts(self) -> int:
         return int(self._clock().timestamp())
@@ -349,6 +392,8 @@ class BookingService:
             self._validate_slot(start, end, now)
 
         bookings = []
+        repeating = len(slots) > 1
+        series_id: int | None = None
         conn = self._connect()
         try:
             # BEGIN IMMEDIATE takes the write lock up front so two concurrent /book calls
@@ -364,10 +409,19 @@ class BookingService:
                     conn.execute("ROLLBACK")
                     raise BookingOverlapError(_row_to_booking(row))
                 cursor = conn.execute(
-                    "INSERT INTO bookings (server_key, user_id, user_name, start_utc, end_utc, created_at, guild_id, event_name) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                    (server_key, user_id, user_name, start, end, now, guild_id, event_name),
+                    "INSERT INTO bookings (server_key, user_id, user_name, start_utc, end_utc, created_at, "
+                    "guild_id, event_name, series_id, recurrence) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        server_key, user_id, user_name, start, end, now, guild_id, event_name,
+                        series_id, recurrence if repeating else None,
+                    ),
                 )
+                if repeating and series_id is None:
+                    # The first date is the series parent; it points at itself.
+                    series_id = cursor.lastrowid
+                    conn.execute(
+                        "UPDATE bookings SET series_id = ? WHERE id = ?", (series_id, series_id)
+                    )
                 bookings.append(
                     Booking(
                         cursor.lastrowid,
@@ -379,6 +433,8 @@ class BookingService:
                         now,
                         guild_id=guild_id,
                         event_name=event_name,
+                        series_id=series_id,
+                        recurrence=recurrence if repeating else None,
                     )
                 )
             conn.execute("COMMIT")
@@ -524,6 +580,49 @@ class BookingService:
                 (until_ts, since_ts),
             ).fetchall()
         return [_row_to_booking(row) for row in rows]
+
+    def cancel_series(
+        self,
+        booking_id: int,
+        actor_id: int,
+        is_admin: bool,
+        admin_guild_id: int | None = None,
+    ) -> list[Booking]:
+        """Cancel every remaining date of the series `booking_id` belongs to (or just that
+        booking when it doesn't repeat). Returns the cancelled bookings, earliest first."""
+        booking = self.get(booking_id)
+        if booking is None or not booking.is_recurring:
+            return [self.cancel(booking_id, actor_id, is_admin, admin_guild_id)]
+        now = self.now_ts()
+        remaining = [
+            b
+            for b in self.list_live()
+            if b.series_id == booking.series_id
+        ]
+        if not remaining:
+            raise BookingNotFoundError(
+                f"Series #{booking.series_id} has no dates left to cancel."
+            )
+        if not remaining[0].manageable_by(actor_id, is_admin, admin_guild_id):
+            raise BookingPermissionError(f"Series #{booking.series_id} is not yours.")
+        with closing(self._connect()) as conn:
+            conn.execute(
+                "UPDATE bookings SET cancelled_at = ?, cancelled_by = ? "
+                "WHERE series_id = ? AND cancelled_at IS NULL AND end_utc > ?",
+                (now, actor_id, booking.series_id, now),
+            )
+        return remaining
+
+    def cancel_all_live(self, actor_id: int) -> int:
+        """Cancel every active or upcoming booking (rows are kept); returns how many."""
+        now = self.now_ts()
+        with closing(self._connect()) as conn:
+            cursor = conn.execute(
+                "UPDATE bookings SET cancelled_at = ?, cancelled_by = ? "
+                f"WHERE {_LIVE}",
+                (now, actor_id, now),
+            )
+        return cursor.rowcount
 
     def claim_unowned(self, guild_id: int) -> int:
         """Give bookings made before multi-guild (no guild) to `guild_id`; returns how many."""

@@ -763,3 +763,91 @@ class PickerEventNameTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(book.await_args.kwargs["event_name"], "Night ops")
         submit.delete_original_response.assert_awaited_once()
+
+
+class SeriesCommandTests(BookingBotTestCase):
+    def setUp(self):
+        super().setUp()
+        self.on_change = mock.AsyncMock()
+        self.tree = app_commands.CommandTree(discord.Client(intents=discord.Intents.none()))
+        register_booking_commands(
+            self.tree,
+            BookingCommandDeps(
+                service=self.service,
+                config=ENABLED_CONFIG,
+                servers=lambda: [(0, "Server One")],
+                server_key=lambda index: "server1",
+                server_name_for_key=lambda key: "Server One",
+                on_change=self.on_change,
+            ),
+        )
+        self.clock.ts = T0 - 24 * HOUR
+        self.series = self.service.create_series(
+            "server1", BOOKER_ID, "booker", T0 + HOUR, T0 + 2 * HOUR, "weekly", 4, event_name="Scrims"
+        )
+
+    async def test_bookings_lists_a_series_once(self):
+        interaction = interaction_for(member(OTHER_ID))
+        await self.tree.get_command("bookings").callback(interaction, server=None)
+
+        reply = interaction.response.sent[-1]
+        self.assertEqual(reply.count("🔁"), 1)
+        self.assertIn("Weekly, 4 dates left", reply)
+
+    async def test_cancel_booking_cancels_the_whole_series_by_default(self):
+        interaction = interaction_for(member(BOOKER_ID))
+        await self.tree.get_command("cancel_booking").callback(interaction, booking_id=self.series[0].id)
+
+        self.assertIn("(4 dates)", interaction.response.sent[-1])
+        self.assertEqual(self.service.list_live(), [])
+
+    async def test_cancel_booking_can_cancel_one_date(self):
+        interaction = interaction_for(member(BOOKER_ID))
+        await self.tree.get_command("cancel_booking").callback(
+            interaction, booking_id=self.series[1].id, series=False
+        )
+
+        self.assertEqual(len(self.service.list_live()), 3)
+
+    async def test_clear_bookings_needs_a_booking_admin_and_confirmation(self):
+        command = self.tree.get_command("clear_bookings")
+
+        member_try = interaction_for(member(BOOKER_ID))
+        await command.callback(member_try, confirm=True)
+        self.assertIn("Only booking admins", member_try.response.sent[-1])
+
+        unconfirmed = interaction_for(member(ADMIN_ID, role_ids=[ADMIN_ROLE]))
+        await command.callback(unconfirmed, confirm=False)
+        self.assertIn("confirm:True", unconfirmed.response.sent[-1])
+        self.assertEqual(len(self.service.list_live()), 4)
+
+        confirmed = interaction_for(member(ADMIN_ID, role_ids=[ADMIN_ROLE]))
+        await command.callback(confirmed, confirm=True)
+        self.assertIn("Cancelled 4 booking(s)", confirmed.response.sent[-1])
+        self.assertEqual(self.service.list_live(), [])
+        self.on_change.assert_awaited()
+
+
+class ManageSeriesTests(BookingBotTestCase):
+    async def test_manage_view_offers_one_option_per_series_and_cancels_it_all(self):
+        from commands import booking_panel
+
+        self.clock.ts = T0 - 24 * HOUR
+        series = self.service.create_series("server1", BOOKER_ID, "b", T0 + HOUR, T0 + 2 * HOUR, "weekly", 3)
+        single = self.service.create("server1", BOOKER_ID, "b", T0 + 5 * HOUR, T0 + 6 * HOUR)
+        deps = BookingCommandDeps(
+            service=self.service, config=ENABLED_CONFIG, servers=lambda: [(0, "Server One")],
+            server_key=lambda index: "server1", server_name_for_key=lambda key: "Server One",
+            on_change=mock.AsyncMock(),
+        )
+        view = booking_panel.ManageBookingsView(deps, self.service.list_live(), BOOKER_ID, False)
+
+        options = view.booking_select.options
+        self.assertEqual([o.value for o in options], [str(series[0].id), str(single.id)])
+        self.assertTrue(options[0].label.startswith("🔁"))
+
+        view.booking_select._values = [str(series[0].id)]
+        interaction = interaction_for(member(BOOKER_ID))
+        await view.cancel_selected.callback(interaction)
+
+        self.assertEqual([b.id for b in self.service.list_live()], [single.id])

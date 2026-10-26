@@ -29,7 +29,9 @@
 - Slash commands:
 - `/setup_panel [channel]` -> an approved guild's admins create that guild's control panel in one of its channels (default: the current one); the guild's old panel is removed and the new one remembered in `data/panel_message.json`, so restarts restore it there. `DISCORD_CHANNEL_ID` is only the home guild's fallback before its first `/setup_panel`. `/repost_button` reposts the calling guild's panel.
 - `/repost_button` -> reposts the persistent control panel for admins.
-- `/book`, `/bookings`, `/cancel_booking` -> server booking (enabled only when `BOOKING_ROLE_ID` and `DISCORD_GUILD_ID` are set; roles and admin rights count only inside `DISCORD_GUILD_ID`). See `docs/booking-shaping.md`.
+- `/book`, `/bookings`, `/cancel_booking`, `/clear_bookings` -> server booking (enabled only when `BOOKING_ROLE_ID` and `DISCORD_GUILD_ID` are set; roles and admin rights count only inside `DISCORD_GUILD_ID`). See `docs/booking-shaping.md`.
+- Repeating bookings form a series: every date stores `series_id` (the first date's ID, the parent) and `recurrence`. `/bookings`, `/cancel_booking` (autocomplete) and Manage Bookings show one entry per series (`group_by_series`); cancelling a series (`BookingService.cancel_series`, `/cancel_booking series:True` is the default) cancels all its remaining dates.
+- `/clear_bookings confirm:True` -> booking admins cancel every active and upcoming booking (rows are kept as cancelled).
 - Persistent panel actions:
 - `Change Server`
 - `Book Server`

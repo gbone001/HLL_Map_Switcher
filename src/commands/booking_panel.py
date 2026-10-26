@@ -21,16 +21,16 @@ from commands.booking import (
     _reply,
     book_and_reply,
     booker_text,
-    booking_label,
     can_book,
     cancel_and_reply,
-    describe_booking,
+    describe_group,
+    group_label,
     fit_lines,
     guild_admin_id,
     is_booking_admin,
     refuse_unavailable,
 )
-from services.booking import EVENT_NAME_MAX_LENGTH, MAX_OCCURRENCES, Booking
+from services.booking import EVENT_NAME_MAX_LENGTH, MAX_OCCURRENCES, Booking, group_by_series
 
 logger = logging.getLogger(__name__)
 
@@ -481,32 +481,38 @@ class ManageBookingsView(_SelfClosingView):
         self._show(bookings)
 
     def _show(self, bookings: list[Booking]) -> None:
+        groups = group_by_series(bookings)
         lines = [
-            describe_booking(
-                b,
-                self.deps.server_name_for_key(b.server_key),
-                booker_text(b, self.viewer_guild_id, self.deps.guild_name),
+            describe_group(
+                g,
+                self.deps.server_name_for_key(g.first.server_key),
+                booker_text(g.first, self.viewer_guild_id, self.deps.guild_name),
             )
-            for b in bookings
+            for g in groups
         ]
         self.embed = discord.Embed(
             title="📋 Manage Bookings",
             description=fit_lines(lines) or "No active or upcoming bookings.",
-            color=0x2F3136,
+            color=0x5865F2,
         )
+        self.embed.set_footer(text="🔁 = repeating series. Cancelling a series cancels all its remaining dates.")
         manageable = [
-            b
-            for b in bookings
-            if b.manageable_by(self.user_id, self.is_admin, self.admin_guild_id)
+            g
+            for g in groups
+            if g.first.manageable_by(self.user_id, self.is_admin, self.admin_guild_id)
         ][:25]
+        self.groups = {str(g.first.id): g for g in manageable}
         self.booking_select = _DeferSelect(
-            placeholder="Select one of your bookings to cancel...",
+            placeholder="Select a booking or series to cancel...",
             options=[
                 discord.SelectOption(
-                    label=booking_label(b, self.deps, self.viewer_guild_id),
-                    value=str(b.id),
+                    label=group_label(g, self.deps, self.viewer_guild_id),
+                    value=str(g.first.id),
+                    description=(
+                        f"Cancels all {len(g.bookings)} remaining dates" if g.is_series else None
+                    ),
                 )
-                for b in manageable
+                for g in manageable
             ],
             row=0,
         )
@@ -518,7 +524,7 @@ class ManageBookingsView(_SelfClosingView):
         self.add_item(_CloseButton(row=1))
 
     @discord.ui.button(
-        label="Cancel selected booking", style=discord.ButtonStyle.danger, row=1
+        label="Cancel selected", style=discord.ButtonStyle.danger, row=1
     )
     async def cancel_selected(
         self, interaction: discord.Interaction, button: discord.ui.Button
@@ -527,8 +533,9 @@ class ManageBookingsView(_SelfClosingView):
             await _reply(interaction, "Select a booking first.")
             return
         await interaction.response.defer()
+        selected = self.groups[self.booking_select.values[0]]
         if await cancel_and_reply(
-            interaction, self.deps, int(self.booking_select.values[0])
+            interaction, self.deps, selected.first.id, whole_series=selected.is_series
         ):
             await self._reload(interaction)
 

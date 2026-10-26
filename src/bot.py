@@ -798,6 +798,8 @@ def _panel_schedule_lines(viewer_guild_id: int | None = None) -> list[str] | Non
     for booking in bookings:
         # Line 1: when (and the event name); line 2, indented as subtext: where and who.
         when = f"**<t:{booking.start_utc}:f> → <t:{booking.end_utc}:t>**"
+        if booking.is_recurring:
+            when += " 🔁"
         if booking.event_name:
             when += f" · *{discord.utils.escape_markdown(booking.event_name)}*"
         where = (
