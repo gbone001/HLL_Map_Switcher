@@ -16,7 +16,7 @@
 - `src/services/server_control.py` -> HTTP-first control service with direct RCON fallback for status reads, map changes, sector layout changes, dynamic weather, and timer updates.
 - `src/services/booking.py` -> server booking store (SQLite in `data/bookings.db`), overlap checks, time parsing, and the booking-lock decision (`blocking_booking`). No Discord or CRCON dependencies.
 - `src/commands/booking.py` -> `/book`, `/bookings`, `/cancel_booking` slash commands, the booking role/admin checks, and the shared `book_and_reply` / `cancel_and_reply` flows.
-- `src/commands/booking_panel.py` -> panel booking views (Book Server with recurrence, Manage Bookings with cancel). Reuses the slash-command flows; recurring series are created atomically by `BookingService.create_series`.
+- `src/commands/booking_panel.py` -> panel booking views (Book Server as a Calendar-style dropdown picker for server, date, start time, length and repeat; Manage Bookings with cancel). Reuses the slash-command flows; recurring series are created atomically by `BookingService.create_series`.
 - `src/events/booking_refresh.py` -> display-only loops that re-render the panel when a booking starts or ends, and daily at `BOOKING_PANEL_REFRESH_TIME` (default 06:00 in `BOOKING_TIMEZONE`) so the panel's two-week booking schedule rolls forward.
 
 ## Supporting Modules
