@@ -535,6 +535,8 @@ class PanelAndRefreshTests(BookingBotTestCase):
         lines = bot._panel_schedule_lines()
 
         self.assertEqual(len(lines), 3)
+        when, where = lines[2].split("\n")
+        self.assertTrue(when.startswith("**<t:") and where.startswith("-# ↳ "))
         self.assertTrue(lines[0].startswith("~~") and f"<t:{ended.start_utc}:f>" in lines[0])
         self.assertTrue(lines[1].startswith("🔒") and f"<t:{active.start_utc}:f>" in lines[1])
         self.assertIn(f"<t:{later.start_utc}:f>", lines[2])
@@ -695,3 +697,69 @@ class GuestPanelTests(BookingBotTestCase):
         self.assertIn(f"<@{BOOKER_ID}>", bot._panel_booking_lines(self.GUEST)[0][0])
         self.assertIn("**Guest Clan**", bot._panel_booking_lines(HOME_GUILD)[0][0])
         self.assertNotIn(f"<@{BOOKER_ID}>", " ".join(bot._panel_schedule_lines(HOME_GUILD)))
+
+
+
+class EventNameDisplayTests(BookingBotTestCase):
+    def test_schedule_entry_shows_event_name_on_the_time_line(self):
+        self.service.create(self.server_key, BOOKER_ID, "b", T0 + HOUR, T0 + 2 * HOUR, event_name="Scrim *vs* 1st Para")
+
+        when, where = bot._panel_schedule_lines()[0].split("\n")
+
+        self.assertIn("Scrim \\*vs\\* 1st Para", when)  # markdown escaped
+        self.assertIn(f"<@{BOOKER_ID}>", where)
+
+    def test_schedule_entries_are_separated_by_a_blank_line(self):
+        embed = bot.build_main_embed(None, {}, None, ["**a**\n-# ↳ x", "**b**\n-# ↳ y"])
+
+        schedule = [f for f in embed.fields if f.name.startswith("📅")][0]
+        self.assertEqual(schedule.value, "**a**\n-# ↳ x\n\n**b**\n-# ↳ y")
+
+    def test_server_card_shows_live_event_name(self):
+        self.service.create(self.server_key, BOOKER_ID, "b", T0 - 60, T0 + HOUR, event_name="Night ops")
+
+        self.assertIn("Night ops", bot._panel_booking_lines()[0][0])
+
+
+class BookEventOptionTests(CommandTests):
+    async def test_book_with_event_name(self):
+        self.clock.ts = T0 - 24 * HOUR
+        interaction = interaction_for(member(BOOKER_ID))
+        choice = app_commands.Choice(name="Server One", value="0")
+
+        await self.tree.get_command("book").callback(
+            interaction, server=choice, start="2027-01-15 09:00", duration="2h", event="Night ops"
+        )
+
+        self.assertIn("for **Night ops**", interaction.response.sent[-1])
+        self.assertEqual(self.service.list_live()[0].event_name, "Night ops")
+
+
+class PickerEventNameTests(unittest.IsolatedAsyncioTestCase):
+    async def test_book_asks_for_event_name_then_books_and_closes_the_picker(self):
+        from commands import booking_panel
+
+        deps = BookingCommandDeps(
+            service=None, config=ENABLED_CONFIG, servers=lambda: [(0, "Server One")],
+            server_key=lambda index: "server1", server_name_for_key=lambda key: "Server One",
+            on_change=mock.AsyncMock(),
+        )
+        picker = booking_panel.BookingPickerView(deps)
+        click = mock.MagicMock()
+        click.response.send_modal = mock.AsyncMock()
+
+        await picker._book(click)
+
+        modal = click.response.send_modal.await_args.args[0]
+        self.assertIsInstance(modal, booking_panel.EventNameModal)
+
+        modal.event_name._value = "Night ops"
+        submit = mock.MagicMock()
+        submit.response.defer = mock.AsyncMock()
+        submit.delete_original_response = mock.AsyncMock()
+        book = mock.AsyncMock(return_value=True)
+        with mock.patch.object(booking_panel, "book_and_reply", book):
+            await modal.on_submit(submit)
+
+        self.assertEqual(book.await_args.kwargs["event_name"], "Night ops")
+        submit.delete_original_response.assert_awaited_once()

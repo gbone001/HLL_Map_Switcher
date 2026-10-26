@@ -41,12 +41,13 @@ CREATE TABLE IF NOT EXISTS bookings (
     created_at INTEGER NOT NULL,
     cancelled_at INTEGER,
     cancelled_by INTEGER,
-    guild_id INTEGER
+    guild_id INTEGER,
+    event_name TEXT
 );
 CREATE INDEX IF NOT EXISTS bookings_server_time ON bookings (server_key, start_utc, end_utc);
 """
 
-_COLUMNS = "id, server_key, user_id, user_name, start_utc, end_utc, created_at, cancelled_at, cancelled_by, guild_id"
+_COLUMNS = "id, server_key, user_id, user_name, start_utc, end_utc, created_at, cancelled_at, cancelled_by, guild_id, event_name"
 _LIVE = "cancelled_at IS NULL AND end_utc > ?"
 
 
@@ -81,6 +82,8 @@ class Booking:
     cancelled_by: int | None = None
     # Discord guild the booking was made from (multi-guild slice 2); None only before migration.
     guild_id: int | None = None
+    # Optional name the booker gave the event, e.g. "Scrim vs 1st Para".
+    event_name: str | None = None
 
     def is_active(self, now_ts: int) -> bool:
         return (
@@ -202,6 +205,17 @@ class BookingConfig:
                 )
 
 
+EVENT_NAME_MAX_LENGTH = 60
+
+
+def clean_event_name(text: str | None) -> str | None:
+    """Trim an event name to one short line; blank means no name."""
+    if text is None:
+        return None
+    cleaned = " ".join(text.split())[:EVENT_NAME_MAX_LENGTH]
+    return cleaned or None
+
+
 def parse_start(text: str, tz: ZoneInfo) -> int:
     """Parse 'YYYY-MM-DD HH:MM' in the booking time zone into UTC epoch seconds."""
     try:
@@ -272,6 +286,8 @@ class BookingService:
             columns = {row[1] for row in conn.execute("PRAGMA table_info(bookings)")}
             if "guild_id" not in columns:  # stores created before multi-guild
                 conn.execute("ALTER TABLE bookings ADD COLUMN guild_id INTEGER")
+            if "event_name" not in columns:  # stores created before event names
+                conn.execute("ALTER TABLE bookings ADD COLUMN event_name TEXT")
 
     def now_ts(self) -> int:
         return int(self._clock().timestamp())
@@ -284,10 +300,17 @@ class BookingService:
         start_utc: int,
         end_utc: int,
         guild_id: int | None = None,
+        event_name: str | None = None,
     ) -> Booking:
         """Insert a booking unless it is invalid or overlaps a live booking on the same server."""
         return self.create_series(
-            server_key, user_id, user_name, start_utc, end_utc, guild_id=guild_id
+            server_key,
+            user_id,
+            user_name,
+            start_utc,
+            end_utc,
+            guild_id=guild_id,
+            event_name=event_name,
         )[0]
 
     def create_series(
@@ -300,6 +323,7 @@ class BookingService:
         recurrence: str = "none",
         count: int = 1,
         guild_id: int | None = None,
+        event_name: str | None = None,
     ) -> list[Booking]:
         """Insert `count` bookings `recurrence` apart, all or nothing.
 
@@ -316,6 +340,7 @@ class BookingService:
         if RECURRENCE_DAYS[recurrence] == 0:
             count = 1
         step = RECURRENCE_DAYS[recurrence] * 86400
+        event_name = clean_event_name(event_name)
         now = self.now_ts()
         slots = [
             (start_utc + i * step, end_utc + i * step) for i in range(count)
@@ -339,9 +364,9 @@ class BookingService:
                     conn.execute("ROLLBACK")
                     raise BookingOverlapError(_row_to_booking(row))
                 cursor = conn.execute(
-                    "INSERT INTO bookings (server_key, user_id, user_name, start_utc, end_utc, created_at, guild_id) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?)",
-                    (server_key, user_id, user_name, start, end, now, guild_id),
+                    "INSERT INTO bookings (server_key, user_id, user_name, start_utc, end_utc, created_at, guild_id, event_name) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    (server_key, user_id, user_name, start, end, now, guild_id, event_name),
                 )
                 bookings.append(
                     Booking(
@@ -353,6 +378,7 @@ class BookingService:
                         end,
                         now,
                         guild_id=guild_id,
+                        event_name=event_name,
                     )
                 )
             conn.execute("COMMIT")

@@ -30,7 +30,7 @@ from commands.booking import (
     is_booking_admin,
     refuse_unavailable,
 )
-from services.booking import MAX_OCCURRENCES, Booking
+from services.booking import EVENT_NAME_MAX_LENGTH, MAX_OCCURRENCES, Booking
 
 logger = logging.getLogger(__name__)
 
@@ -381,7 +381,10 @@ class BookingPickerView(_SelfClosingView):
         await self.redraw(interaction)
 
     async def _book(self, interaction: discord.Interaction):
-        # Deferring the button press keeps the picker as this interaction's original
+        await interaction.response.send_modal(EventNameModal(self))
+
+    async def submit(self, interaction: discord.Interaction, event_name: str | None):
+        # Deferring the modal submit keeps the picker as this interaction's original
         # response, so it can be deleted once the booking succeeds.
         await interaction.response.defer()
         booked = await book_and_reply(
@@ -392,10 +395,29 @@ class BookingPickerView(_SelfClosingView):
             str(self.duration),
             self.recurrence,
             self.count if self.recurrence != "none" else 1,
+            event_name=event_name,
         )
         if booked:
             self.close = interaction.delete_original_response
             await self.finish()
+
+
+class EventNameModal(discord.ui.Modal, title="Name this booking"):
+    """Last step of the picker: an optional event name, then the booking is made."""
+
+    event_name = discord.ui.TextInput(
+        label="Event name (optional)",
+        placeholder="Scrim vs 1st Para",
+        required=False,
+        max_length=EVENT_NAME_MAX_LENGTH,
+    )
+
+    def __init__(self, picker: BookingPickerView):
+        super().__init__()
+        self.picker = picker
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await self.picker.submit(interaction, self.event_name.value or None)
 
 
 # ---------------------------------------------------------------- management

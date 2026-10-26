@@ -765,11 +765,13 @@ def _panel_booking_lines(viewer_guild_id: int | None = None) -> dict[int, list[s
             if active is not None:
                 lines[index] = [
                     f"🔒 Booked by {_booked_by(active, viewer_guild_id)} · until <t:{active.end_utc}:t> (<t:{active.end_utc}:R>)"
+                    + (f"\n-# {discord.utils.escape_markdown(active.event_name)}" if active.event_name else "")
                 ]
                 continue
             if upcoming is not None:
                 lines[index] = [
                     f"📅 Next booking <t:{upcoming.start_utc}:R> · {_booked_by(upcoming, viewer_guild_id)}"
+                    + (f"\n-# {discord.utils.escape_markdown(upcoming.event_name)}" if upcoming.event_name else "")
                 ]
     except Exception as exc:
         print(f"Could not read bookings for the panel: {exc}")
@@ -792,18 +794,22 @@ def _panel_schedule_lines(viewer_guild_id: int | None = None) -> list[str] | Non
         print(f"Could not read the booking schedule for the panel: {exc}")
         return None
 
-    lines = []
+    entries = []
     for booking in bookings:
-        line = (
-            f"<t:{booking.start_utc}:f> → <t:{booking.end_utc}:t> · "
-            f"**{api_client.get_server_name_for_key(booking.server_key)}** · {_booked_by(booking, viewer_guild_id)}"
+        # Line 1: when (and the event name); line 2, indented as subtext: where and who.
+        when = f"**<t:{booking.start_utc}:f> → <t:{booking.end_utc}:t>**"
+        if booking.event_name:
+            when += f" · *{discord.utils.escape_markdown(booking.event_name)}*"
+        where = (
+            f"-# ↳ {api_client.get_server_name_for_key(booking.server_key)} · "
+            f"{_booked_by(booking, viewer_guild_id)}"
         )
         if booking.end_utc <= now:
-            line = f"~~{line}~~"
+            when = f"~~{when}~~"
         elif booking.start_utc <= now:
-            line = f"🔒 {line}"
-        lines.append(line)
-    return lines
+            when = f"🔒 {when}"
+        entries.append(f"{when}\n{where}")
+    return entries
 
 
 # Discord caps an embed field at 1024 characters and a whole embed at 6000.
@@ -812,8 +818,16 @@ _EMBED_TOTAL_LIMIT = 6000
 _SCHEDULE_MAX_CHARS = 3072
 
 
+# Blank line between schedule entries so each booking reads as its own block.
+_SCHEDULE_SEPARATOR = "\n\n"
+
+
 def _add_schedule_fields(embed: discord.Embed, lines: list[str]) -> None:
-    """Append the booking schedule as one or more fields, trimmed to fit Discord's embed limits."""
+    """Append the booking schedule as one or more fields, trimmed to fit Discord's embed limits.
+
+    Each item in `lines` is one booking (possibly several lines); items are separated by a
+    blank line and never split across fields.
+    """
     title = f"📅 Schedule · today + {SCHEDULE_DAYS - 1} days"
     if not lines:
         embed.add_field(
@@ -827,15 +841,16 @@ def _add_schedule_fields(embed: discord.Embed, lines: list[str]) -> None:
     chunks: list[list[str]] = [[]]
     used = chunk_len = 0
     shown = 0
+    gap = len(_SCHEDULE_SEPARATOR)
     for line in lines:
-        if used + len(line) + 1 > budget:
+        if used + len(line) + gap > budget:
             break
-        if chunk_len + len(line) + 1 > _EMBED_FIELD_LIMIT - 40:
+        if chunk_len + len(line) + gap > _EMBED_FIELD_LIMIT - 40:
             chunks.append([])
             chunk_len = 0
         chunks[-1].append(line)
-        chunk_len += len(line) + 1
-        used += len(line) + 1
+        chunk_len += len(line) + gap
+        used += len(line) + gap
         shown += 1
     if shown < len(lines):
         chunks[-1].append(f"…and {len(lines) - shown} more (see /bookings).")
@@ -844,7 +859,7 @@ def _add_schedule_fields(embed: discord.Embed, lines: list[str]) -> None:
         if chunk:
             embed.add_field(
                 name=title if number == 0 else "📅 (cont.)",
-                value="\n".join(chunk),
+                value=_SCHEDULE_SEPARATOR.join(chunk),
                 inline=False,
             )
 

@@ -426,3 +426,40 @@ class GuildColumnTests(unittest.TestCase):
             self.assertTrue(booking.manageable_by(2, False, admin_guild_id=7))
             self.assertFalse(booking.manageable_by(2, False, admin_guild_id=8))
             self.assertFalse(booking.manageable_by(2, False))
+
+
+class EventNameTests(unittest.TestCase):
+    def test_event_name_is_stored_cleaned_and_shared_by_a_series(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            service = BookingService(Path(tmp) / "b.db", clock=FakeClock())
+            series = service.create_series(
+                "server1", 1, "u", T0 + HOUR, T0 + 2 * HOUR, "weekly", 2,
+                event_name="  Scrim   vs\n1st Para  ",
+            )
+            unnamed = service.create("server2", 1, "u", T0 + HOUR, T0 + 2 * HOUR, event_name="   ")
+
+            self.assertEqual([b.event_name for b in series], ["Scrim vs 1st Para"] * 2)
+            self.assertEqual(service.get(series[1].id).event_name, "Scrim vs 1st Para")
+            self.assertIsNone(unnamed.event_name)
+            long = service.create("server3", 1, "u", T0 + HOUR, T0 + 2 * HOUR, event_name="x" * 100)
+            self.assertEqual(len(long.event_name), 60)
+
+    def test_store_without_event_column_is_upgraded(self):
+        import sqlite3
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Path(tmp) / "bookings.db"
+            conn = sqlite3.connect(db)
+            conn.executescript(
+                "CREATE TABLE bookings (id INTEGER PRIMARY KEY AUTOINCREMENT, server_key TEXT NOT NULL, "
+                "user_id INTEGER NOT NULL, user_name TEXT NOT NULL, start_utc INTEGER NOT NULL, "
+                "end_utc INTEGER NOT NULL, created_at INTEGER NOT NULL, cancelled_at INTEGER, "
+                "cancelled_by INTEGER, guild_id INTEGER);"
+            )
+            conn.close()
+
+            service = BookingService(db, clock=FakeClock())
+            self.assertEqual(
+                service.create("server1", 1, "u", T0 + HOUR, T0 + 2 * HOUR, event_name="Night ops").event_name,
+                "Night ops",
+            )

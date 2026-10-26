@@ -18,6 +18,7 @@ from discord import app_commands
 from services.guild_registry import GuildRegistry
 from services.booking import (
     DURATION_HINT,
+    EVENT_NAME_MAX_LENGTH,
     START_FORMAT_HINT,
     Booking,
     BookingConfig,
@@ -127,8 +128,9 @@ def timestamp(ts: int, style: str = "F") -> str:
 def describe_booking(
     booking: Booking, server_name: str, booked_by: str | None = None
 ) -> str:
+    named = f" *{discord.utils.escape_markdown(booking.event_name)}*" if booking.event_name else ""
     return (
-        f"#{booking.id} **{server_name}** — {booked_by or f'<@{booking.user_id}>'} "
+        f"#{booking.id} **{server_name}**{named} — {booked_by or f'<@{booking.user_id}>'} "
         f"{timestamp(booking.start_utc)} → {timestamp(booking.end_utc, 't')} ({timestamp(booking.start_utc, 'R')})"
     )
 
@@ -198,6 +200,7 @@ async def book_and_reply(
     duration: str,
     recurrence: str = "none",
     count: int = 1,
+    event_name: str | None = None,
 ) -> bool:
     """Create a booking (or recurring series) and reply; True if it was created. Shared by /book and the panel."""
     if not can_book(interaction.user, deps):
@@ -219,6 +222,7 @@ async def book_and_reply(
             recurrence=recurrence,
             count=count,
             guild_id=interaction.guild_id,
+            event_name=event_name,
         )
     except BookingOverlapError as exc:
         conflict = exc.conflict
@@ -246,9 +250,10 @@ async def book_and_reply(
 
     first = bookings[0]
     series = f" (+{len(bookings) - 1} more, {recurrence})" if len(bookings) > 1 else ""
+    named = f" for **{discord.utils.escape_markdown(first.event_name)}**" if first.event_name else ""
     await _reply(
         interaction,
-        f"✅ **{deps.server_name_for_key(server_key)}** booked {timestamp(first.start_utc)} → "
+        f"✅ **{deps.server_name_for_key(server_key)}** booked{named} {timestamp(first.start_utc)} → "
         f"{timestamp(first.end_utc, 't')} (booking #{first.id}){series}. "
         "During your slot only you and booking admins can change this server.",
     )
@@ -297,6 +302,7 @@ def register_booking_commands(
         server="Server to book",
         start=f"Start time ({START_FORMAT_HINT}, {deps.config.timezone.key})",
         duration=f"Length: {DURATION_HINT}",
+        event="Optional event name shown on the schedule, e.g. Scrim vs 1st Para",
     )
     @app_commands.choices(server=server_choices)
     async def book(
@@ -304,10 +310,13 @@ def register_booking_commands(
         server: app_commands.Choice[str],
         start: str,
         duration: str,
+        event: app_commands.Range[str, 1, EVENT_NAME_MAX_LENGTH] | None = None,
     ):
         if await refuse_unavailable(interaction, deps):
             return
-        await book_and_reply(interaction, deps, int(server.value), start, duration)
+        await book_and_reply(
+            interaction, deps, int(server.value), start, duration, event_name=event
+        )
 
     @tree.command(
         name="bookings", description="List active and upcoming server bookings"
