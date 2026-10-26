@@ -272,12 +272,6 @@ class ParsingTests(unittest.TestCase):
 
 
 class ConfigTests(unittest.TestCase):
-    def test_disabled_without_role(self):
-        config = BookingConfig.from_env({"DISCORD_GUILD_ID": "1"})
-
-        self.assertFalse(config.enabled)
-        self.assertIn("BOOKING_ROLE_ID", config.disabled_reason)
-
     def test_disabled_with_invalid_time_zone(self):
         config = BookingConfig.from_env(
             {"BOOKING_ROLE_ID": "123", "BOOKING_TIMEZONE": "Mars/Base", "DISCORD_GUILD_ID": "1"}
@@ -299,7 +293,7 @@ class ConfigTests(unittest.TestCase):
         })
 
         self.assertTrue(config.enabled)
-        self.assertEqual((config.role_id, config.admin_role_id, config.guild_id), (123, 456, 999))
+        self.assertEqual((config.admin_role_id, config.guild_id), (456, 999))
         self.assertEqual(config.timezone.key, "Australia/Sydney")
         self.assertEqual((config.max_duration_seconds, config.max_lead_seconds), (6 * HOUR, 14 * 86400))
 

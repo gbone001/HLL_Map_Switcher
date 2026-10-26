@@ -5,12 +5,13 @@ boundary tick refreshes only if a booking started or ended since the last tick, 
 idle bot does not edit the panel every minute. The daily refresh rolls the panel's
 two-week booking schedule forward to the new day.
 """
+
 from __future__ import annotations
 
 import asyncio
 import logging
+from collections.abc import Awaitable, Callable
 from datetime import time
-from typing import Awaitable, Callable, Optional
 
 from discord.ext import tasks
 
@@ -25,14 +26,18 @@ class BookingBoundaryRefresher:
         service: BookingService,
         refresh: Callable[[], Awaitable[None]],
         interval_seconds: float = 60.0,
-        daily_at: Optional[time] = None,
+        daily_at: time | None = None,
     ) -> None:
         """`daily_at` must be time-zone aware (e.g. 06:00 in the booking time zone)."""
         self.service = service
         self.refresh = refresh
         self._last_tick_ts = service.now_ts()
         self._loop = tasks.loop(seconds=interval_seconds)(self.tick)
-        self._daily_loop = tasks.loop(time=daily_at)(self.daily) if daily_at is not None else None
+        self._daily_loop = (
+            tasks.loop(time=daily_at)(self.daily)
+            if daily_at is not None
+            else None
+        )
 
     async def tick(self) -> bool:
         """Refresh the panel if a booking started or ended since the last successful tick.
@@ -42,7 +47,9 @@ class BookingBoundaryRefresher:
         """
         now = self.service.now_ts()
         try:
-            crossed = await asyncio.to_thread(self.service.has_boundary_between, self._last_tick_ts, now)
+            crossed = await asyncio.to_thread(
+                self.service.has_boundary_between, self._last_tick_ts, now
+            )
         except Exception:
             logger.exception("Booking boundary check failed; will retry")
             return False
@@ -50,7 +57,9 @@ class BookingBoundaryRefresher:
             try:
                 await self.refresh()
             except Exception:
-                logger.exception("Panel refresh after booking boundary failed; will retry")
+                logger.exception(
+                    "Panel refresh after booking boundary failed; will retry"
+                )
                 return False
         self._last_tick_ts = now
         return crossed
@@ -59,7 +68,9 @@ class BookingBoundaryRefresher:
         try:
             await self.refresh()
         except Exception:
-            logger.exception("Daily panel refresh failed; the next booking boundary or day will retry")
+            logger.exception(
+                "Daily panel refresh failed; the next booking boundary or day will retry"
+            )
             return False
         return True
 
@@ -76,4 +87,3 @@ class BookingBoundaryRefresher:
             self._loop.cancel()
         if self._daily_loop is not None and self._daily_loop.is_running():
             self._daily_loop.cancel()
-

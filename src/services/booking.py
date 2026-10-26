@@ -7,16 +7,17 @@ as half-open ranges [start, end), so back-to-back bookings do not overlap.
 This module has no Discord or CRCON dependencies; src/commands/booking.py and
 src/bot.py wire it into the bot.
 """
+
 from __future__ import annotations
 
 import os
 import re
 import sqlite3
+from collections.abc import Callable
 from contextlib import closing
 from dataclasses import dataclass
-from datetime import datetime, time, timedelta, timezone
+from datetime import UTC, datetime, time, timedelta
 from pathlib import Path
-from typing import Callable, Optional
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 DEFAULT_DB_PATH = Path(__file__).resolve().parents[2] / "data" / "bookings.db"
@@ -24,7 +25,10 @@ START_FORMAT = "%Y-%m-%d %H:%M"
 START_FORMAT_HINT = "YYYY-MM-DD HH:MM"
 DURATION_HINT = "minutes (e.g. 90) or hours/minutes (e.g. 2h, 1h30m)"
 
-_DURATION_PATTERN = re.compile(r"^\s*(?:(?P<hours>\d+)\s*h)?\s*(?:(?P<minutes>\d+)\s*m?)?\s*$", re.IGNORECASE)
+_DURATION_PATTERN = re.compile(
+    r"^\s*(?:(?P<hours>\d+)\s*h)?\s*(?:(?P<minutes>\d+)\s*m?)?\s*$",
+    re.IGNORECASE,
+)
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS bookings (
@@ -50,7 +54,7 @@ class BookingError(Exception):
 
 
 class BookingOverlapError(BookingError):
-    def __init__(self, conflict: "Booking"):
+    def __init__(self, conflict: Booking):
         super().__init__(f"Overlaps booking #{conflict.id}.")
         self.conflict = conflict
 
@@ -72,11 +76,14 @@ class Booking:
     start_utc: int
     end_utc: int
     created_at: int
-    cancelled_at: Optional[int] = None
-    cancelled_by: Optional[int] = None
+    cancelled_at: int | None = None
+    cancelled_by: int | None = None
 
     def is_active(self, now_ts: int) -> bool:
-        return self.cancelled_at is None and self.start_utc <= now_ts < self.end_utc
+        return (
+            self.cancelled_at is None
+            and self.start_utc <= now_ts < self.end_utc
+        )
 
 
 DEFAULT_MAX_HOURS = 24
@@ -87,26 +94,27 @@ SCHEDULE_DAYS = 14
 
 @dataclass(frozen=True)
 class BookingConfig:
-    """Booking is enabled only when BOOKING_ROLE_ID, DISCORD_GUILD_ID and BOOKING_TIMEZONE are valid.
+    """Booking is enabled when DISCORD_GUILD_ID and BOOKING_TIMEZONE are valid.
 
-    DISCORD_GUILD_ID is required because booking roles and admin rights only mean something
-    inside one guild; without it, admins of any guild the bot is in would count as booking admins.
+    DISCORD_GUILD_ID is required so booking is scoped to one guild.
+    Any member of that guild can book; BOOKING_ADMIN_ROLE_ID (or Discord Administrator)
+    grants permission to cancel any booking and bypass the booking lock.
     """
 
     enabled: bool
-    role_id: Optional[int]
-    admin_role_id: Optional[int]
     timezone: ZoneInfo
     db_path: Path
-    disabled_reason: Optional[str] = None
-    guild_id: Optional[int] = None
+    admin_role_id: int | None = None
+    role_id: int | None = None  # retained for backward compat, not used for access checks
+    disabled_reason: str | None = None
+    guild_id: int | None = None
     max_duration_seconds: int = DEFAULT_MAX_HOURS * 3600
     max_lead_seconds: int = DEFAULT_MAX_DAYS_AHEAD * 86400
     # Local time (in `timezone`) at which the panel's two-week schedule is re-rendered each day.
     panel_refresh_time: time = DEFAULT_PANEL_REFRESH_TIME
 
     @classmethod
-    def from_env(cls, environ: Optional[dict] = None) -> "BookingConfig":
+    def from_env(cls, environ: dict | None = None) -> BookingConfig:
         env = os.environ if environ is None else environ
         base = {
             "role_id": None,
@@ -114,30 +122,58 @@ class BookingConfig:
             "timezone": ZoneInfo("UTC"),
             "db_path": Path(env.get("BOOKING_DB_PATH") or DEFAULT_DB_PATH),
             "guild_id": _optional_int(env.get("DISCORD_GUILD_ID")),
-            "max_duration_seconds": _positive_int(env.get("BOOKING_MAX_HOURS"), DEFAULT_MAX_HOURS) * 3600,
-            "max_lead_seconds": _positive_int(env.get("BOOKING_MAX_DAYS_AHEAD"), DEFAULT_MAX_DAYS_AHEAD) * 86400,
-            "panel_refresh_time": _clock_time(env.get("BOOKING_PANEL_REFRESH_TIME"), DEFAULT_PANEL_REFRESH_TIME),
+            "max_duration_seconds": _positive_int(
+                env.get("BOOKING_MAX_HOURS"), DEFAULT_MAX_HOURS
+            )
+            * 3600,
+            "max_lead_seconds": _positive_int(
+                env.get("BOOKING_MAX_DAYS_AHEAD"), DEFAULT_MAX_DAYS_AHEAD
+            )
+            * 86400,
+            "panel_refresh_time": _clock_time(
+                env.get("BOOKING_PANEL_REFRESH_TIME"),
+                DEFAULT_PANEL_REFRESH_TIME,
+            ),
         }
 
-        def disabled(reason: str) -> "BookingConfig":
-            return cls(enabled=False, disabled_reason=reason, **base)
+        def disabled(reason: str) -> BookingConfig:
+                    return cls(
+                        enabled=False,
+                        timezone=base["timezone"],
+                        db_path=base["db_path"],
+                        disabled_reason=reason,
+                        role_id=base["role_id"],
+                        admin_role_id=base["admin_role_id"],
+                        guild_id=base["guild_id"],
+                        max_duration_seconds=base["max_duration_seconds"],
+                        max_lead_seconds=base["max_lead_seconds"],
+                        panel_refresh_time=base["panel_refresh_time"],
+                    )
 
         timezone_name = (env.get("BOOKING_TIMEZONE") or "UTC").strip()
         try:
             base["timezone"] = ZoneInfo(timezone_name)
         except (ZoneInfoNotFoundError, ValueError):
-            return disabled(f"BOOKING_TIMEZONE {timezone_name!r} is not a valid IANA time zone.")
+            return disabled(
+                f"BOOKING_TIMEZONE {timezone_name!r} is not a valid IANA time zone."
+            )
 
-        raw_role = (env.get("BOOKING_ROLE_ID") or "").strip()
-        if not raw_role:
-            return disabled("BOOKING_ROLE_ID is not set.")
-        base["role_id"] = _optional_int(raw_role)
-        if base["role_id"] is None:
-            return disabled(f"BOOKING_ROLE_ID {raw_role!r} is not a number.")
         if base["guild_id"] is None:
-            return disabled("DISCORD_GUILD_ID must be set so booking roles and admins are scoped to one guild.")
+            return disabled(
+                "DISCORD_GUILD_ID must be set so bookings are scoped to one guild."
+            )
 
-        return cls(enabled=True, **base)
+        return cls(
+                    enabled=True,
+                    timezone=base["timezone"],
+                    db_path=base["db_path"],
+                    role_id=base["role_id"],
+                    admin_role_id=base["admin_role_id"],
+                    guild_id=base["guild_id"],
+                    max_duration_seconds=base["max_duration_seconds"],
+                    max_lead_seconds=base["max_lead_seconds"],
+                    panel_refresh_time=base["panel_refresh_time"],
+                )
 
 
 def parse_start(text: str, tz: ZoneInfo) -> int:
@@ -150,10 +186,17 @@ def parse_start(text: str, tz: ZoneInfo) -> int:
     local = naive.replace(tzinfo=tz)
     # A local time inside a DST spring-forward gap doesn't round-trip; one inside the
     # fall-back hour has two valid UTC offsets. Reject both rather than guess.
-    if datetime.fromtimestamp(local.timestamp(), tz).replace(tzinfo=None) != naive:
-        raise BookingError(f"{text.strip()} doesn't exist in {tz.key} (clocks skip it for daylight saving).")
+    if (
+        datetime.fromtimestamp(local.timestamp(), tz).replace(tzinfo=None)
+        != naive
+    ):
+        raise BookingError(
+            f"{text.strip()} doesn't exist in {tz.key} (clocks skip it for daylight saving)."
+        )
     if local.utcoffset() != naive.replace(tzinfo=tz, fold=1).utcoffset():
-        raise BookingError(f"{text.strip()} happens twice in {tz.key} (daylight saving ends); pick another time.")
+        raise BookingError(
+            f"{text.strip()} happens twice in {tz.key} (daylight saving ends); pick another time."
+        )
     return int(local.timestamp())
 
 
@@ -162,13 +205,18 @@ def parse_duration(text: str) -> int:
     match = _DURATION_PATTERN.match(text or "")
     if not match or not (match.group("hours") or match.group("minutes")):
         raise BookingError(f"Duration must be {DURATION_HINT}.")
-    seconds = int(match.group("hours") or 0) * 3600 + int(match.group("minutes") or 0) * 60
+    seconds = (
+        int(match.group("hours") or 0) * 3600
+        + int(match.group("minutes") or 0) * 60
+    )
     if seconds <= 0:
         raise BookingError("Duration must be greater than zero.")
     return seconds
 
 
-def schedule_window(now_ts: int, tz: ZoneInfo, days: int = SCHEDULE_DAYS) -> tuple[int, int]:
+def schedule_window(
+    now_ts: int, tz: ZoneInfo, days: int = SCHEDULE_DAYS
+) -> tuple[int, int]:
     """[start of today, start of the day `days` later) in the booking time zone, as UTC epoch seconds."""
     today = datetime.fromtimestamp(now_ts, tz).date()
     start = datetime.combine(today, time(0, 0), tzinfo=tz)
@@ -184,9 +232,9 @@ class BookingService:
     def __init__(
         self,
         db_path: Path,
-        clock: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
-        max_duration_seconds: Optional[int] = None,
-        max_lead_seconds: Optional[int] = None,
+        clock: Callable[[], datetime] = lambda: datetime.now(UTC),
+        max_duration_seconds: int | None = None,
+        max_lead_seconds: int | None = None,
     ):
         self.db_path = Path(db_path)
         self._clock = clock
@@ -199,17 +247,31 @@ class BookingService:
     def now_ts(self) -> int:
         return int(self._clock().timestamp())
 
-    def create(self, server_key: str, user_id: int, user_name: str, start_utc: int, end_utc: int) -> Booking:
+    def create(
+        self,
+        server_key: str,
+        user_id: int,
+        user_name: str,
+        start_utc: int,
+        end_utc: int,
+    ) -> Booking:
         """Insert a booking unless it is invalid or overlaps a live booking on the same server."""
         now = self.now_ts()
         if end_utc <= start_utc:
             raise BookingError("The booking must end after it starts.")
         if start_utc < now - 60:
             raise BookingError("The start time is in the past.")
-        if self.max_duration_seconds and end_utc - start_utc > self.max_duration_seconds:
-            raise BookingError(f"Bookings can be at most {self.max_duration_seconds // 3600} hours long.")
+        if (
+            self.max_duration_seconds
+            and end_utc - start_utc > self.max_duration_seconds
+        ):
+            raise BookingError(
+                f"Bookings can be at most {self.max_duration_seconds // 3600} hours long."
+            )
         if self.max_lead_seconds and start_utc - now > self.max_lead_seconds:
-            raise BookingError(f"Bookings can start at most {self.max_lead_seconds // 86400} days ahead.")
+            raise BookingError(
+                f"Bookings can start at most {self.max_lead_seconds // 86400} days ahead."
+            )
 
         conn = self._connect()
         try:
@@ -235,12 +297,14 @@ class BookingService:
             conn.close()
         return self.get(booking_id)
 
-    def get(self, booking_id: int) -> Optional[Booking]:
+    def get(self, booking_id: int) -> Booking | None:
         with closing(self._connect()) as conn:
-            row = conn.execute(f"SELECT {_COLUMNS} FROM bookings WHERE id = ?", (booking_id,)).fetchone()
+            row = conn.execute(
+                f"SELECT {_COLUMNS} FROM bookings WHERE id = ?", (booking_id,)
+            ).fetchone()
         return _row_to_booking(row) if row else None
 
-    def list_live(self, server_key: Optional[str] = None) -> list[Booking]:
+    def list_live(self, server_key: str | None = None) -> list[Booking]:
         """Bookings that are active or upcoming, earliest first."""
         query = f"SELECT {_COLUMNS} FROM bookings WHERE {_LIVE}"
         params: list = [self.now_ts()]
@@ -249,9 +313,12 @@ class BookingService:
             params.append(server_key)
         query += " ORDER BY start_utc"
         with closing(self._connect()) as conn:
-            return [_row_to_booking(row) for row in conn.execute(query, params).fetchall()]
+            return [
+                _row_to_booking(row)
+                for row in conn.execute(query, params).fetchall()
+            ]
 
-    def active_for(self, server_key: str) -> Optional[Booking]:
+    def active_for(self, server_key: str) -> Booking | None:
         now = self.now_ts()
         with closing(self._connect()) as conn:
             row = conn.execute(
@@ -261,10 +328,12 @@ class BookingService:
             ).fetchone()
         return _row_to_booking(row) if row else None
 
-    def summary_by_server(self) -> dict[str, tuple[Optional[Booking], Optional[Booking]]]:
+    def summary_by_server(
+        self,
+    ) -> dict[str, tuple[Booking | None, Booking | None]]:
         """(active, next) booking per server key, from a single query."""
         now = self.now_ts()
-        summary: dict[str, tuple[Optional[Booking], Optional[Booking]]] = {}
+        summary: dict[str, tuple[Booking | None, Booking | None]] = {}
         for booking in self.list_live():  # earliest first
             active, upcoming = summary.get(booking.server_key, (None, None))
             if booking.start_utc <= now and active is None:
@@ -274,7 +343,9 @@ class BookingService:
             summary[booking.server_key] = (active, upcoming)
         return summary
 
-    def blocking_booking(self, server_key: str, user_id: int, is_admin: bool) -> Optional[Booking]:
+    def blocking_booking(
+        self, server_key: str, user_id: int, is_admin: bool
+    ) -> Booking | None:
         """The booking that stops this user writing to this server right now, if any."""
         if is_admin:
             return None
@@ -283,12 +354,22 @@ class BookingService:
             return None
         return active
 
-    def cancel(self, booking_id: int, actor_id: int, is_admin: bool) -> Booking:
+    def cancel(
+        self, booking_id: int, actor_id: int, is_admin: bool
+    ) -> Booking:
         booking = self.get(booking_id)
-        if booking is None or booking.cancelled_at is not None or booking.end_utc <= self.now_ts():
-            raise BookingNotFoundError(f"Booking #{booking_id} was not found or has already ended.")
+        if (
+            booking is None
+            or booking.cancelled_at is not None
+            or booking.end_utc <= self.now_ts()
+        ):
+            raise BookingNotFoundError(
+                f"Booking #{booking_id} was not found or has already ended."
+            )
         if booking.user_id != actor_id and not is_admin:
-            raise BookingPermissionError(f"Booking #{booking_id} is not yours.")
+            raise BookingPermissionError(
+                f"Booking #{booking_id} is not yours."
+            )
         with closing(self._connect()) as conn:
             cursor = conn.execute(
                 "UPDATE bookings SET cancelled_at = ?, cancelled_by = ? WHERE id = ? AND cancelled_at IS NULL",
@@ -296,7 +377,9 @@ class BookingService:
             )
         if cursor.rowcount == 0:
             # Someone else cancelled it between the read above and this update.
-            raise BookingNotFoundError(f"Booking #{booking_id} was not found or has already ended.")
+            raise BookingNotFoundError(
+                f"Booking #{booking_id} was not found or has already ended."
+            )
         return self.get(booking_id)
 
     def list_window(self, since_ts: int, until_ts: int) -> list[Booking]:
@@ -328,19 +411,23 @@ def _row_to_booking(row: tuple) -> Booking:
     return Booking(*row)
 
 
-def _positive_int(value: Optional[str], default: int) -> int:
+def _positive_int(value: str | None, default: int) -> int:
     parsed = _optional_int(value)
     return parsed if parsed is not None and parsed > 0 else default
 
 
-def _clock_time(value: Optional[str], default: time) -> time:
+def _clock_time(value: str | None, default: time) -> time:
     try:
-        return datetime.strptime(str(value).strip(), "%H:%M").time() if value not in (None, "") else default
+        return (
+            datetime.strptime(str(value).strip(), "%H:%M").time()
+            if value not in (None, "")
+            else default
+        )
     except ValueError:
         return default
 
 
-def _optional_int(value: Optional[str]) -> Optional[int]:
+def _optional_int(value: str | None) -> int | None:
     try:
         return int(str(value).strip()) if value not in (None, "") else None
     except ValueError:

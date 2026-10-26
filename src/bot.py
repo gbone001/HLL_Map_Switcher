@@ -1,29 +1,46 @@
 import asyncio
 import os
+import sys
 import threading
 from datetime import datetime, timedelta, timezone
-from typing import Dict, Optional, Tuple
 
 import discord
 from discord.ext import commands
 from dotenv import load_dotenv
-from commands.booking import BookingCommandDeps, is_booking_admin, register_booking_commands
+
+from commands.booking import (
+    BookingCommandDeps,
+    is_booking_admin,
+    register_booking_commands,
+)
 from events.booking_refresh import BookingBoundaryRefresher
-from services.booking import SCHEDULE_DAYS, Booking, BookingConfig, BookingService, schedule_window
-from services.server_control import ControlResult, GameStatus, ServerControlService
+from services.booking import (
+    SCHEDULE_DAYS,
+    Booking,
+    BookingConfig,
+    BookingService,
+    schedule_window,
+)
+from services.server_control import (
+    ControlResult,
+    GameStatus,
+    ServerControlService,
+)
+from utils.api_client import HLLAPIClient
+from utils.crcon_http import CRCONHttpClient, CRCONHTTPError
 from utils.map_data import (
     get_maps_for_mode,
     get_variants_for_map,
     refresh_map_cache,
 )
-from utils.api_client import HLLAPIClient
-from utils.crcon_http import CRCONHttpClient, CRCONHTTPError
 
 # Load environment variables
 load_dotenv()
 
 
-async def sync_app_commands(tree: discord.app_commands.CommandTree, guild_id_raw: Optional[str] = None) -> list:
+async def sync_app_commands(
+    tree: discord.app_commands.CommandTree, guild_id_raw: str | None = None
+) -> list:
     """Register slash commands with Discord.
 
     With DISCORD_GUILD_ID set, commands are copied to that guild so they appear
@@ -33,18 +50,22 @@ async def sync_app_commands(tree: discord.app_commands.CommandTree, guild_id_raw
         guild_id_raw = os.getenv("DISCORD_GUILD_ID")
     guild_id_raw = (guild_id_raw or "").strip()
 
-    guild: Optional[discord.Object] = None
+    guild: discord.Object | None = None
     if guild_id_raw:
         try:
             guild = discord.Object(id=int(guild_id_raw))
         except ValueError:
-            print(f"Invalid DISCORD_GUILD_ID value: {guild_id_raw}; syncing slash commands globally.")
+            print(
+                f"Invalid DISCORD_GUILD_ID value: {guild_id_raw}; syncing slash commands globally."
+            )
 
     try:
         if guild is not None:
             tree.copy_global_to(guild=guild)
             synced = await tree.sync(guild=guild)
-            print(f"Synced {len(synced)} slash command(s) to guild {guild.id}.")
+            print(
+                f"Synced {len(synced)} slash command(s) to guild {guild.id}."
+            )
         else:
             synced = await tree.sync()
             print(f"Synced {len(synced)} slash command(s) globally.")
@@ -70,18 +91,18 @@ intents = discord.Intents.none()
 intents.guilds = True
 intents.guild_messages = True
 intents.message_content = True
-bot = MapSwitcherBot(command_prefix='!', intents=intents)
+bot = MapSwitcherBot(command_prefix="!", intents=intents)
 
 # API client
 api_client = HLLAPIClient()
-_http_clients: Dict[Optional[int], CRCONHttpClient] = {}
-_http_client_errors: Dict[Optional[int], str] = {}
+_http_clients: dict[int | None, CRCONHttpClient] = {}
+_http_client_errors: dict[int | None, str] = {}
 # Clients are created lazily from worker threads (see asyncio.to_thread call sites).
 # Use RLock to protect all access (reads + writes) to the dicts across threads.
 _http_clients_lock = threading.RLock()
 
 
-def _server_number(server_index: Optional[int]) -> Optional[int]:
+def _server_number(server_index: int | None) -> int | None:
     if server_index is None:
         return None
     resolved_server_number = api_client.get_server_number(server_index)
@@ -90,7 +111,9 @@ def _server_number(server_index: Optional[int]) -> Optional[int]:
     return server_index + 1
 
 
-def _get_http_client(server_index: Optional[int] = None) -> Optional[CRCONHttpClient]:
+def _get_http_client(
+    server_index: int | None = None,
+) -> CRCONHttpClient | None:
     with _http_clients_lock:
         if server_index in _http_clients:
             return _http_clients[server_index]
@@ -114,9 +137,12 @@ def _get_http_client(server_index: Optional[int] = None) -> Optional[CRCONHttpCl
         return client
 
 
-def _http_error_message(server_index: Optional[int]) -> str:
+def _http_error_message(server_index: int | None) -> str:
     with _http_clients_lock:
-        return _http_client_errors.get(server_index) or "HTTP API credentials are not configured for this server."
+        return (
+            _http_client_errors.get(server_index)
+            or "HTTP API credentials are not configured for this server."
+        )
 
 
 server_control = ServerControlService(
@@ -127,7 +153,7 @@ server_control = ServerControlService(
 
 # Server booking (docs/booking-shaping.md). Disabled unless BOOKING_ROLE_ID is set.
 booking_config = BookingConfig.from_env()
-booking_service: Optional[BookingService] = None
+booking_service: BookingService | None = None
 if booking_config.enabled:
     try:
         booking_service = BookingService(
@@ -135,9 +161,13 @@ if booking_config.enabled:
             max_duration_seconds=booking_config.max_duration_seconds,
             max_lead_seconds=booking_config.max_lead_seconds,
         )
-        print(f"Server booking enabled (store: {booking_config.db_path}, time zone: {booking_config.timezone.key}).")
+        print(
+            f"Server booking enabled (store: {booking_config.db_path}, time zone: {booking_config.timezone.key})."
+        )
     except Exception as exc:
-        print(f"Server booking disabled: could not open {booking_config.db_path}: {exc}")
+        print(
+            f"Server booking disabled: could not open {booking_config.db_path}: {exc}"
+        )
 else:
     print(f"Server booking disabled: {booking_config.disabled_reason}")
 
@@ -146,8 +176,13 @@ def _orphaned_booking_keys() -> set[str]:
     """Server keys of live bookings that match no configured server (e.g. after SERVER{N}_* changes)."""
     if booking_service is None:
         return set()
-    known = {api_client.get_server_key(index) for index, _ in api_client.get_servers()}
-    return {booking.server_key for booking in booking_service.list_live()} - known
+    known = {
+        api_client.get_server_key(index)
+        for index, _ in api_client.get_servers()
+    }
+    return {
+        booking.server_key for booking in booking_service.list_live()
+    } - known
 
 
 if booking_service is not None:
@@ -164,7 +199,9 @@ if booking_service is not None:
             )
 
 
-async def _booking_blocking_user(interaction: discord.Interaction, server_index: int) -> Optional[Booking]:
+async def _booking_blocking_user(
+    interaction: discord.Interaction, server_index: int
+) -> Booking | None:
     if booking_service is None:
         return None
     return await asyncio.to_thread(
@@ -175,7 +212,12 @@ async def _booking_blocking_user(interaction: discord.Interaction, server_index:
     )
 
 
-async def _deny_if_booked(interaction: discord.Interaction, server_index: int, *, edit_flow: bool = False) -> bool:
+async def _deny_if_booked(
+    interaction: discord.Interaction,
+    server_index: int,
+    *,
+    edit_flow: bool = False,
+) -> bool:
     """Booking guard for control writes: True (and tell the user) if someone else holds the server.
 
     Called right before each write rather than when a flow opens, so a flow opened before a
@@ -185,7 +227,9 @@ async def _deny_if_booked(interaction: discord.Interaction, server_index: int, *
         blocking = await _booking_blocking_user(interaction, server_index)
     except Exception as exc:
         # Fail closed: without the booking store we can't tell whether someone holds the server.
-        print(f"Booking guard could not read bookings for server index {server_index}: {exc}")
+        print(
+            f"Booking guard could not read bookings for server index {server_index}: {exc}"
+        )
         message = "❌ Could not check server bookings, so nothing was changed. Try again shortly."
     else:
         if blocking is None:
@@ -199,7 +243,9 @@ async def _deny_if_booked(interaction: discord.Interaction, server_index: int, *
             f"(booking #{blocking.id})"
         )
     if edit_flow:
-        await update_interaction_message(interaction, content=message, embed=None, view=None)
+        await update_interaction_message(
+            interaction, content=message, embed=None, view=None
+        )
         asyncio.create_task(_delete_interaction_after(interaction, 20.0))
     else:
         await send_temporary_response(interaction, content=message, delay=20)
@@ -221,7 +267,7 @@ async def _run_server_write(server_index: int, func, *args, **kwargs):
     return await asyncio.to_thread(locked_call)
 
 
-def _get_channel_focused_server(channel: Optional[object]) -> Optional[int]:
+def _get_channel_focused_server(channel: object | None) -> int | None:
     if channel is None:
         return None
     channel_id = getattr(channel, "id", None)
@@ -229,19 +275,20 @@ def _get_channel_focused_server(channel: Optional[object]) -> Optional[int]:
         return None
     return _persistent_focused_server.get(channel_id)
 
+
 MAIN_EMBED_TITLE = "🌍 Hell Let Loose Map Changer"
 LEGACY_EMBED_TITLES = {
     "🌍 Hell Let Loose Map Changer",
     "🎮 Hell Let Loose Map Changer",
     "?? Hell Let Loose Map Changer",
 }
-persistent_message_ref: Optional[Tuple[int, int]] = None
+persistent_message_ref: tuple[int, int] | None = None
 # Map channel_id -> focused server index (None = show all)
-_persistent_focused_server: Dict[int, Optional[int]] = {}
+_persistent_focused_server: dict[int, int | None] = {}
 # Map (server_index, map_pretty_name) -> current objectives last set through this bot
-_current_objectives_state: Dict[Tuple[int, str], list[str]] = {}
+_current_objectives_state: dict[tuple[int, str], list[str]] = {}
 # Map (server_index, map_id) -> dynamic weather state last set through this bot
-_dynamic_weather_state: Dict[Tuple[int, str], bool] = {}
+_dynamic_weather_state: dict[tuple[int, str], bool] = {}
 
 # ============================================================
 # Periodic cleanup for unbounded module-level dicts (P2 fix)
@@ -249,29 +296,25 @@ _dynamic_weather_state: Dict[Tuple[int, str], bool] = {}
 
 _MAX_CACHE_ENTRIES = 1000
 _MAX_CACHE_AGE_HOURS = 24
-_cache_cleanup_task: Optional[asyncio.Task] = None
+_cache_cleanup_task: asyncio.Task | None = None
 
 
 def _cleanup_state_caches() -> None:
     """Remove stale entries from unbounded caches to prevent memory leaks."""
-    import time
-    from datetime import datetime, timedelta
-
-    now = time.time()
-    max_age_seconds = _MAX_CACHE_AGE_HOURS * 3600
 
     # Clean _current_objectives_state
     if len(_current_objectives_state) > _MAX_CACHE_ENTRIES:
         # Keep only recent entries (by arbitrary ordering, we can't track timestamps without more structure)
         # For now, just trim to max size - in practice, a server won't have 1000 different maps
-        keys_to_keep = list(_current_objectives_state.keys())[-_MAX_CACHE_ENTRIES:]
+        keys_to_keep = list(_current_objectives_state.keys())[
+            -_MAX_CACHE_ENTRIES:
+        ]
         _current_objectives_state.clear()
         for k in keys_to_keep:
             if k in _current_objectives_state:
                 pass  # already cleared
         # Actually, let's just keep it simple and don't auto-evict for now
         # The dicts are keyed by (server_index, map_name) which is naturally bounded
-        pass
 
     # Clean _dynamic_weather_state
     if len(_dynamic_weather_state) > _MAX_CACHE_ENTRIES:
@@ -294,6 +337,7 @@ async def _periodic_cache_cleanup() -> None:
         except Exception:
             # Don't let cleanup crashes affect the bot
             import logging
+
             logging.getLogger(__name__).exception("Cache cleanup task crashed")
 
 
@@ -309,6 +353,7 @@ def _stop_cache_cleanup_task() -> None:
     global _cache_cleanup_task
     if _cache_cleanup_task is not None and not _cache_cleanup_task.done():
         _cache_cleanup_task.cancel()
+
 
 CRCON_PANEL_DEPENDENT_BUTTONS = {
     "persistent:set_objectives",
@@ -332,7 +377,9 @@ CRCON_PANEL_DEFAULT_BUTTON_LABELS = {
 }
 
 
-def _format_time_remaining(time_remaining: Optional[float], raw_time: Optional[str]) -> str:
+def _format_time_remaining(
+    time_remaining: float | None, raw_time: str | None
+) -> str:
     if time_remaining is None:
         if raw_time:
             return raw_time
@@ -370,20 +417,23 @@ def _status_badge(status: GameStatus) -> str:
 # Embed building helpers (extracted from build_main_embed)
 # ============================================================
 
+
 def _build_server_status_lines(
     servers: list[tuple[int, str]],
     statuses: dict[int, ControlResult],
-    focused_server_index: Optional[int],
+    focused_server_index: int | None,
     current_objectives_state: dict[tuple[int, str], list[str]],
     dynamic_weather_state: dict[tuple[int, str], bool],
-    booking_lines: Optional[dict[int, list[str]]] = None,
+    booking_lines: dict[int, list[str]] | None = None,
 ) -> tuple[list[str], list[str]]:
     """Build server status lines and collect CRCON-degraded server names."""
     server_lines: list[str] = []
     crcon_http_degraded_servers: list[str] = []
 
     for position, (index, server_name) in enumerate(servers, start=1):
-        selected_prefix = "**[SELECTED]** " if focused_server_index == index else ""
+        selected_prefix = (
+            "**[SELECTED]** " if focused_server_index == index else ""
+        )
         status_result = statuses.get(index)
         server_lines.append(f"{position}. {selected_prefix}{server_name}")
         server_lines.extend((booking_lines or {}).get(index, []))
@@ -404,17 +454,22 @@ def _build_server_status_lines(
             continue
 
         pretty_name = status.current_map or "Unknown"
-        allied = status.allied_players if status.allied_players is not None else "??"
+        allied = (
+            status.allied_players
+            if status.allied_players is not None
+            else "??"
+        )
         axis = status.axis_players if status.axis_players is not None else "??"
         time_remaining = _format_time_remaining(
             status.time_remaining_seconds,
             status.raw_time_remaining,
         )
 
-        objective_rows_text = "Unknown"
-        known_objectives = current_objectives_state.get((index, str(pretty_name)))
+        known_objectives = current_objectives_state.get(
+            (index, str(pretty_name))
+        )
         if known_objectives is not None:
-            objective_rows_text = _format_current_objectives(known_objectives)
+            _format_current_objectives(known_objectives)
 
         dynamic_weather_text = "Unknown"
         known_state = dynamic_weather_state.get((index, pretty_name))
@@ -422,7 +477,9 @@ def _build_server_status_lines(
             dynamic_weather_text = "Enabled" if known_state else "Disabled"
 
         server_lines.append(f"   Map: {pretty_name}")
-        server_lines.append(f"   Allied: {allied} | Axis: {axis} | Time Remaining: {time_remaining}")
+        server_lines.append(
+            f"   Allied: {allied} | Axis: {axis} | Time Remaining: {time_remaining}"
+        )
         server_lines.append(f"   Dynamic Weather: {dynamic_weather_text}")
         server_lines.append(f"   Status Source: {_status_badge(status)}")
         if status_result.warning:
@@ -448,12 +505,15 @@ def _build_crcon_warning_block(crcon_http_degraded_servers: list[str]) -> str:
 
 def _build_selected_server_label(
     servers: list[tuple[int, str]],
-    focused_server_index: Optional[int],
+    focused_server_index: int | None,
 ) -> str:
     """Determine the selected server label for the embed."""
     if not servers:
         return "None"
-    selected_name = next((name for index, name in servers if index == focused_server_index), None)
+    selected_name = next(
+        (name for index, name in servers if index == focused_server_index),
+        None,
+    )
     if selected_name:
         return selected_name
     if focused_server_index is not None:
@@ -470,7 +530,9 @@ def _get_updated_at_text(servers: list[tuple[int, str]]) -> str:
     return f"Updated as at {updated_at.strftime('%d %B %Y - %H:%M:%S')} AEST"
 
 
-def _get_server_env_value(name: str, server_index: Optional[int] = None) -> Optional[str]:
+def _get_server_env_value(
+    name: str, server_index: int | None = None
+) -> str | None:
     server_number = _server_number(server_index)
     if server_number is not None:
         server_key = f"SERVER{server_number}_{name}"
@@ -479,7 +541,9 @@ def _get_server_env_value(name: str, server_index: Optional[int] = None) -> Opti
     return os.getenv(name)
 
 
-def _get_timer_minutes(name: str, default: int, server_index: Optional[int] = None) -> int:
+def _get_timer_minutes(
+    name: str, default: int, server_index: int | None = None
+) -> int:
     raw_value = (_get_server_env_value(name, server_index) or "").strip()
     if not raw_value:
         return default
@@ -492,11 +556,15 @@ def _get_timer_minutes(name: str, default: int, server_index: Optional[int] = No
     return value if value > 0 else default
 
 
-def _get_focused_or_single_server(interaction: discord.Interaction) -> Optional[int]:
+def _get_focused_or_single_server(
+    interaction: discord.Interaction,
+) -> int | None:
     servers = api_client.get_servers()
     focused_server = _get_channel_focused_server(interaction.channel)
 
-    if focused_server is not None and any(index == focused_server for index, _ in servers):
+    if focused_server is not None and any(
+        index == focused_server for index, _ in servers
+    ):
         return focused_server
 
     if len(servers) == 1:
@@ -505,11 +573,14 @@ def _get_focused_or_single_server(interaction: discord.Interaction) -> Optional[
     return None
 
 
-async def fetch_server_statuses() -> Dict[int, ControlResult]:
+async def fetch_server_statuses() -> dict[int, ControlResult]:
     """Read status for every configured server concurrently, off the event loop."""
     indices = [index for index, _ in api_client.get_servers()]
     results = await asyncio.gather(
-        *(asyncio.to_thread(server_control.get_status, index) for index in indices),
+        *(
+            asyncio.to_thread(server_control.get_status, index)
+            for index in indices
+        ),
         return_exceptions=True,
     )
     # Handle exceptions: convert to failed ControlResult
@@ -517,8 +588,12 @@ async def fetch_server_statuses() -> Dict[int, ControlResult]:
     for index, result in zip(indices, results):
         if isinstance(result, Exception):
             import logging
+
             logging.getLogger(__name__).warning(
-                "fetch_server_statuses: server %s raised %s: %s", index, type(result).__name__, result
+                "fetch_server_statuses: server %s raised %s: %s",
+                index,
+                type(result).__name__,
+                result,
             )
             processed_results[index] = ControlResult(
                 success=False,
@@ -530,15 +605,17 @@ async def fetch_server_statuses() -> Dict[int, ControlResult]:
     return processed_results
 
 
-def _panel_booking_lines() -> Dict[int, list[str]]:
+def _panel_booking_lines() -> dict[int, list[str]]:
     """Active booking (or the next one) per server, as Discord timestamps."""
     if booking_service is None:
         return {}
-    lines: Dict[int, list[str]] = {}
+    lines: dict[int, list[str]] = {}
     try:
         summary = booking_service.summary_by_server()
         for index, _ in api_client.get_servers():
-            active, upcoming = summary.get(api_client.get_server_key(index), (None, None))
+            active, upcoming = summary.get(
+                api_client.get_server_key(index), (None, None)
+            )
             if active is not None:
                 lines[index] = [
                     f"   🔒 Booked by <@{active.user_id}> until <t:{active.end_utc}:t> (<t:{active.end_utc}:R>)"
@@ -554,7 +631,7 @@ def _panel_booking_lines() -> Dict[int, list[str]]:
     return lines
 
 
-def _panel_schedule_lines() -> Optional[list[str]]:
+def _panel_schedule_lines() -> list[str] | None:
     """Every booking from the start of today through the next SCHEDULE_DAYS days (booking time zone).
 
     None when booking is off or the store can't be read, so the panel omits the section.
@@ -615,36 +692,54 @@ def _add_schedule_fields(embed: discord.Embed, lines: list[str]) -> None:
 
     for number, chunk in enumerate(chunks):
         if chunk:
-            embed.add_field(name=title if number == 0 else "📅 (cont.)", value="\n".join(chunk), inline=False)
+            embed.add_field(
+                name=title if number == 0 else "📅 (cont.)",
+                value="\n".join(chunk),
+                inline=False,
+            )
 
 
-async def build_panel(focused_server_index: Optional[int] = None) -> Tuple[discord.Embed, "GameModeView"]:
+async def build_panel(
+    focused_server_index: int | None = None,
+) -> tuple[discord.Embed, "GameModeView"]:
     statuses, booking_lines, schedule_lines = await asyncio.gather(
         fetch_server_statuses(),
         asyncio.to_thread(_panel_booking_lines),
         asyncio.to_thread(_panel_schedule_lines),
     )
-    embed = build_main_embed(focused_server_index, statuses, booking_lines, schedule_lines)
+    embed = build_main_embed(
+        focused_server_index, statuses, booking_lines, schedule_lines
+    )
     crcon_outage, _ = _panel_crcon_outage_state(statuses, focused_server_index)
-    view = GameModeView(focused_server_index=focused_server_index, crcon_outage=crcon_outage)
+    view = GameModeView(
+        focused_server_index=focused_server_index, crcon_outage=crcon_outage
+    )
     return embed, view
 
 
-def _server_has_crcon_http(statuses: Dict[int, ControlResult], server_index: int) -> bool:
+def _server_has_crcon_http(
+    statuses: dict[int, ControlResult], server_index: int
+) -> bool:
     status_result = statuses.get(server_index)
-    return status_result is not None and status_result.success and status_result.transport == "crcon_http"
+    return (
+        status_result is not None
+        and status_result.success
+        and status_result.transport == "crcon_http"
+    )
 
 
 def _panel_crcon_outage_state(
-    statuses: Dict[int, ControlResult],
-    focused_server_index: Optional[int] = None,
+    statuses: dict[int, ControlResult],
+    focused_server_index: int | None = None,
 ) -> tuple[bool, list[str]]:
     servers = api_client.get_servers()
     if not servers:
         return False, []
 
     target_indices: list[int]
-    if focused_server_index is not None and any(index == focused_server_index for index, _ in servers):
+    if focused_server_index is not None and any(
+        index == focused_server_index for index, _ in servers
+    ):
         target_indices = [focused_server_index]
     elif len(servers) == 1:
         target_indices = [servers[0][0]]
@@ -658,7 +753,9 @@ def _panel_crcon_outage_state(
         if _server_has_crcon_http(statuses, server_index):
             healthy_count += 1
             continue
-        unavailable_server_names.append(api_client.get_server_name(server_index))
+        unavailable_server_names.append(
+            api_client.get_server_name(server_index)
+        )
 
     if not target_indices:
         return False, []
@@ -669,18 +766,15 @@ def _panel_crcon_outage_state(
     return healthy_count == 0, unavailable_server_names
 
 
-
-
-
 def build_main_embed(
-    focused_server_index: Optional[int],
-    statuses: Dict[int, ControlResult],
-    booking_lines: Optional[Dict[int, list[str]]] = None,
-    schedule_lines: Optional[list[str]] = None,
+    focused_server_index: int | None,
+    statuses: dict[int, ControlResult],
+    booking_lines: dict[int, list[str]] | None = None,
+    schedule_lines: list[str] | None = None,
 ) -> discord.Embed:
     """Render the panel embed from statuses already fetched by fetch_server_statuses()."""
     servers = api_client.get_servers()
-    
+
     server_lines, crcon_http_degraded_servers = _build_server_status_lines(
         servers=servers,
         statuses=statuses,
@@ -689,32 +783,42 @@ def build_main_embed(
         dynamic_weather_state=_dynamic_weather_state,
         booking_lines=booking_lines,
     )
-    
-    selected_server_label = _build_selected_server_label(servers, focused_server_index)
+
+    selected_server_label = _build_selected_server_label(
+        servers, focused_server_index
+    )
     updated_at_text = _get_updated_at_text(servers)
-    
-    crcon_warning_block = _build_crcon_warning_block(crcon_http_degraded_servers)
+
+    crcon_warning_block = _build_crcon_warning_block(
+        crcon_http_degraded_servers
+    )
 
     description = "Click the buttons below to manage the server.\n\n"
-    description += f"**Currently Selected Server:** {selected_server_label}\n\n"
+    description += (
+        f"**Currently Selected Server:** {selected_server_label}\n\n"
+    )
     description += crcon_warning_block
     description += "**Available Servers:**\n" + "\n".join(server_lines)
-    
+
     if updated_at_text:
         description += f"\n\n{updated_at_text}"
 
     embed = discord.Embed(
         title=MAIN_EMBED_TITLE,
         description=description,
-        color=0x2f3136,
+        color=0x2F3136,
     )
-    embed.set_footer(text="Buttons stay active across restarts. Note: When you choose the last objective it will set the map to the selected objectives immediately.")
+    embed.set_footer(
+        text="Buttons stay active across restarts. Note: When you choose the last objective it will set the map to the selected objectives immediately."
+    )
     if schedule_lines is not None:
         _add_schedule_fields(embed, schedule_lines)
     return embed
 
 
-async def ensure_persistent_message(channel: discord.abc.Messageable) -> Optional[discord.Message]:
+async def ensure_persistent_message(
+    channel: discord.abc.Messageable,
+) -> discord.Message | None:
     global persistent_message_ref
     channel_id = getattr(channel, "id", None)
     focused = None
@@ -752,7 +856,10 @@ async def ensure_persistent_message(channel: discord.abc.Messageable) -> Optiona
                     persistent_message_ref = (channel_id, message.id)
                 await message.edit(embed=embed, view=view)
                 # ensure focus map initialized
-                if channel_id is not None and channel_id not in _persistent_focused_server:
+                if (
+                    channel_id is not None
+                    and channel_id not in _persistent_focused_server
+                ):
                     _persistent_focused_server[channel_id] = None
                 return message
 
@@ -785,7 +892,9 @@ async def refresh_main_embed() -> None:
     await ensure_persistent_message(channel)
 
 
-async def _delete_interaction_after(interaction: discord.Interaction, delay: float = 10.0) -> None:
+async def _delete_interaction_after(
+    interaction: discord.Interaction, delay: float = 10.0
+) -> None:
     await asyncio.sleep(delay)
     try:
         await interaction.delete_original_response()
@@ -793,7 +902,9 @@ async def _delete_interaction_after(interaction: discord.Interaction, delay: flo
         pass
 
 
-async def _delete_interaction_after_and_refresh(interaction: discord.Interaction, delay: float = 10.0) -> None:
+async def _delete_interaction_after_and_refresh(
+    interaction: discord.Interaction, delay: float = 10.0
+) -> None:
     """Delete interaction response after delay and refresh the persistent panel."""
     await asyncio.sleep(delay)
     try:
@@ -803,17 +914,33 @@ async def _delete_interaction_after_and_refresh(interaction: discord.Interaction
     await refresh_main_embed()
 
 
-async def send_temporary_response(interaction: discord.Interaction, *, embed: Optional[discord.Embed] = None, content: Optional[str] = None, view: Optional[discord.ui.View] = None, delay: Optional[float] = 20, ephemeral: bool = True) -> None:
+async def send_temporary_response(
+    interaction: discord.Interaction,
+    *,
+    embed: discord.Embed | None = None,
+    content: str | None = None,
+    view: discord.ui.View | None = None,
+    delay: float | None = 20,
+    ephemeral: bool = True,
+) -> None:
     """Send an interaction response and optionally auto-delete it after `delay` seconds."""
     if not interaction.response.is_done():
         if embed is not None and view is not None:
-            await interaction.response.send_message(content=content, embed=embed, view=view, ephemeral=ephemeral)
+            await interaction.response.send_message(
+                content=content, embed=embed, view=view, ephemeral=ephemeral
+            )
         elif embed is not None:
-            await interaction.response.send_message(content=content, embed=embed, ephemeral=ephemeral)
+            await interaction.response.send_message(
+                content=content, embed=embed, ephemeral=ephemeral
+            )
         elif view is not None:
-            await interaction.response.send_message(content=content, view=view, ephemeral=ephemeral)
+            await interaction.response.send_message(
+                content=content, view=view, ephemeral=ephemeral
+            )
         else:
-            await interaction.response.send_message(content=content, ephemeral=ephemeral)
+            await interaction.response.send_message(
+                content=content, ephemeral=ephemeral
+            )
         if delay is not None and delay > 0:
             asyncio.create_task(_delete_interaction_after(interaction, delay))
     else:
@@ -849,7 +976,9 @@ async def send_temporary_response(interaction: discord.Interaction, *, embed: Op
             asyncio.create_task(_delete_message_after(followup, delay))
 
 
-async def _delete_message_after(message: discord.Message, delay: float = 10.0) -> None:
+async def _delete_message_after(
+    message: discord.Message, delay: float = 10.0
+) -> None:
     await asyncio.sleep(delay)
     try:
         await message.delete()
@@ -871,14 +1000,19 @@ async def defer_interaction(
 async def update_interaction_message(
     interaction: discord.Interaction,
     *,
-    content: Optional[str] = None,
-    embed: Optional[discord.Embed] = None,
-    view: Optional[discord.ui.View] = None,
+    content: str | None = None,
+    embed: discord.Embed | None = None,
+    view: discord.ui.View | None = None,
 ) -> None:
     if interaction.response.is_done():
-        await interaction.edit_original_response(content=content, embed=embed, view=view)
+        await interaction.edit_original_response(
+            content=content, embed=embed, view=view
+        )
     else:
-        await interaction.response.edit_message(content=content, embed=embed, view=view)
+        await interaction.response.edit_message(
+            content=content, embed=embed, view=view
+        )
+
 
 class PersistentView(discord.ui.View):
     def __init__(self):
@@ -910,7 +1044,9 @@ class AddAdminCamModal(discord.ui.Modal, title="ADD ADMIN CAM ACCESS"):
 
         player_id = str(self.player_id.value).strip()
         if not player_id:
-            await send_temporary_response(interaction, content="Player NOT FOUND", delay=10)
+            await send_temporary_response(
+                interaction, content="Player NOT FOUND", delay=10
+            )
             return
 
         if await _deny_if_booked(interaction, self.server_index):
@@ -918,18 +1054,28 @@ class AddAdminCamModal(discord.ui.Modal, title="ADD ADMIN CAM ACCESS"):
 
         try:
             added = await _run_server_write(
-                self.server_index, client.add_admin, player_id=player_id, role="spectator", description="Admin cam access"
+                self.server_index,
+                client.add_admin,
+                player_id=player_id,
+                role="spectator",
+                description="Admin cam access",
             )
         except CRCONHTTPError:
             added = False
 
         if added:
-            await send_temporary_response(interaction, content="Player ADDED", delay=10)
+            await send_temporary_response(
+                interaction, content="Player ADDED", delay=10
+            )
         else:
-            await send_temporary_response(interaction, content="Player NOT FOUND", delay=10)
+            await send_temporary_response(
+                interaction, content="Player NOT FOUND", delay=10
+            )
 
 
-class TeamSwitchCooldownModal(discord.ui.Modal, title="SET TEAM SWITCH COOLDOWN"):
+class TeamSwitchCooldownModal(
+    discord.ui.Modal, title="SET TEAM SWITCH COOLDOWN"
+):
     cooldown_minutes = discord.ui.TextInput(
         label="Cooldown in minutes",
         placeholder="Enter 0 or a positive whole number",
@@ -966,7 +1112,11 @@ class TeamSwitchCooldownModal(discord.ui.Modal, title="SET TEAM SWITCH COOLDOWN"
         await defer_interaction(interaction, ephemeral=True)
         if await _deny_if_booked(interaction, self.server_index):
             return
-        result = await asyncio.to_thread(server_control.set_team_switch_cooldown, self.server_index, cooldown_minutes)
+        result = await asyncio.to_thread(
+            server_control.set_team_switch_cooldown,
+            self.server_index,
+            cooldown_minutes,
+        )
         if not result.success:
             await send_temporary_response(
                 interaction,
@@ -998,7 +1148,9 @@ class RemoveAdminCamConfirmView(discord.ui.View):
         self.player_name = player_name
 
     @discord.ui.button(label="Yes", style=discord.ButtonStyle.danger)
-    async def confirm_yes(self, interaction: discord.Interaction, button: discord.ui.Button):
+    async def confirm_yes(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ):
         await defer_interaction(interaction)
         client = _get_http_client(self.server_index)
         if not client:
@@ -1011,11 +1163,15 @@ class RemoveAdminCamConfirmView(discord.ui.View):
             asyncio.create_task(_delete_interaction_after(interaction, 10.0))
             return
 
-        if await _deny_if_booked(interaction, self.server_index, edit_flow=True):
+        if await _deny_if_booked(
+            interaction, self.server_index, edit_flow=True
+        ):
             return
 
         try:
-            removed = await _run_server_write(self.server_index, client.remove_admin, self.player_id)
+            removed = await _run_server_write(
+                self.server_index, client.remove_admin, self.player_id
+            )
         except CRCONHTTPError:
             removed = False
 
@@ -1024,12 +1180,18 @@ class RemoveAdminCamConfirmView(discord.ui.View):
         else:
             message = "Player NOT FOUND"
 
-        await update_interaction_message(interaction, content=message, embed=None, view=None)
+        await update_interaction_message(
+            interaction, content=message, embed=None, view=None
+        )
         asyncio.create_task(_delete_interaction_after(interaction, 10.0))
 
     @discord.ui.button(label="No", style=discord.ButtonStyle.secondary)
-    async def confirm_no(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.edit_message(content="Cancelled.", embed=None, view=None)
+    async def confirm_no(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ):
+        await interaction.response.edit_message(
+            content="Cancelled.", embed=None, view=None
+        )
         asyncio.create_task(_delete_interaction_after(interaction, 1.0))
 
 
@@ -1074,9 +1236,11 @@ class RemoveAdminCamSelect(discord.ui.Select):
                 f"Remove spectator access for **{selected_name}**?\n"
                 f"Player ID: `{selected_player_id}`"
             ),
-            color=0xe67e22,
+            color=0xE67E22,
         )
-        view = RemoveAdminCamConfirmView(self.server_index, selected_player_id, selected_name)
+        view = RemoveAdminCamConfirmView(
+            self.server_index, selected_player_id, selected_name
+        )
         await interaction.response.edit_message(embed=embed, view=view)
 
 
@@ -1087,7 +1251,11 @@ class RemoveAdminCamSelectionView(discord.ui.View):
 
 
 class GameModeView(PersistentView):
-    def __init__(self, focused_server_index: Optional[int] = None, crcon_outage: bool = False):
+    def __init__(
+        self,
+        focused_server_index: int | None = None,
+        crcon_outage: bool = False,
+    ):
         super().__init__()
         self.focused_server_index = focused_server_index
         self._apply_crcon_panel_state(crcon_outage)
@@ -1100,8 +1268,12 @@ class GameModeView(PersistentView):
             if custom_id not in CRCON_PANEL_DEPENDENT_BUTTONS:
                 continue
 
-            default_style = CRCON_PANEL_DEFAULT_BUTTON_STYLES.get(custom_id, child.style)
-            default_label = CRCON_PANEL_DEFAULT_BUTTON_LABELS.get(custom_id, child.label)
+            default_style = CRCON_PANEL_DEFAULT_BUTTON_STYLES.get(
+                custom_id, child.style
+            )
+            default_label = CRCON_PANEL_DEFAULT_BUTTON_LABELS.get(
+                custom_id, child.label
+            )
             child.disabled = disable_crcon_controls
 
             if disable_crcon_controls:
@@ -1145,9 +1317,19 @@ class GameModeView(PersistentView):
             return
 
         if timer_name == "match timer":
-            result = await asyncio.to_thread(server_control.set_match_timer, server_index, "warfare", minutes)
+            result = await asyncio.to_thread(
+                server_control.set_match_timer,
+                server_index,
+                "warfare",
+                minutes,
+            )
         else:
-            result = await asyncio.to_thread(server_control.set_warmup_timer, server_index, "warfare", minutes)
+            result = await asyncio.to_thread(
+                server_control.set_warmup_timer,
+                server_index,
+                "warfare",
+                minutes,
+            )
 
         if not result.success:
             await send_temporary_response(
@@ -1166,77 +1348,127 @@ class GameModeView(PersistentView):
             delay=20,
         )
 
-    @discord.ui.button(label='🔁 Change Server', style=discord.ButtonStyle.secondary, custom_id='persistent:change_server', row=0)
-    async def change_server(self, interaction: discord.Interaction, button: discord.ui.Button):
+    @discord.ui.button(
+        label="🔁 Change Server",
+        style=discord.ButtonStyle.secondary,
+        custom_id="persistent:change_server",
+        row=0,
+    )
+    async def change_server(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ):
         servers = api_client.get_servers()
         if not servers:
-            await send_temporary_response(interaction, content="No servers configured.", delay=20)
+            await send_temporary_response(
+                interaction, content="No servers configured.", delay=20
+            )
             return
 
         if len(servers) == 1:
-            await send_temporary_response(interaction, content="Only one server configured.", delay=20)
+            await send_temporary_response(
+                interaction, content="Only one server configured.", delay=20
+            )
             return
 
         embed = discord.Embed(
             title="🔁 Change Server",
             description="Select which server the main view should focus on:",
-            color=0x7289da,
+            color=0x7289DA,
         )
         view = ChangeServerSelectionView()
-        await send_temporary_response(interaction, embed=embed, view=view, delay=None)
+        await send_temporary_response(
+            interaction, embed=embed, view=view, delay=None
+        )
 
-    @discord.ui.button(label='🔄 Refresh Status', style=discord.ButtonStyle.success, custom_id='persistent:refresh_status', row=0)
-    async def refresh_status(self, interaction: discord.Interaction, button: discord.ui.Button):
+    @discord.ui.button(
+        label="🔄 Refresh Status",
+        style=discord.ButtonStyle.success,
+        custom_id="persistent:refresh_status",
+        row=0,
+    )
+    async def refresh_status(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ):
         await defer_interaction(interaction, ephemeral=True)
         await refresh_main_embed()
-        await send_temporary_response(interaction, content="Status refreshed.", delay=20)
+        await send_temporary_response(
+            interaction, content="Status refreshed.", delay=20
+        )
 
-    @discord.ui.button(label='🗺️ Change Map', style=discord.ButtonStyle.primary, custom_id='persistent:open_map_changer', row=1)
-    async def open_map_changer(self, interaction: discord.Interaction, button: discord.ui.Button):
+    @discord.ui.button(
+        label="🗺️ Change Map",
+        style=discord.ButtonStyle.primary,
+        custom_id="persistent:open_map_changer",
+        row=1,
+    )
+    async def open_map_changer(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ):
         await defer_interaction(interaction, ephemeral=True)
         servers = api_client.get_servers()
         focused_server = _get_channel_focused_server(interaction.channel)
 
-        if focused_server is not None and any(index == focused_server for index, _ in servers):
+        if focused_server is not None and any(
+            index == focused_server for index, _ in servers
+        ):
             server_index = focused_server
             server_name = api_client.get_server_name(server_index)
-            current_map = await asyncio.to_thread(api_client.get_current_map, server_index)
+            current_map = await asyncio.to_thread(
+                api_client.get_current_map, server_index
+            )
 
             embed = discord.Embed(
                 title="??? Map Change Control",
                 description=f"**Server:** {server_name}\n**Current Map:** {current_map}\n\nSelect a game mode:",
-                color=0x00ff00
+                color=0x00FF00,
             )
             view = GameModeSelectionView(server_index)
-            await send_temporary_response(interaction, embed=embed, view=view, delay=None)
+            await send_temporary_response(
+                interaction, embed=embed, view=view, delay=None
+            )
             return
 
         if len(servers) == 1:
             server_index = servers[0][0]
             server_name = servers[0][1]
-            current_map = await asyncio.to_thread(api_client.get_current_map, server_index)
+            current_map = await asyncio.to_thread(
+                api_client.get_current_map, server_index
+            )
 
             embed = discord.Embed(
                 title="??? Map Change Control",
                 description=f"**Server:** {server_name}\n**Current Map:** {current_map}\n\nSelect a game mode:",
-                color=0x00ff00
+                color=0x00FF00,
             )
             view = GameModeSelectionView(server_index)
         else:
             embed = discord.Embed(
                 title="??? Map Change Control",
                 description="Select a server:",
-                color=0x00ff00
+                color=0x00FF00,
             )
             view = ServerSelectionView()
 
-        await send_temporary_response(interaction, embed=embed, view=view, delay=None)
+        await send_temporary_response(
+            interaction, embed=embed, view=view, delay=None
+        )
 
-    @discord.ui.button(label='🎯 Set Objectives', style=discord.ButtonStyle.secondary, custom_id='persistent:set_objectives', row=1)
-    async def set_objectives(self, interaction: discord.Interaction, button: discord.ui.Button):
+    @discord.ui.button(
+        label="🎯 Set Objectives",
+        style=discord.ButtonStyle.secondary,
+        custom_id="persistent:set_objectives",
+        row=1,
+    )
+    async def set_objectives(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ):
         servers = api_client.get_servers()
         if not servers:
-            await send_temporary_response(interaction, content="No servers are configured; cannot set objectives.", delay=20)
+            await send_temporary_response(
+                interaction,
+                content="No servers are configured; cannot set objectives.",
+                delay=20,
+            )
             return
 
         if not any(_get_http_client(index) for index, _ in servers):
@@ -1248,32 +1480,51 @@ class GameModeView(PersistentView):
             return
 
         focused_server = _get_channel_focused_server(interaction.channel)
-        if focused_server is not None and any(index == focused_server for index, _ in servers):
+        if focused_server is not None and any(
+            index == focused_server for index, _ in servers
+        ):
             if not interaction.response.is_done():
                 await interaction.response.defer(ephemeral=True)
-            await send_objective_selection(interaction, focused_server, edit_message=False)
+            await send_objective_selection(
+                interaction, focused_server, edit_message=False
+            )
             return
 
         if len(servers) == 1:
             if not interaction.response.is_done():
                 await interaction.response.defer(ephemeral=True)
-            await send_objective_selection(interaction, servers[0][0], edit_message=False)
+            await send_objective_selection(
+                interaction, servers[0][0], edit_message=False
+            )
             return
 
         server_list = "\n".join([f" {name}" for _, name in servers])
         embed = discord.Embed(
             title="🎯 Select Server",
             description=f"Choose which server's objectives you want to configure:\n\n{server_list}",
-            color=0x9b59b6,
+            color=0x9B59B6,
         )
         view = ObjectiveServerSelectionView()
-        await send_temporary_response(interaction, embed=embed, view=view, delay=None)
+        await send_temporary_response(
+            interaction, embed=embed, view=view, delay=None
+        )
 
-    @discord.ui.button(label='🌦 Dynamic Weather', style=discord.ButtonStyle.secondary, custom_id='persistent:set_dynamic_weather', row=1)
-    async def set_dynamic_weather(self, interaction: discord.Interaction, button: discord.ui.Button):
+    @discord.ui.button(
+        label="🌦 Dynamic Weather",
+        style=discord.ButtonStyle.secondary,
+        custom_id="persistent:set_dynamic_weather",
+        row=1,
+    )
+    async def set_dynamic_weather(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ):
         servers = api_client.get_servers()
         if not servers:
-            await send_temporary_response(interaction, content="No servers are configured; cannot update dynamic weather.", delay=20)
+            await send_temporary_response(
+                interaction,
+                content="No servers are configured; cannot update dynamic weather.",
+                delay=20,
+            )
             return
 
         if not any(_get_http_client(index) for index, _ in servers):
@@ -1285,34 +1536,44 @@ class GameModeView(PersistentView):
             return
 
         focused_server = _get_channel_focused_server(interaction.channel)
-        if focused_server is not None and any(index == focused_server for index, _ in servers):
+        if focused_server is not None and any(
+            index == focused_server for index, _ in servers
+        ):
             if not interaction.response.is_done():
                 await interaction.response.defer(ephemeral=True)
-            await send_dynamic_weather_controls(interaction, focused_server, edit_message=False)
+            await send_dynamic_weather_controls(
+                interaction, focused_server, edit_message=False
+            )
             return
 
         if len(servers) == 1:
             if not interaction.response.is_done():
                 await interaction.response.defer(ephemeral=True)
-            await send_dynamic_weather_controls(interaction, servers[0][0], edit_message=False)
+            await send_dynamic_weather_controls(
+                interaction, servers[0][0], edit_message=False
+            )
             return
 
         server_list = "\n".join([f" {name}" for _, name in servers])
         embed = discord.Embed(
             title="🌦 Select Server",
             description=f"Choose which server's dynamic weather you want to update:\n\n{server_list}",
-            color=0x1abc9c,
+            color=0x1ABC9C,
         )
         view = DynamicWeatherServerSelectionView()
-        await send_temporary_response(interaction, embed=embed, view=view, delay=None)
+        await send_temporary_response(
+            interaction, embed=embed, view=view, delay=None
+        )
 
     @discord.ui.button(
-        label='⏱ Warfare Match Timer',
+        label="⏱ Warfare Match Timer",
         style=discord.ButtonStyle.primary,
-        custom_id='persistent:set_warfare_match_timer',
+        custom_id="persistent:set_warfare_match_timer",
         row=2,
     )
-    async def set_warfare_match_timer(self, interaction: discord.Interaction, button: discord.ui.Button):
+    async def set_warfare_match_timer(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ):
         await self._apply_warfare_timer(
             interaction,
             timer_name="match timer",
@@ -1321,12 +1582,14 @@ class GameModeView(PersistentView):
         )
 
     @discord.ui.button(
-        label='🔥 Warfare Warm Up Timer',
+        label="🔥 Warfare Warm Up Timer",
         style=discord.ButtonStyle.primary,
-        custom_id='persistent:set_warfare_warmup_timer',
+        custom_id="persistent:set_warfare_warmup_timer",
         row=2,
     )
-    async def set_warfare_warmup_timer(self, interaction: discord.Interaction, button: discord.ui.Button):
+    async def set_warfare_warmup_timer(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ):
         await self._apply_warfare_timer(
             interaction,
             timer_name="warmup timer",
@@ -1335,12 +1598,14 @@ class GameModeView(PersistentView):
         )
 
     @discord.ui.button(
-        label='↔️ Team Switch Cooldown',
+        label="↔️ Team Switch Cooldown",
         style=discord.ButtonStyle.primary,
-        custom_id='persistent:set_team_switch_cooldown',
+        custom_id="persistent:set_team_switch_cooldown",
         row=2,
     )
-    async def set_team_switch_cooldown(self, interaction: discord.Interaction, button: discord.ui.Button):
+    async def set_team_switch_cooldown(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ):
         servers = api_client.get_servers()
         if not servers:
             await send_temporary_response(
@@ -1367,23 +1632,33 @@ class GameModeView(PersistentView):
             )
             return
 
-        await interaction.response.send_modal(TeamSwitchCooldownModal(server_index))
+        await interaction.response.send_modal(
+            TeamSwitchCooldownModal(server_index)
+        )
 
     @discord.ui.button(
-        label='🗑️ REMOVE ADMIN CAM USER',
+        label="🗑️ REMOVE ADMIN CAM USER",
         style=discord.ButtonStyle.secondary,
-        custom_id='persistent:remove_admin_cam_access',
+        custom_id="persistent:remove_admin_cam_access",
         row=3,
     )
-    async def remove_admin_cam_access(self, interaction: discord.Interaction, button: discord.ui.Button):
+    async def remove_admin_cam_access(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ):
         await defer_interaction(interaction, ephemeral=True)
         servers = api_client.get_servers()
         if not servers:
-            await send_temporary_response(interaction, content="No servers are configured; cannot remove admin cam access.", delay=10)
+            await send_temporary_response(
+                interaction,
+                content="No servers are configured; cannot remove admin cam access.",
+                delay=10,
+            )
             return
 
         focused_server = _get_channel_focused_server(interaction.channel)
-        if focused_server is not None and any(index == focused_server for index, _ in servers):
+        if focused_server is not None and any(
+            index == focused_server for index, _ in servers
+        ):
             server_index = focused_server
         elif len(servers) == 1:
             server_index = servers[0][0]
@@ -1415,35 +1690,50 @@ class GameModeView(PersistentView):
             return
 
         spectator_admins = [
-            row for row in admins
+            row
+            for row in admins
             if str(row.get("role", "")).lower() == "spectator"
         ]
         if not spectator_admins:
-            await send_temporary_response(interaction, content="No users with spectator access found.", delay=10)
+            await send_temporary_response(
+                interaction,
+                content="No users with spectator access found.",
+                delay=10,
+            )
             return
 
         embed = discord.Embed(
             title="Remove Admin Cam User",
             description="Select a user with spectator access to remove.",
-            color=0xe67e22,
+            color=0xE67E22,
         )
         view = RemoveAdminCamSelectionView(server_index, spectator_admins)
-        await send_temporary_response(interaction, embed=embed, view=view, delay=None)
+        await send_temporary_response(
+            interaction, embed=embed, view=view, delay=None
+        )
 
     @discord.ui.button(
-        label='🎥 ADD ADMIN CAM ACCESS',
+        label="🎥 ADD ADMIN CAM ACCESS",
         style=discord.ButtonStyle.danger,
-        custom_id='persistent:add_admin_cam_access',
+        custom_id="persistent:add_admin_cam_access",
         row=3,
     )
-    async def add_admin_cam_access(self, interaction: discord.Interaction, button: discord.ui.Button):
+    async def add_admin_cam_access(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ):
         servers = api_client.get_servers()
         if not servers:
-            await send_temporary_response(interaction, content="No servers are configured; cannot add admin cam access.", delay=10)
+            await send_temporary_response(
+                interaction,
+                content="No servers are configured; cannot add admin cam access.",
+                delay=10,
+            )
             return
 
         focused_server = _get_channel_focused_server(interaction.channel)
-        if focused_server is not None and any(index == focused_server for index, _ in servers):
+        if focused_server is not None and any(
+            index == focused_server for index, _ in servers
+        ):
             server_index = focused_server
         elif len(servers) == 1:
             server_index = servers[0][0]
@@ -1465,10 +1755,11 @@ class GameModeView(PersistentView):
 
         await interaction.response.send_modal(AddAdminCamModal(server_index))
 
+
 class ServerSelectionView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=300)
-        
+
         # Create dropdown with servers
         servers = api_client.get_servers()
         if servers:
@@ -1486,14 +1777,18 @@ class ChangeServerSelectionView(discord.ui.View):
 class ChangeServerDropdown(discord.ui.Select):
     def __init__(self, servers):
         options = [
-            discord.SelectOption(label=server_name, description=f"Focus main view on {server_name}", value=str(server_index))
+            discord.SelectOption(
+                label=server_name,
+                description=f"Focus main view on {server_name}",
+                value=str(server_index),
+            )
             for server_index, server_name in servers[:25]
         ]
         super().__init__(
             placeholder="Choose a server to focus...",
             min_values=1,
             max_values=1,
-            options=options
+            options=options,
         )
 
     async def callback(self, interaction: discord.Interaction):
@@ -1501,20 +1796,31 @@ class ChangeServerDropdown(discord.ui.Select):
             await defer_interaction(interaction)
             channel = interaction.channel
             if channel is None:
-                await send_temporary_response(interaction, content="Unable to determine channel to update.", delay=20)
+                await send_temporary_response(
+                    interaction,
+                    content="Unable to determine channel to update.",
+                    delay=20,
+                )
                 return
 
             selected = int(self.values[0])
             channel_id = getattr(channel, "id", None)
             if channel_id is None:
-                await send_temporary_response(interaction, content="Unable to determine channel to update.", delay=20)
+                await send_temporary_response(
+                    interaction,
+                    content="Unable to determine channel to update.",
+                    delay=20,
+                )
                 return
 
             # Store focus and update persistent message if present
             _persistent_focused_server[channel_id] = selected
 
             # Update persistent message if we have a reference for this channel
-            if persistent_message_ref and persistent_message_ref[0] == channel_id:
+            if (
+                persistent_message_ref
+                and persistent_message_ref[0] == channel_id
+            ):
                 _, message_id = persistent_message_ref
                 try:
                     msg = await channel.fetch_message(message_id)  # type: ignore[attr-defined]
@@ -1522,7 +1828,9 @@ class ChangeServerDropdown(discord.ui.Select):
                     await msg.edit(embed=embed, view=view)
                 except (discord.NotFound, discord.HTTPException):
                     # recreate persistent message
-                    if isinstance(channel, (discord.TextChannel, discord.Thread)):
+                    if isinstance(
+                        channel, (discord.TextChannel, discord.Thread)
+                    ):
                         await ensure_persistent_message(channel)
 
             await update_interaction_message(
@@ -1536,7 +1844,12 @@ class ChangeServerDropdown(discord.ui.Select):
             )
             asyncio.create_task(_delete_interaction_after(interaction, 10.0))
         except Exception as exc:
-            await send_temporary_response(interaction, content=f"Error updating main view: {exc}", delay=20)
+            await send_temporary_response(
+                interaction,
+                content=f"Error updating main view: {exc}",
+                delay=20,
+            )
+
 
 class ServerDropdown(discord.ui.Select):
     def __init__(self, servers):
@@ -1544,33 +1857,34 @@ class ServerDropdown(discord.ui.Select):
             discord.SelectOption(
                 label=server_name,
                 description=f"Change map on {server_name}",
-                value=str(server_index)
+                value=str(server_index),
             )
             for server_index, server_name in servers[:25]  # Discord limit
         ]
-        
+
         super().__init__(
             placeholder="Choose a server...",
             min_values=1,
             max_values=1,
-            options=options
+            options=options,
         )
-    
+
     async def callback(self, interaction: discord.Interaction):
         await defer_interaction(interaction)
         selected_server_index = int(self.values[0])
         server_name = api_client.get_server_name(selected_server_index)
-        current_map = await asyncio.to_thread(api_client.get_current_map, selected_server_index)
-        
+        current_map = await asyncio.to_thread(
+            api_client.get_current_map, selected_server_index
+        )
+
         embed = discord.Embed(
             title="🗺️ Map Change Control",
             description=f"**Server:** {server_name}\n**Current Map:** {current_map}\n\nSelect a game mode:",
-            color=0x00ff00
+            color=0x00FF00,
         )
-        
+
         view = GameModeSelectionView(selected_server_index)
         await update_interaction_message(interaction, embed=embed, view=view)
-
 
 
 async def send_objective_selection(
@@ -1585,12 +1899,18 @@ async def send_objective_selection(
         if edit_message:
             await update_interaction_message(
                 interaction,
-                embed=discord.Embed(title="?? Objective Controls Disabled", description=message, color=0xffa500),
+                embed=discord.Embed(
+                    title="?? Objective Controls Disabled",
+                    description=message,
+                    color=0xFFA500,
+                ),
                 view=None,
             )
             asyncio.create_task(_delete_interaction_after(interaction, 20.0))
         else:
-            await send_temporary_response(interaction, content=message, delay=20)
+            await send_temporary_response(
+                interaction, content=message, delay=20
+            )
         return
 
     try:
@@ -1600,24 +1920,33 @@ async def send_objective_selection(
         if edit_message:
             await update_interaction_message(
                 interaction,
-                embed=discord.Embed(title="?? Objective Fetch Failed", description=message, color=0xffa500),
+                embed=discord.Embed(
+                    title="?? Objective Fetch Failed",
+                    description=message,
+                    color=0xFFA500,
+                ),
                 view=None,
             )
             asyncio.create_task(_delete_interaction_after(interaction, 20.0))
         else:
-            await send_temporary_response(interaction, content=message, delay=20)
+            await send_temporary_response(
+                interaction, content=message, delay=20
+            )
         return
 
     server_name = api_client.get_server_name(server_index)
-    current_map = await asyncio.to_thread(api_client.get_current_map, server_index)
+    current_map = await asyncio.to_thread(
+        api_client.get_current_map, server_index
+    )
     view = ObjectiveSelectionView(server_index, rows, server_name, current_map)
     embed = view.build_embed()
 
     if edit_message:
         await update_interaction_message(interaction, embed=embed, view=view)
     else:
-        await send_temporary_response(interaction, embed=embed, view=view, delay=None)
-
+        await send_temporary_response(
+            interaction, embed=embed, view=view, delay=None
+        )
 
 
 async def send_dynamic_weather_controls(
@@ -1632,45 +1961,72 @@ async def send_dynamic_weather_controls(
         if edit_message:
             await update_interaction_message(
                 interaction,
-                embed=discord.Embed(title="?? Dynamic Weather Disabled", description=message, color=0xffa500),
+                embed=discord.Embed(
+                    title="?? Dynamic Weather Disabled",
+                    description=message,
+                    color=0xFFA500,
+                ),
                 view=None,
             )
             asyncio.create_task(_delete_interaction_after(interaction, 20.0))
         else:
-            await send_temporary_response(interaction, content=message, delay=20)
+            await send_temporary_response(
+                interaction, content=message, delay=20
+            )
         return
 
     try:
         gamestate_resp = await asyncio.to_thread(client.get_gamestate)
-        gamestate = gamestate_resp.get("result") if isinstance(gamestate_resp, dict) else None
+        gamestate = (
+            gamestate_resp.get("result")
+            if isinstance(gamestate_resp, dict)
+            else None
+        )
     except CRCONHTTPError as exc:
         message = f"Failed to load gamestate: {exc}"
         if edit_message:
             await update_interaction_message(
                 interaction,
-                embed=discord.Embed(title="?? Dynamic Weather Unavailable", description=message, color=0xffa500),
+                embed=discord.Embed(
+                    title="?? Dynamic Weather Unavailable",
+                    description=message,
+                    color=0xFFA500,
+                ),
                 view=None,
             )
             asyncio.create_task(_delete_interaction_after(interaction, 20.0))
         else:
-            await send_temporary_response(interaction, content=message, delay=20)
+            await send_temporary_response(
+                interaction, content=message, delay=20
+            )
         return
 
     current_map = (gamestate or {}).get("current_map") or {}
     map_id = current_map.get("id") or current_map.get("map", {}).get("id")
-    map_pretty = current_map.get("pretty_name") or current_map.get("map", {}).get("pretty_name") or map_id or "Unknown"
+    map_pretty = (
+        current_map.get("pretty_name")
+        or current_map.get("map", {}).get("pretty_name")
+        or map_id
+        or "Unknown"
+    )
 
     if not map_id:
         message = "Could not determine the current map ID from the server."
         if edit_message:
             await update_interaction_message(
                 interaction,
-                embed=discord.Embed(title="?? Dynamic Weather Unavailable", description=message, color=0xffa500),
+                embed=discord.Embed(
+                    title="?? Dynamic Weather Unavailable",
+                    description=message,
+                    color=0xFFA500,
+                ),
                 view=None,
             )
             asyncio.create_task(_delete_interaction_after(interaction, 20.0))
         else:
-            await send_temporary_response(interaction, content=message, delay=20)
+            await send_temporary_response(
+                interaction, content=message, delay=20
+            )
         return
 
     view = DynamicWeatherToggleView(server_index, map_id, map_pretty)
@@ -1679,7 +2035,9 @@ async def send_dynamic_weather_controls(
     if edit_message:
         await update_interaction_message(interaction, embed=embed, view=view)
     else:
-        await send_temporary_response(interaction, embed=embed, view=view, delay=None)
+        await send_temporary_response(
+            interaction, embed=embed, view=view, delay=None
+        )
 
 
 class DynamicWeatherServerSelectionView(discord.ui.View):
@@ -1706,7 +2064,9 @@ class DynamicWeatherServerDropdown(discord.ui.Select):
     async def callback(self, interaction: discord.Interaction):
         server_index = int(self.values[0])
         await defer_interaction(interaction)
-        await send_dynamic_weather_controls(interaction, server_index, edit_message=True)
+        await send_dynamic_weather_controls(
+            interaction, server_index, edit_message=True
+        )
 
 
 class DynamicWeatherToggleView(discord.ui.View):
@@ -1724,22 +2084,31 @@ class DynamicWeatherToggleView(discord.ui.View):
         embed = discord.Embed(
             title="🌦 Dynamic Weather Control",
             description=description,
-            color=0x1abc9c,
+            color=0x1ABC9C,
         )
         embed.set_footer(
             text="The API does not expose the current dynamic weather state; last action applies immediately."
         )
         return embed
 
-    async def _set_dynamic_weather(self, interaction: discord.Interaction, enabled: bool) -> None:
+    async def _set_dynamic_weather(
+        self, interaction: discord.Interaction, enabled: bool
+    ) -> None:
         if not interaction.response.is_done():
             await interaction.response.defer(ephemeral=True)
 
-        if await _deny_if_booked(interaction, self.server_index, edit_flow=True):
+        if await _deny_if_booked(
+            interaction, self.server_index, edit_flow=True
+        ):
             self.stop()
             return
 
-        result = await asyncio.to_thread(server_control.set_dynamic_weather_enabled, self.server_index, self.map_id, enabled)
+        result = await asyncio.to_thread(
+            server_control.set_dynamic_weather_enabled,
+            self.server_index,
+            self.map_id,
+            enabled,
+        )
         if not result.success:
             followup = await interaction.followup.send(
                 f"Failed to update dynamic weather: {result.message}",
@@ -1760,20 +2129,26 @@ class DynamicWeatherToggleView(discord.ui.View):
                 f"Dynamic weather {state} for **{self.map_pretty}**.\n"
                 f"Transport: {'Direct RCON fallback' if result.transport == 'direct_rcon' else 'CRCON HTTP'}."
             ),
-            color=0x1abc9c,
+            color=0x1ABC9C,
         )
 
         self.stop()
-        await interaction.edit_original_response(embed=success_embed, view=None)
+        await interaction.edit_original_response(
+            embed=success_embed, view=None
+        )
         await refresh_main_embed()
         asyncio.create_task(_delete_interaction_after(interaction, 10.0))
 
     @discord.ui.button(label="Turn On", style=discord.ButtonStyle.success)
-    async def enable(self, interaction: discord.Interaction, button: discord.ui.Button):
+    async def enable(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ):
         await self._set_dynamic_weather(interaction, True)
 
     @discord.ui.button(label="Turn Off", style=discord.ButtonStyle.danger)
-    async def disable(self, interaction: discord.Interaction, button: discord.ui.Button):
+    async def disable(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ):
         await self._set_dynamic_weather(interaction, False)
 
 
@@ -1801,11 +2176,19 @@ class ObjectiveServerDropdown(discord.ui.Select):
     async def callback(self, interaction: discord.Interaction):
         server_index = int(self.values[0])
         await defer_interaction(interaction)
-        await send_objective_selection(interaction, server_index, edit_message=True)
+        await send_objective_selection(
+            interaction, server_index, edit_message=True
+        )
 
 
 class ObjectiveSelectionView(discord.ui.View):
-    def __init__(self, server_index: int, rows: list[list[str]], server_name: str, current_map: str):
+    def __init__(
+        self,
+        server_index: int,
+        rows: list[list[str]],
+        server_name: str,
+        current_map: str,
+    ):
         super().__init__(timeout=300)
         self.server_index = server_index
         self.server_name = server_name
@@ -1835,13 +2218,17 @@ class ObjectiveSelectionView(discord.ui.View):
         embed = discord.Embed(
             title="🎯 Set Objectives for Current Map",
             description=description,
-            color=0x9b59b6,
+            color=0x9B59B6,
         )
-        embed.add_field(name="Selections", value="\n".join(lines), inline=False)
+        embed.add_field(
+            name="Selections", value="\n".join(lines), inline=False
+        )
         return embed
 
     async def lock_objectives(self, interaction: discord.Interaction) -> None:
-        objective_list = [self.selected.get(slot) for slot in range(1, len(self.rows) + 1)]
+        objective_list = [
+            self.selected.get(slot) for slot in range(1, len(self.rows) + 1)
+        ]
         if any(choice is None for choice in objective_list):
             await interaction.followup.send(
                 "Please choose an objective for every slot before locking.",
@@ -1850,12 +2237,18 @@ class ObjectiveSelectionView(discord.ui.View):
             return
 
         objective_list = [choice for choice in objective_list if choice]
+        # mypy doesn't track the None filter above
+        objective_list_typed: list[str] = objective_list  # type: ignore[assignment]
 
-        if await _deny_if_booked(interaction, self.server_index, edit_flow=True):
+        if await _deny_if_booked(
+            interaction, self.server_index, edit_flow=True
+        ):
             self.stop()
             return
 
-        result = await asyncio.to_thread(server_control.set_sector_layout, self.server_index, objective_list)
+        result = await asyncio.to_thread(
+            server_control.set_sector_layout, self.server_index, objective_list
+        )
         if not result.success:
             await interaction.followup.send(
                 f"Failed to lock objectives: {result.message}",
@@ -1863,10 +2256,15 @@ class ObjectiveSelectionView(discord.ui.View):
             )
             return
 
-        latest_map = await asyncio.to_thread(api_client.get_current_map, self.server_index)
-        _current_objectives_state[(self.server_index, latest_map)] = list(objective_list)
+        latest_map = await asyncio.to_thread(
+            api_client.get_current_map, self.server_index
+        )
+        _current_objectives_state[(self.server_index, latest_map)] = list(
+            objective_list_typed
+        )
         summary = "\n".join(
-            f"{idx}. **{name}**" for idx, name in enumerate(objective_list, start=1)
+            f"{idx}. **{name}**"
+            for idx, name in enumerate(objective_list, start=1)
         )
 
         success_embed = discord.Embed(
@@ -1877,19 +2275,24 @@ class ObjectiveSelectionView(discord.ui.View):
                 f"**Transport:** {'Direct RCON fallback' if result.transport == 'direct_rcon' else 'CRCON HTTP'}\n\n"
                 f"{summary}"
             ),
-            color=0x2ecc71,
+            color=0x2ECC71,
         )
 
         self.stop()
-        await interaction.edit_original_response(embed=success_embed, view=None)
+        await interaction.edit_original_response(
+            embed=success_embed, view=None
+        )
         await refresh_main_embed()
-        asyncio.create_task(_delete_interaction_after_and_refresh(interaction, 10.0))
+        asyncio.create_task(
+            _delete_interaction_after_and_refresh(interaction, 10.0)
+        )
 
 
 class ObjectiveDropdown(discord.ui.Select):
     def __init__(self, slot: int, options: list[str]):
         select_options = [
-            discord.SelectOption(label=option, value=option) for option in options
+            discord.SelectOption(label=option, value=option)
+            for option in options
         ]
         super().__init__(
             placeholder=f"Objective Slot {slot}",
@@ -1903,55 +2306,75 @@ class ObjectiveDropdown(discord.ui.Select):
         objective = self.values[0]
         view: ObjectiveSelectionView = self.view  # type: ignore[assignment]
         view.selected[self.slot] = objective
-        if all(view.selected.get(slot) for slot in range(1, len(view.rows) + 1)):
+        if all(
+            view.selected.get(slot) for slot in range(1, len(view.rows) + 1)
+        ):
             if not interaction.response.is_done():
                 await interaction.response.defer()
             await view.lock_objectives(interaction)
         else:
-            await interaction.response.edit_message(embed=view.build_embed(), view=view)
+            await interaction.response.edit_message(
+                embed=view.build_embed(), view=view
+            )
+
 
 class GameModeSelectionView(discord.ui.View):
     def __init__(self, server_index):
         super().__init__(timeout=300)
         self.server_index = server_index
-    
-    @discord.ui.button(label='Warfare', style=discord.ButtonStyle.primary, emoji='⚔️')
-    async def warfare_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+
+    @discord.ui.button(
+        label="Warfare", style=discord.ButtonStyle.primary, emoji="⚔️"
+    )
+    async def warfare_button(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ):
         await self.show_map_selection(interaction, "warfare")
-    
-    @discord.ui.button(label='Offensive', style=discord.ButtonStyle.secondary, emoji='🏃')
-    async def offensive_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+
+    @discord.ui.button(
+        label="Offensive", style=discord.ButtonStyle.secondary, emoji="🏃"
+    )
+    async def offensive_button(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ):
         await self.show_map_selection(interaction, "offensive")
-    
-    @discord.ui.button(label='Skirmish', style=discord.ButtonStyle.success, emoji='💥')
-    async def skirmish_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+
+    @discord.ui.button(
+        label="Skirmish", style=discord.ButtonStyle.success, emoji="💥"
+    )
+    async def skirmish_button(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ):
         await self.show_map_selection(interaction, "skirmish")
-    
+
     async def show_map_selection(self, interaction, game_mode):
         await defer_interaction(interaction)
         server_name = api_client.get_server_name(self.server_index)
-        current_map = await asyncio.to_thread(api_client.get_current_map, self.server_index)
-        
+        current_map = await asyncio.to_thread(
+            api_client.get_current_map, self.server_index
+        )
+
         embed = discord.Embed(
             title=f"🗺️ {game_mode.title()} Maps",
             description=f"**Server:** {server_name}\n**Current Map:** {current_map}\n\nSelect a map:",
-            color=0x0099ff
+            color=0x0099FF,
         )
-        
+
         maps = await asyncio.to_thread(get_maps_for_mode, game_mode)
         view = MapSelectionView(self.server_index, game_mode, maps)
         await update_interaction_message(interaction, embed=embed, view=view)
+
 
 class MapSelectionView(discord.ui.View):
     def __init__(self, server_index, game_mode, maps):
         super().__init__(timeout=300)
         self.server_index = server_index
         self.game_mode = game_mode
-        
+
         # Create dropdown with maps
         if maps:
             self.add_item(MapDropdown(server_index, game_mode, maps))
-        
+
         # Add back button
         servers = api_client.get_servers()
         if len(servers) > 1:
@@ -1959,42 +2382,50 @@ class MapSelectionView(discord.ui.View):
         else:
             self.add_item(BackToGameModeButton(server_index))
 
+
 class MapDropdown(discord.ui.Select):
     def __init__(self, server_index, game_mode, maps):
         self.server_index = server_index
         self.game_mode = game_mode
-        
+
         options = [
             discord.SelectOption(
                 label=map_name,
                 description=f"Select {map_name} for {game_mode}",
-                value=map_name
+                value=map_name,
             )
             for map_name in maps[:25]  # Discord limit
         ]
-        
+
         super().__init__(
             placeholder="Choose a map...",
             min_values=1,
             max_values=1,
-            options=options
+            options=options,
         )
-    
+
     async def callback(self, interaction: discord.Interaction):
         await defer_interaction(interaction)
         selected_map = self.values[0]
         server_name = api_client.get_server_name(self.server_index)
-        current_map = await asyncio.to_thread(api_client.get_current_map, self.server_index)
-        
+        current_map = await asyncio.to_thread(
+            api_client.get_current_map, self.server_index
+        )
+
         embed = discord.Embed(
             title=f"🗺️ {selected_map} - {self.game_mode.title()}",
             description=f"**Server:** {server_name}\n**Current Map:** {current_map}\n\nSelect a variant:",
-            color=0xff9900
+            color=0xFF9900,
         )
-        
-        variants = await asyncio.to_thread(get_variants_for_map, self.game_mode, selected_map)
-        view = VariantSelectionView(self.server_index, self.game_mode, selected_map, variants)
+
+        variants = await asyncio.to_thread(
+            get_variants_for_map, self.game_mode, selected_map
+        )
+        view = VariantSelectionView(
+            self.server_index, self.game_mode, selected_map, variants
+        )
         await update_interaction_message(interaction, embed=embed, view=view)
+
 
 class VariantSelectionView(discord.ui.View):
     def __init__(self, server_index, game_mode, map_name, variants):
@@ -2002,13 +2433,16 @@ class VariantSelectionView(discord.ui.View):
         self.server_index = server_index
         self.game_mode = game_mode
         self.map_name = map_name
-        
+
         # Create dropdown with variants
         if variants:
-            self.add_item(VariantDropdown(server_index, game_mode, map_name, variants))
-        
+            self.add_item(
+                VariantDropdown(server_index, game_mode, map_name, variants)
+            )
+
         # Add back button
         self.add_item(BackToMapSelectionButton(server_index, game_mode))
+
 
 class VariantDropdown(discord.ui.Select):
     def __init__(self, server_index, game_mode, map_name, variants):
@@ -2021,45 +2455,55 @@ class VariantDropdown(discord.ui.Select):
             discord.SelectOption(
                 label=variant["variant"],
                 description=f"{map_name} - {variant['variant']}",
-                value=variant["id"]
+                value=variant["id"],
             )
             for variant in variants[:25]  # Discord limit
         ]
-        
+
         super().__init__(
             placeholder="Choose a variant...",
             min_values=1,
             max_values=1,
-            options=options
+            options=options,
         )
-    
+
     async def callback(self, interaction: discord.Interaction):
         selected_variant_id = self.values[0]
         server_name = api_client.get_server_name(self.server_index)
-        
+
         # Find the variant name for display
-        variant_entry = next((v for v in self.variants if v["id"] == selected_variant_id), None)
-        variant_name = variant_entry["variant"] if variant_entry else selected_variant_id
+        variant_entry = next(
+            (v for v in self.variants if v["id"] == selected_variant_id), None
+        )
+        variant_name = (
+            variant_entry["variant"] if variant_entry else selected_variant_id
+        )
 
         embed = discord.Embed(
             title="🔄 Changing Map...",
             description=f"**Server:** {server_name}\n\nAttempting to change to **{self.map_name}** ({variant_name})",
-            color=0xffff00
+            color=0xFFFF00,
         )
-        
+
         await interaction.response.edit_message(embed=embed, view=None)
 
         # Acknowledge first, then check the booking lock right before the write.
-        if await _deny_if_booked(interaction, self.server_index, edit_flow=True):
+        if await _deny_if_booked(
+            interaction, self.server_index, edit_flow=True
+        ):
             return
 
         status_lines = []
         overall_success = False
 
-        result = await asyncio.to_thread(server_control.change_map, self.server_index, selected_variant_id)
+        result = await asyncio.to_thread(
+            server_control.change_map, self.server_index, selected_variant_id
+        )
         if result.success:
             if result.transport == "direct_rcon":
-                status_lines.append("Direct RCON fallback change_map succeeded.")
+                status_lines.append(
+                    "Direct RCON fallback change_map succeeded."
+                )
                 if result.warning:
                     status_lines.append(f"CRCON HTTP issue: {result.warning}")
             else:
@@ -2071,15 +2515,19 @@ class VariantDropdown(discord.ui.Select):
             status_lines.append(result.message)
 
         status_summary = "\n".join(f"• {line}" for line in status_lines)
-        
+
         if overall_success:
-            new_current_map = await asyncio.to_thread(api_client.get_current_map, self.server_index)
+            new_current_map = await asyncio.to_thread(
+                api_client.get_current_map, self.server_index
+            )
             stale_objective_keys = [
-                key for key in _current_objectives_state if key[0] == self.server_index
+                key
+                for key in _current_objectives_state
+                if key[0] == self.server_index
             ]
             for key in stale_objective_keys:
                 _current_objectives_state.pop(key, None)
-            
+
             final_embed = discord.Embed(
                 title="✅ Map Changed Successfully!",
                 description=(
@@ -2088,9 +2536,11 @@ class VariantDropdown(discord.ui.Select):
                     f"**Target:** {self.map_name} ({variant_name})\n\n"
                     f"{status_summary}"
                 ),
-                color=0x00ff00
+                color=0x00FF00,
             )
-            await interaction.edit_original_response(embed=final_embed, view=None)
+            await interaction.edit_original_response(
+                embed=final_embed, view=None
+            )
             await refresh_main_embed()
             asyncio.create_task(_delete_interaction_after(interaction, 10.0))
         else:
@@ -2101,70 +2551,86 @@ class VariantDropdown(discord.ui.Select):
                     f"**Target:** {self.map_name} ({variant_name})\n\n"
                     f"{status_summary}"
                 ),
-                color=0xff0000
+                color=0xFF0000,
             )
-            await interaction.edit_original_response(embed=final_embed, view=None)
+            await interaction.edit_original_response(
+                embed=final_embed, view=None
+            )
             asyncio.create_task(_delete_interaction_after(interaction, 20.0))
+
 
 class BackToServerSelectionButton(discord.ui.Button):
     def __init__(self):
-        super().__init__(label="← Back to Servers", style=discord.ButtonStyle.gray)
-    
+        super().__init__(
+            label="← Back to Servers", style=discord.ButtonStyle.gray
+        )
+
     async def callback(self, interaction: discord.Interaction):
         await defer_interaction(interaction)
         embed = discord.Embed(
             title="🗺️ Map Change Control",
             description="Select a server:",
-            color=0x00ff00
+            color=0x00FF00,
         )
-        
+
         view = ServerSelectionView()
         await update_interaction_message(interaction, embed=embed, view=view)
 
+
 class BackToGameModeButton(discord.ui.Button):
     def __init__(self, server_index):
-        super().__init__(label="← Back to Game Modes", style=discord.ButtonStyle.gray)
+        super().__init__(
+            label="← Back to Game Modes", style=discord.ButtonStyle.gray
+        )
         self.server_index = server_index
-    
+
     async def callback(self, interaction: discord.Interaction):
         await defer_interaction(interaction)
         server_name = api_client.get_server_name(self.server_index)
-        current_map = await asyncio.to_thread(api_client.get_current_map, self.server_index)
-        
+        current_map = await asyncio.to_thread(
+            api_client.get_current_map, self.server_index
+        )
+
         embed = discord.Embed(
             title="🗺️ Map Change Control",
             description=f"**Server:** {server_name}\n**Current Map:** {current_map}\n\nSelect a game mode:",
-            color=0x00ff00
+            color=0x00FF00,
         )
-        
+
         view = GameModeSelectionView(self.server_index)
         await update_interaction_message(interaction, embed=embed, view=view)
 
+
 class BackToMapSelectionButton(discord.ui.Button):
     def __init__(self, server_index, game_mode):
-        super().__init__(label="← Back to Maps", style=discord.ButtonStyle.gray)
+        super().__init__(
+            label="← Back to Maps", style=discord.ButtonStyle.gray
+        )
         self.server_index = server_index
         self.game_mode = game_mode
-    
+
     async def callback(self, interaction: discord.Interaction):
         await defer_interaction(interaction)
         server_name = api_client.get_server_name(self.server_index)
-        current_map = await asyncio.to_thread(api_client.get_current_map, self.server_index)
-        
+        current_map = await asyncio.to_thread(
+            api_client.get_current_map, self.server_index
+        )
+
         embed = discord.Embed(
             title=f"🗺️ {self.game_mode.title()} Maps",
             description=f"**Server:** {server_name}\n**Current Map:** {current_map}\n\nSelect a map:",
-            color=0x0099ff
+            color=0x0099FF,
         )
-        
+
         maps = await asyncio.to_thread(get_maps_for_mode, self.game_mode)
         view = MapSelectionView(self.server_index, self.game_mode, maps)
         await update_interaction_message(interaction, embed=embed, view=view)
 
+
 @bot.event
 async def on_ready():
-    print(f'{bot.user} has connected to Discord!')
-    print(f'Bot is in {len(bot.guilds)} guilds')
+    print(f"{bot.user} has connected to Discord!")
+    print(f"Bot is in {len(bot.guilds)} guilds")
 
     # Start periodic cache cleanup task
     _start_cache_cleanup_task()
@@ -2178,11 +2644,13 @@ async def on_ready():
 
     # Add the persistent view
     bot.add_view(GameModeView())
-    
+
     # Post the persistent button to the specified channel
-    channel_id_str = os.getenv('DISCORD_CHANNEL_ID')
+    channel_id_str = os.getenv("DISCORD_CHANNEL_ID")
     if not channel_id_str:
-        print("DISCORD_CHANNEL_ID not configured; cannot post persistent controls.")
+        print(
+            "DISCORD_CHANNEL_ID not configured; cannot post persistent controls."
+        )
         return
 
     try:
@@ -2201,27 +2669,46 @@ async def on_ready():
     if isinstance(channel, (discord.TextChannel, discord.Thread)):
         message = await ensure_persistent_message(channel)
         if message:
-            print(f"Persistent controls ready in #{channel.name} (message ID {message.id})")
+            print(
+                f"Persistent controls ready in #{channel.name} (message ID {message.id})"
+            )
     else:
         print(f"Could not find text channel with ID: {channel_id}")
 
+
 # Admin command to repost the button if needed
-@bot.tree.command(name="repost_button", description="Repost the map changer button (Admin only)")
+@bot.tree.command(
+    name="repost_button",
+    description="Repost the map changer button (Admin only)",
+)
 async def repost_button(interaction: discord.Interaction):
     # Check if user has admin permissions
-    if not isinstance(interaction.user, discord.Member) or not interaction.user.guild_permissions.administrator:
-        await send_temporary_response(interaction, content="❌ You need administrator permissions to use this command.", delay=20)
+    if (
+        not isinstance(interaction.user, discord.Member)
+        or not interaction.user.guild_permissions.administrator
+    ):
+        await send_temporary_response(
+            interaction,
+            content="❌ You need administrator permissions to use this command.",
+            delay=20,
+        )
         return
 
-    channel_id_str = os.getenv('DISCORD_CHANNEL_ID')
+    channel_id_str = os.getenv("DISCORD_CHANNEL_ID")
     if not channel_id_str:
-        await send_temporary_response(interaction, content="❌ DISCORD_CHANNEL_ID is not configured.", delay=20)
+        await send_temporary_response(
+            interaction,
+            content="❌ DISCORD_CHANNEL_ID is not configured.",
+            delay=20,
+        )
         return
 
     try:
         channel_id = int(channel_id_str)
     except ValueError:
-        await send_temporary_response(interaction, content="❌ DISCORD_CHANNEL_ID is invalid.", delay=20)
+        await send_temporary_response(
+            interaction, content="❌ DISCORD_CHANNEL_ID is invalid.", delay=20
+        )
         return
 
     channel = bot.get_channel(channel_id)
@@ -2232,11 +2719,18 @@ async def repost_button(interaction: discord.Interaction):
         message = await channel.send(embed=embed, view=view)
         global persistent_message_ref
         persistent_message_ref = (channel.id, message.id)
-        await send_temporary_response(interaction, content="✅ Map changer button reposted!", delay=20)
+        await send_temporary_response(
+            interaction, content="✅ Map changer button reposted!", delay=20
+        )
     else:
-        await send_temporary_response(interaction, content="❌ Could not find the configured channel.", delay=20)
+        await send_temporary_response(
+            interaction,
+            content="❌ Could not find the configured channel.",
+            delay=20,
+        )
 
-booking_refresher: Optional[BookingBoundaryRefresher] = None
+
+booking_refresher: BookingBoundaryRefresher | None = None
 if booking_service is not None:
     register_booking_commands(
         bot.tree,
@@ -2252,16 +2746,19 @@ if booking_service is not None:
     booking_refresher = BookingBoundaryRefresher(
         booking_service,
         lambda: refresh_main_embed(),
-        daily_at=booking_config.panel_refresh_time.replace(tzinfo=booking_config.timezone),
+        daily_at=booking_config.panel_refresh_time.replace(
+            tzinfo=booking_config.timezone
+        ),
     )
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     from config.settings import validate_required_env
+
     validate_required_env()
-    token = os.getenv('DISCORD_TOKEN')
+    token = os.getenv("DISCORD_TOKEN")
     if not token:
         print("Error: DISCORD_TOKEN not found in environment variables")
-        exit(1)
-    
+        sys.exit(1)
+
     bot.run(token)

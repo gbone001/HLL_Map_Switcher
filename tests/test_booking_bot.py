@@ -342,10 +342,12 @@ class CommandTests(BookingBotTestCase):
         self.assertIn("Server One", choices[0].name)
 
     async def test_book_requires_role(self):
-        reply = await self.run_book(member(OTHER_ID))
+            # Now any guild member can book - no role required
+            reply = await self.run_book(member(OTHER_ID))
 
-        self.assertIn("role", reply)
-        self.assertEqual(self.service.list_live(), [])
+            self.assertIn("booked", reply)
+            # booking should succeed now
+            self.assertEqual(len(self.service.list_live()), 1)
 
     async def test_book_rejects_bad_time(self):
         reply = await self.run_book(member(BOOKER_ID, role_ids=[BOOKING_ROLE]), start="tonight")
