@@ -26,6 +26,7 @@
 
 ## Discord Controls In Production
 - Slash commands:
+- `/setup_panel [channel]` -> admins create the control panel in a channel (default: the current one); the old panel is removed and the new channel is remembered in `data/panel_message.json`, so restarts restore the panel there. `DISCORD_CHANNEL_ID` is only the fallback before the first `/setup_panel`.
 - `/repost_button` -> reposts the persistent control panel for admins.
 - `/book`, `/bookings`, `/cancel_booking` -> server booking (enabled only when `BOOKING_ROLE_ID` and `DISCORD_GUILD_ID` are set; roles and admin rights count only inside `DISCORD_GUILD_ID`). See `docs/booking-shaping.md`.
 - Persistent panel actions:

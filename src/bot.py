@@ -992,27 +992,54 @@ async def ensure_persistent_message(
     return message
 
 
-async def refresh_main_embed() -> None:
-    channel_id = os.getenv("DISCORD_CHANNEL_ID")
-    if not channel_id:
-        return
-
+def _panel_channel_id() -> int | None:
+    """The panel's channel: wherever /setup_panel last put it, else DISCORD_CHANNEL_ID."""
+    if persistent_message_ref:
+        return persistent_message_ref[0]
     try:
-        channel_id_int = int(channel_id)
+        return int(os.getenv("DISCORD_CHANNEL_ID") or "")
     except ValueError:
-        return
+        return None
 
-    channel = bot.get_channel(channel_id_int)
+
+async def _resolve_text_channel(
+    channel_id: int | None,
+) -> discord.TextChannel | discord.Thread | None:
+    if channel_id is None:
+        return None
+    channel = bot.get_channel(channel_id)
     if channel is None:
         try:
-            channel = await bot.fetch_channel(channel_id_int)
+            channel = await bot.fetch_channel(channel_id)
         except (discord.NotFound, discord.HTTPException):
-            return
+            return None
+    if isinstance(channel, (discord.TextChannel, discord.Thread)):
+        return channel
+    return None
 
-    if not isinstance(channel, (discord.TextChannel, discord.Thread)):
-        return
 
-    await ensure_persistent_message(channel)
+async def post_panel(
+    channel: discord.TextChannel | discord.Thread,
+) -> discord.Message:
+    """Post a fresh panel in `channel`, remove the one it replaces, and remember the new one."""
+    _persistent_focused_server.setdefault(channel.id, None)
+    embed, view = await build_panel(_persistent_focused_server[channel.id])
+    message = await channel.send(embed=embed, view=view)
+    if persistent_message_ref and persistent_message_ref[1] != message.id:
+        old_channel = await _resolve_text_channel(persistent_message_ref[0])
+        if old_channel is not None:
+            try:
+                await old_channel.get_partial_message(persistent_message_ref[1]).delete()
+            except discord.HTTPException:
+                pass  # already deleted by hand
+    _set_panel_ref(channel.id, message.id)
+    return message
+
+
+async def refresh_main_embed() -> None:
+    channel = await _resolve_text_channel(_panel_channel_id())
+    if channel is not None:
+        await ensure_persistent_message(channel)
 
 
 async def _delete_interaction_after(
@@ -2781,28 +2808,14 @@ async def on_ready():
     # Add the persistent view
     bot.add_view(GameModeView())
 
-    # Post the persistent button to the specified channel
-    channel_id_str = os.getenv("DISCORD_CHANNEL_ID")
-    if not channel_id_str:
-        print(
-            "DISCORD_CHANNEL_ID not configured; cannot post persistent controls."
-        )
+    # Restore the panel where /setup_panel last put it (or DISCORD_CHANNEL_ID).
+    channel_id = _panel_channel_id()
+    if channel_id is None:
+        print("No panel channel yet; an admin can run /setup_panel in a channel.")
         return
 
-    try:
-        channel_id = int(channel_id_str)
-    except ValueError:
-        print(f"Invalid DISCORD_CHANNEL_ID value: {channel_id_str}")
-        return
-
-    channel = bot.get_channel(channel_id)
-    if channel is None:
-        try:
-            channel = await bot.fetch_channel(channel_id)
-        except (discord.NotFound, discord.HTTPException):
-            channel = None
-
-    if isinstance(channel, (discord.TextChannel, discord.Thread)):
+    channel = await _resolve_text_channel(channel_id)
+    if channel is not None:
         message = await ensure_persistent_message(channel)
         if message:
             print(
@@ -2830,45 +2843,70 @@ async def repost_button(interaction: discord.Interaction):
         )
         return
 
-    channel_id_str = os.getenv("DISCORD_CHANNEL_ID")
-    if not channel_id_str:
+    channel = await _resolve_text_channel(_panel_channel_id())
+    if channel is None:
         await send_temporary_response(
             interaction,
-            content="❌ DISCORD_CHANNEL_ID is not configured.",
+            content="❌ No panel channel is set. Use /setup_panel in the channel you want.",
+            delay=20,
+        )
+        return
+    await defer_interaction(interaction, ephemeral=True)
+    await post_panel(channel)
+    await send_temporary_response(
+        interaction, content="✅ Map changer button reposted!", delay=20
+    )
+
+
+@bot.tree.command(
+    name="setup_panel",
+    description="Create the control panel in a channel; it is restored there on restart (Admin only)",
+)
+@discord.app_commands.describe(
+    channel="Channel for the panel (defaults to this one)"
+)
+async def setup_panel(
+    interaction: discord.Interaction,
+    channel: discord.TextChannel | None = None,
+):
+    if (
+        not isinstance(interaction.user, discord.Member)
+        or not interaction.user.guild_permissions.administrator
+    ):
+        await send_temporary_response(
+            interaction,
+            content="❌ You need administrator permissions to use this command.",
             delay=20,
         )
         return
 
+    target = channel or interaction.channel
+    if not isinstance(target, (discord.TextChannel, discord.Thread)):
+        await send_temporary_response(
+            interaction,
+            content="❌ Pick a text channel for the panel.",
+            delay=20,
+        )
+        return
+
+    await defer_interaction(interaction, ephemeral=True)
     try:
-        channel_id = int(channel_id_str)
-    except ValueError:
-        await send_temporary_response(
-            interaction, content="❌ DISCORD_CHANNEL_ID is invalid.", delay=20
-        )
-        return
-
-    channel = bot.get_channel(channel_id)
-
-    if isinstance(channel, (discord.TextChannel, discord.Thread)):
-        await defer_interaction(interaction, ephemeral=True)
-        embed, view = await build_panel()
-        message = await channel.send(embed=embed, view=view)
-        if persistent_message_ref and persistent_message_ref[0] == channel.id:
-            # Remove the panel being replaced so the channel keeps a single copy.
-            try:
-                await channel.get_partial_message(persistent_message_ref[1]).delete()
-            except discord.HTTPException:
-                pass
-        _set_panel_ref(channel.id, message.id)
-        await send_temporary_response(
-            interaction, content="✅ Map changer button reposted!", delay=20
-        )
-    else:
+        message = await post_panel(target)
+    except discord.Forbidden:
         await send_temporary_response(
             interaction,
-            content="❌ Could not find the configured channel.",
+            content=f"❌ I can't post in {target.mention}. Give me View Channel and Send Messages there.",
             delay=20,
         )
+        return
+    print(
+        f"Control panel set up in #{target.name} (message ID {message.id}) by {interaction.user.id}"
+    )
+    await send_temporary_response(
+        interaction,
+        content=f"✅ Control panel created in {target.mention}. It will be restored there after restarts.",
+        delay=20,
+    )
 
 
 booking_refresher: BookingBoundaryRefresher | None = None

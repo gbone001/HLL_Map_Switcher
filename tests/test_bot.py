@@ -183,3 +183,27 @@ class PanelMessageTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result, "edited")
         channel.get_partial_message.assert_called_once_with(22)
         channel.send.assert_not_called()
+
+    def test_panel_channel_prefers_saved_panel_over_env(self):
+        with mock.patch.dict(os.environ, {"DISCORD_CHANNEL_ID": "99"}):
+            self.assertEqual(bot._panel_channel_id(), 99)
+            bot._set_panel_ref(11, 22)
+            self.assertEqual(bot._panel_channel_id(), 11)
+
+    async def test_post_panel_moves_panel_and_deletes_the_old_one(self):
+        bot._set_panel_ref(11, 22)
+        old_partial = mock.MagicMock()
+        old_partial.delete = mock.AsyncMock()
+        old_channel = mock.MagicMock(id=11)
+        old_channel.get_partial_message.return_value = old_partial
+        new_channel = mock.MagicMock(id=33)
+        new_channel.send = mock.AsyncMock(return_value=mock.MagicMock(id=44))
+
+        with mock.patch.object(bot, "build_panel", mock.AsyncMock(return_value=("embed", "view"))), \
+                mock.patch.object(bot, "_resolve_text_channel", mock.AsyncMock(return_value=old_channel)):
+            await bot.post_panel(new_channel)
+
+        old_channel.get_partial_message.assert_called_once_with(22)
+        old_partial.delete.assert_awaited_once()
+        self.assertEqual(bot._load_panel_ref(), (33, 44))
+        self.assertEqual(bot._panel_channel_id(), 33)
