@@ -7,6 +7,7 @@ timestamps, which each viewer's client renders in their own time zone.
 from __future__ import annotations
 
 import asyncio
+import functools
 import logging
 import sqlite3
 from collections.abc import Awaitable, Callable
@@ -251,16 +252,7 @@ async def book_and_reply(
             event_name=event_name,
         )
     except BookingOverlapError as exc:
-        conflict = exc.conflict
-        if conflict.guild_id is None or conflict.guild_id == interaction.guild_id:
-            holder = f"<@{conflict.user_id}>'s booking #{conflict.id}"
-        else:
-            holder = f"a booking by **{deps.guild_name(conflict.guild_id)}**"
-        await _reply(
-            interaction,
-            f"❌ That overlaps {holder}: "
-            f"{timestamp(conflict.start_utc)} → {timestamp(conflict.end_utc, 't')}.",
-        )
+        await _reply(interaction, _overlap_message(exc.conflict, interaction, deps))
         return False
     except sqlite3.Error:
         logger.exception("Booking store failed while creating a booking")
@@ -283,6 +275,76 @@ async def book_and_reply(
         f"{timestamp(first.end_utc, 't')} (booking #{first.id}){series}. "
         "During your slot only you and booking admins can change this server.",
     )
+    await _notify_change(deps)
+    return True
+
+
+def _overlap_message(
+    conflict: Booking, interaction: discord.Interaction, deps: BookingCommandDeps
+) -> str:
+    if conflict.guild_id is None or conflict.guild_id == interaction.guild_id:
+        holder = f"<@{conflict.user_id}>'s booking #{conflict.id}"
+    else:
+        holder = f"a booking by **{deps.guild_name(conflict.guild_id)}**"
+    return (
+        f"❌ That overlaps {holder}: "
+        f"{timestamp(conflict.start_utc)} → {timestamp(conflict.end_utc, 't')}."
+    )
+
+
+async def edit_and_reply(
+    interaction: discord.Interaction,
+    deps: BookingCommandDeps,
+    booking_id: int,
+    *,
+    server_index: int,
+    start: str,
+    duration: str,
+    event_name: str | None,
+    whole_series: bool,
+) -> bool:
+    """Edit a booking (or every remaining date of its series) and reply; True if saved."""
+    await _defer(interaction)
+    try:
+        start_utc = parse_start(start, deps.config.timezone)
+        end_utc = start_utc + parse_duration(duration)
+        updated = await asyncio.to_thread(
+            functools.partial(
+                deps.service.reschedule,
+                booking_id,
+                interaction.user.id,
+                is_booking_admin(interaction.user, deps.config),
+                guild_admin_id(interaction.user),
+                server_key=deps.server_key(server_index),
+                start_utc=start_utc,
+                end_utc=end_utc,
+                event_name=event_name,
+                whole_series=whole_series,
+            )
+        )
+    except BookingOverlapError as exc:
+        await _reply(interaction, _overlap_message(exc.conflict, interaction, deps))
+        return False
+    except sqlite3.Error:
+        logger.exception("Booking store failed while editing a booking")
+        await _reply(interaction, STORE_ERROR_MESSAGE)
+        return False
+    except BookingError as exc:
+        await _reply(interaction, f"❌ {exc}")
+        return False
+    first = updated[0]
+    server = deps.server_name_for_key(first.server_key)
+    if len(updated) > 1:
+        message = (
+            f"✅ Updated series #{first.series_id} on **{server}** ({len(updated)} dates). "
+            f"Next: {timestamp(first.start_utc)} → {timestamp(first.end_utc, 't')}."
+        )
+    else:
+        message = (
+            f"✅ Updated booking #{first.id}: **{server}** "
+            f"{timestamp(first.start_utc)} → {timestamp(first.end_utc, 't')}."
+        )
+    await _reply(interaction, message)
     await _notify_change(deps)
     return True
 

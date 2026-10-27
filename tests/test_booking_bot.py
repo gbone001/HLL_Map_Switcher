@@ -735,34 +735,92 @@ class BookEventOptionTests(CommandTests):
         self.assertEqual(self.service.list_live()[0].event_name, "Night ops")
 
 
-class PickerEventNameTests(unittest.IsolatedAsyncioTestCase):
-    async def test_book_asks_for_event_name_then_books_and_closes_the_picker(self):
-        from commands import booking_panel
-
-        deps = BookingCommandDeps(
-            service=None, config=ENABLED_CONFIG, servers=lambda: [(0, "Server One")],
-            server_key=lambda index: "server1", server_name_for_key=lambda key: "Server One",
+class BookingModalTests(BookingBotTestCase):
+    def deps(self, servers=((0, "Server One"),)):
+        return BookingCommandDeps(
+            service=self.service, config=ENABLED_CONFIG, servers=lambda: list(servers),
+            server_key=lambda index: f"server{index + 1}", server_name_for_key=lambda key: key,
             on_change=mock.AsyncMock(),
         )
-        picker = booking_panel.BookingPickerView(deps)
-        click = mock.MagicMock()
+
+    async def test_book_button_opens_the_pop_up_form(self):
+        from commands import booking_panel
+
+        interaction = interaction_for(member(BOOKER_ID))
+        interaction.response.send_modal = mock.AsyncMock()
+
+        await booking_panel.open_book_panel(interaction, self.deps())
+
+        modal = interaction.response.send_modal.await_args.args[0]
+        self.assertIsInstance(modal, booking_panel.BookingModal)
+        self.assertEqual(
+            [label.text for label in modal.children], ["Event name", "Server", "Date", "Time", "Repeat"]
+        )
+        self.assertEqual([o.default for o in modal.server.options], [True])  # only server preselected
+
+    async def test_submitting_the_form_books_with_event_time_and_repeat(self):
+        from commands import booking_panel
+
+        modal = booking_panel.BookingModal(self.deps())
+        modal.event._value = "Weekly Tank Battle"
+        modal.server._values = ["0"]
+        modal.date._values = ["2027-01-20"]
+        modal.time._value = "19:30-22:00"
+        modal.repeat._values = ["weekly:4"]
+        book = mock.AsyncMock(return_value=True)
+
+        with mock.patch.object(booking_panel, "book_and_reply", book):
+            await modal.on_submit(interaction_for(member(BOOKER_ID)))
+
+        args = book.await_args
+        self.assertEqual(args.args[2:], (0, "2027-01-20 19:30", "150", "weekly", 4))
+        self.assertEqual(args.kwargs["event_name"], "Weekly Tank Battle")
+
+    async def test_bad_time_is_explained_and_nothing_is_booked(self):
+        from commands import booking_panel
+
+        modal = booking_panel.BookingModal(self.deps())
+        modal.server._values = ["0"]
+        modal.date._values = ["2027-01-20"]
+        modal.time._value = "half seven"
+        interaction = interaction_for(member(BOOKER_ID))
+        book = mock.AsyncMock()
+
+        with mock.patch.object(booking_panel, "book_and_reply", book):
+            await modal.on_submit(interaction)
+
+        book.assert_not_awaited()
+        self.assertIn("Couldn't read the time", interaction.response.sent[-1])
+
+    async def test_edit_from_manage_bookings_moves_the_whole_series(self):
+        from commands import booking_panel
+
+        self.clock.ts = T0 - 24 * HOUR
+        series = self.service.create_series("server1", BOOKER_ID, "b", T0 + HOUR, T0 + 2 * HOUR, "weekly", 2, event_name="Old")
+        deps = self.deps(servers=((0, "Server One"), (1, "Server Two")))
+        view = booking_panel.ManageBookingsView(deps, self.service.list_live(), BOOKER_ID, False)
+        view.booking_select._values = [str(series[0].id)]
+        click = interaction_for(member(BOOKER_ID))
         click.response.send_modal = mock.AsyncMock()
 
-        await picker._book(click)
+        await view.edit_selected.callback(click)
 
         modal = click.response.send_modal.await_args.args[0]
-        self.assertIsInstance(modal, booking_panel.EventNameModal)
+        self.assertEqual([label.text for label in modal.children], ["Event name", "Server", "Date", "Time"])
+        self.assertEqual(modal.event.default, "Old")
+        modal.event._value = "New name"
+        modal.server._values = ["1"]
+        modal.date._values = [modal.date.options[[o.default for o in modal.date.options].index(True)].value]
+        modal.time._value = modal.time.default
+        submit = interaction_for(member(BOOKER_ID))
 
-        modal.event_name._value = "Night ops"
-        submit = mock.MagicMock()
-        submit.response.defer = mock.AsyncMock()
-        submit.delete_original_response = mock.AsyncMock()
-        book = mock.AsyncMock(return_value=True)
-        with mock.patch.object(booking_panel, "book_and_reply", book):
-            await modal.on_submit(submit)
+        await modal.on_submit(submit)
 
-        self.assertEqual(book.await_args.kwargs["event_name"], "Night ops")
-        submit.delete_original_response.assert_awaited_once()
+        stored = [self.service.get(b.id) for b in series]
+        self.assertEqual({(b.server_key, b.event_name) for b in stored}, {("server2", "New name")})
+        self.assertEqual([b.start_utc for b in stored], [b.start_utc for b in series])
+        self.assertIn("Updated series", submit.response.sent[-1])
+        submit.edit_original_response.assert_awaited()  # Manage Bookings redrawn
 
 
 class SeriesCommandTests(BookingBotTestCase):

@@ -9,7 +9,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import sqlite3
-from datetime import date, datetime, timedelta
+from datetime import datetime, timedelta
 
 import discord
 
@@ -20,6 +20,7 @@ from commands.booking import (
     _defer,
     _reply,
     book_and_reply,
+    edit_and_reply,
     booker_text,
     can_book,
     cancel_and_reply,
@@ -30,17 +31,17 @@ from commands.booking import (
     is_booking_admin,
     refuse_unavailable,
 )
-from services.booking import EVENT_NAME_MAX_LENGTH, MAX_OCCURRENCES, Booking, group_by_series
+from services.booking import (
+    EVENT_NAME_MAX_LENGTH,
+    MAX_OCCURRENCES,
+    Booking,
+    BookingError,
+    BookingGroup,
+    group_by_series,
+    parse_time_range,
+)
 
 logger = logging.getLogger(__name__)
-
-RECURRENCE_CHOICES = [
-    ("none", "Does not repeat"),
-    ("daily", "Daily"),
-    ("weekly", "Weekly"),
-    ("biweekly", "Every 2 weeks"),
-]
-
 
 class _DeferSelect(discord.ui.Select):
     """A select whose value is read later by a button; picking just acknowledges."""
@@ -70,11 +71,7 @@ async def open_book_panel(
     if not can_book(interaction.user, deps):
         await _reply(interaction, NOT_A_MEMBER_MESSAGE)
         return
-    view = BookingPickerView(deps)
-    await interaction.response.send_message(
-        embed=view.embed(), view=view, ephemeral=True
-    )
-    view.close = interaction.delete_original_response
+    await interaction.response.send_modal(BookingModal(deps))
 
 
 class _SelfClosingView(discord.ui.View):
@@ -94,330 +91,144 @@ class _SelfClosingView(discord.ui.View):
         await self.finish()
 
 
-# One server: the server row is not needed, so 30 days fit as two 15-day dropdowns.
-# Several servers: one 25-day dropdown (Discord's per-select limit), paged with ◀ ▶.
-SINGLE_SERVER_DATE_DAYS = 30
-MULTI_SERVER_DATE_DAYS = 25
-SLOT_MINUTES = 30
-DURATION_CHOICES = [30, 60, 90, 120, 150, 180, 240, 300, 360, 480, 720, 1440]
+# Discord allows 25 options per dropdown, so the date list covers 25 days.
+DATE_DAYS = 25
+REPEAT_CHOICES = (
+    [("none:1", "Does not repeat")]
+    + [(f"daily:{n}", f"Daily · {n} days") for n in (2, 3, 5, 7, 14)]
+    + [(f"weekly:{n}", f"Weekly · {n} weeks") for n in (2, 3, 4, 6, 8, 10, 12, 16, 20)]
+    + [(f"biweekly:{n}", f"Every 2 weeks · {n} times") for n in (2, 3, 4, 6, 8, 10)]
+)
 
 
-def _hhmm(minutes: int) -> str:
-    return f"{minutes // 60 % 24:02d}:{minutes % 60:02d}"
+class BookingModal(discord.ui.Modal):
+    """Pop-up booking form: event name, server, date, time range and repeat.
 
-
-def _duration_label(minutes: int) -> str:
-    hours, mins = divmod(minutes, 60)
-    if not hours:
-        return f"{mins} min"
-    return f"{hours} h {mins:02d}" if mins else f"{hours} h"
-
-
-class _StateSelect(discord.ui.Select):
-    """Stores its pick on the picker view and redraws it, like editing a calendar field."""
-
-    def __init__(self, field: str, cast, **kwargs):
-        super().__init__(**kwargs)
-        self.field = field
-        self.cast = cast
-
-    async def callback(self, interaction: discord.Interaction):
-        setattr(self.view, self.field, self.cast(self.values[0]))
-        await self.view.redraw(interaction)
-
-
-class _ActionButton(discord.ui.Button):
-    def __init__(self, action, **kwargs):
-        super().__init__(**kwargs)
-        self.action = action
-
-    async def callback(self, interaction: discord.Interaction):
-        await self.action(interaction)
-
-
-class BookingPickerView(_SelfClosingView):
-    """Google-Calendar-style picker: server, date, start time and length as dropdowns.
-
-    The embed shows the slot as it will be booked and updates on every pick. 🔁 swaps in a
-    repeat panel, like Calendar's "Does not repeat" menu. Discord allows 5 rows and 25
-    options per select, so start times show one half of the day (AM/PM toggle) in
-    30-minute steps. The picker deletes itself after a successful booking or on timeout.
+    With `editing`, the same form edits a booking (or a whole series, every remaining
+    date moving together) and leaves out Repeat. A Discord modal holds at most 5 fields.
     """
 
-    def __init__(self, deps: BookingCommandDeps):
-        super().__init__(timeout=600)
+    def __init__(self, deps: BookingCommandDeps, *, editing: BookingGroup | None = None, on_saved=None):
+        super().__init__(title="Edit booking" if editing else "Book a server", timeout=900)
         self.deps = deps
-        self.tz = deps.config.timezone
-        now = datetime.now(self.tz)
-        self.today = now.date()
-        servers = deps.servers()
-        self.single_server = len(servers) == 1
-        self.page_days = (
-            SINGLE_SERVER_DATE_DAYS if self.single_server else MULTI_SERVER_DATE_DAYS
-        )
-        self.server_index: int | None = servers[0][0] if self.single_server else None
-        # Default slot: the next half hour, one hour long, like a new Calendar event.
-        minute_of_day = now.hour * 60 + now.minute
-        next_slot = (minute_of_day // SLOT_MINUTES + 1) * SLOT_MINUTES
-        self.date = self.today + timedelta(days=next_slot // 1440)
-        self.start_minutes = next_slot % 1440
-        self.pm = self.start_minutes >= 720
-        self.page = (self.date - self.today).days // self.page_days
-        self.duration = 60
-        self.recurrence = "none"
-        self.count = 1
-        self.editing_repeat = False
-        self.max_days = max(1, deps.config.max_lead_seconds // 86400)
-        self.max_minutes = deps.config.max_duration_seconds // 60 or 1440
-        self._render()
+        self.editing = editing
+        self.on_saved = on_saved
+        tz = deps.config.timezone
+        today = datetime.now(tz).date()
+        first = editing.first if editing else None
+        start = datetime.fromtimestamp(first.start_utc, tz) if first else None
+        end = datetime.fromtimestamp(first.end_utc, tz) if first else None
 
-    # ------------------------------------------------------------ display
-
-    def embed(self) -> discord.Embed:
-        start = datetime.combine(self.date, datetime.min.time(), tzinfo=self.tz)
-        start += timedelta(minutes=self.start_minutes)
-        end = start + timedelta(minutes=self.duration)
-        end_text = end.strftime("%H:%M")
-        if end.date() != start.date():
-            end_text += f" ({end.strftime('%a %d %b')})"
-        server = dict(self.deps.servers()).get(self.server_index, "*Pick a server*")
-        repeat = (
-            "Does not repeat"
-            if self.recurrence == "none"
-            else f"{dict(RECURRENCE_CHOICES)[self.recurrence]}, {self.count} times"
+        self.event = discord.ui.TextInput(
+            required=False,
+            max_length=EVENT_NAME_MAX_LENGTH,
+            placeholder="Weekly Tank Battle",
+            default=first.event_name if first else None,
         )
-        return discord.Embed(
-            title="📅 Book Server",
-            description="\n".join(
-                [
-                    f"🕒 **{start.strftime('%A, %d %B')}** · **{start.strftime('%H:%M')} – {end_text}**",
-                    f"🖥️ {server}",
-                    f"🔁 {repeat}",
-                    f"🌐 Times in {self.tz.key}",
-                ]
-            ),
-            color=0x5EA9F5,
-        )
+        self.add_item(discord.ui.Label(text="Event name", description="Optional. Shown on the schedule.", component=self.event))
 
-    def _render(self) -> None:
-        self.clear_items()
-        if self.editing_repeat:
-            self._render_repeat()
+        servers = deps.servers()[:25]
+        if first:
+            current = next((i for i, _ in servers if deps.server_key(i) == first.server_key), None)
         else:
-            self._render_picker()
+            current = servers[0][0] if len(servers) == 1 else None
+        self.server = discord.ui.Select(
+            placeholder="Pick a server",
+            options=[
+                discord.SelectOption(label=name[:100], value=str(index), default=index == current)
+                for index, name in servers
+            ],
+        )
+        self.add_item(discord.ui.Label(text="Server", component=self.server))
 
-    def _render_picker(self) -> None:
-        if not self.single_server:
-            self.add_item(
-                _StateSelect(
-                    "server_index",
-                    int,
-                    placeholder="Select a server...",
-                    options=[
-                        discord.SelectOption(
-                            label=name[:100],
-                            value=str(index),
-                            default=index == self.server_index,
-                        )
-                        for index, name in self.deps.servers()[:25]
-                    ],
-                )
-            )
-
-        first = self.page * self.page_days
+        chosen = start.date() if start else today
+        max_days = max(1, deps.config.max_lead_seconds // 86400)
+        window_start = today if (chosen - today).days < DATE_DAYS else chosen - timedelta(days=DATE_DAYS // 2)
         days = [
-            self.today + timedelta(days=n)
-            for n in range(first, min(first + self.page_days, self.max_days + 1))
+            window_start + timedelta(days=n)
+            for n in range(DATE_DAYS)
+            if (window_start + timedelta(days=n) - today).days <= max_days
         ]
-        # Split into equal dropdowns of at most 25 days (30 days -> two of 15).
-        chunks = -(-len(days) // 25)
-        size = -(-len(days) // chunks)
-        for start in range(0, len(days), size):
-            chunk = days[start : start + size]
-            self.add_item(
-                _StateSelect(
-                    "date",
-                    date.fromisoformat,
-                    placeholder=(
-                        f"Date: {chunk[0].strftime('%d %b')} – {chunk[-1].strftime('%d %b')}"
-                    ),
-                    options=[
-                        discord.SelectOption(
-                            label=d.strftime("%a %d %b"),
-                            value=d.isoformat(),
-                            description={0: "Today", 1: "Tomorrow"}.get(
-                                (d - self.today).days
-                            ),
-                            default=d == self.date,
-                        )
-                        for d in chunk
-                    ],
+        self.date = discord.ui.Select(
+            placeholder="Pick a date",
+            options=[
+                discord.SelectOption(
+                    label=d.strftime("%a %d %b"),
+                    value=d.isoformat(),
+                    description={0: "Today", 1: "Tomorrow"}.get((d - today).days),
+                    default=d == chosen,
                 )
-            )
+                for d in days
+            ],
+        )
+        self.add_item(discord.ui.Label(text="Date", component=self.date))
 
-        base = 720 if self.pm else 0
+        self.time = discord.ui.TextInput(
+            max_length=15,
+            placeholder="19:30-22:00",
+            default=f"{start:%H:%M}-{end:%H:%M}" if start else None,
+        )
         self.add_item(
-            _StateSelect(
-                "start_minutes",
-                int,
-                placeholder="Start time",
+            discord.ui.Label(
+                text="Time",
+                description=f"Start and end, 24-hour, {tz.key}"[:100],
+                component=self.time,
+            )
+        )
+
+        self.repeat = None
+        if editing is None:
+            self.repeat = discord.ui.Select(
                 options=[
-                    discord.SelectOption(
-                        label=_hhmm(m), value=str(m), default=m == self.start_minutes
-                    )
-                    for m in range(base, base + 720, SLOT_MINUTES)
+                    discord.SelectOption(label=label, value=value, default=value == "none:1")
+                    for value, label in REPEAT_CHOICES
+                    if int(value.split(":")[1]) <= MAX_OCCURRENCES
                 ],
             )
-        )
-
-        self.add_item(
-            _StateSelect(
-                "duration",
-                int,
-                placeholder="Length",
-                options=[
-                    discord.SelectOption(
-                        label=_duration_label(m),
-                        value=str(m),
-                        description=f"Ends {_hhmm(self.start_minutes + m)}",
-                        default=m == self.duration,
-                    )
-                    for m in DURATION_CHOICES
-                    if m <= self.max_minutes
-                ],
-            )
-        )
-        for row, item in enumerate(self.children):
-            item.row = row
-
-        last_page = self.max_days // self.page_days
-        buttons = [
-            _ActionButton(self._shift_page(-1), label="◀", disabled=self.page == 0),
-            _ActionButton(
-                self._shift_page(1), label="▶", disabled=self.page >= last_page
-            ),
-            _ActionButton(
-                self._toggle_half, label="AM times" if self.pm else "PM times"
-            ),
-            _ActionButton(self._open_repeat, label="🔁 Repeat"),
-            _ActionButton(
-                self._book,
-                label="Book",
-                style=discord.ButtonStyle.success,
-                disabled=self.server_index is None,
-            ),
-        ]
-        for button in buttons:
-            button.row = 4
-            self.add_item(button)
-
-    def _render_repeat(self) -> None:
-        self.add_item(
-            _StateSelect(
-                "recurrence",
-                str,
-                options=[
-                    discord.SelectOption(
-                        label=label, value=value, default=value == self.recurrence
-                    )
-                    for value, label in RECURRENCE_CHOICES
-                ],
-                row=0,
-            )
-        )
-        self.add_item(
-            _StateSelect(
-                "count",
-                int,
-                placeholder="How many times",
-                disabled=self.recurrence == "none",
-                options=[
-                    discord.SelectOption(
-                        label=f"{n} times", value=str(n), default=n == self.count
-                    )
-                    for n in range(2, MAX_OCCURRENCES + 1)
-                ],
-                row=1,
-            )
-        )
-        self.add_item(
-            _ActionButton(
-                self._close_repeat,
-                label="Done",
-                style=discord.ButtonStyle.primary,
-                row=2,
-            )
-        )
-
-    async def redraw(self, interaction: discord.Interaction) -> None:
-        if self.recurrence != "none" and self.count < 2:
-            self.count = 2
-        self._render()
-        await interaction.response.edit_message(embed=self.embed(), view=self)
-        # Keep the freshest interaction token (valid 15 minutes) for deleting on timeout.
-        self.close = interaction.delete_original_response
-
-    # ------------------------------------------------------------ actions
-
-    def _shift_page(self, step: int):
-        async def action(interaction: discord.Interaction):
-            self.page += step
-            self.date = self.today + timedelta(days=self.page * self.page_days)
-            await self.redraw(interaction)
-
-        return action
-
-    async def _toggle_half(self, interaction: discord.Interaction):
-        self.pm = not self.pm
-        self.start_minutes = (self.start_minutes + 720) % 1440
-        await self.redraw(interaction)
-
-    async def _open_repeat(self, interaction: discord.Interaction):
-        self.editing_repeat = True
-        await self.redraw(interaction)
-
-    async def _close_repeat(self, interaction: discord.Interaction):
-        self.editing_repeat = False
-        await self.redraw(interaction)
-
-    async def _book(self, interaction: discord.Interaction):
-        await interaction.response.send_modal(EventNameModal(self))
-
-    async def submit(self, interaction: discord.Interaction, event_name: str | None):
-        # Deferring the modal submit keeps the picker as this interaction's original
-        # response, so it can be deleted once the booking succeeds.
-        await interaction.response.defer()
-        booked = await book_and_reply(
-            interaction,
-            self.deps,
-            self.server_index,
-            f"{self.date.isoformat()} {_hhmm(self.start_minutes)}",
-            str(self.duration),
-            self.recurrence,
-            self.count if self.recurrence != "none" else 1,
-            event_name=event_name,
-        )
-        if booked:
-            self.close = interaction.delete_original_response
-            await self.finish()
-
-
-class EventNameModal(discord.ui.Modal, title="Name this booking"):
-    """Last step of the picker: an optional event name, then the booking is made."""
-
-    event_name = discord.ui.TextInput(
-        label="Event name (optional)",
-        placeholder="Scrim vs 1st Para",
-        required=False,
-        max_length=EVENT_NAME_MAX_LENGTH,
-    )
-
-    def __init__(self, picker: BookingPickerView):
-        super().__init__()
-        self.picker = picker
+            self.add_item(discord.ui.Label(text="Repeat", component=self.repeat))
 
     async def on_submit(self, interaction: discord.Interaction):
-        await self.picker.submit(interaction, self.event_name.value or None)
+        if not self.server.values or not self.date.values:
+            await _reply(interaction, "❌ Pick a server and a date.")
+            return
+        try:
+            start_minute, length = parse_time_range(self.time.value)
+        except BookingError as exc:
+            await _reply(interaction, f"❌ {exc}")
+            return
+        server_index = int(self.server.values[0])
+        start = f"{self.date.values[0]} {start_minute // 60:02d}:{start_minute % 60:02d}"
+        event_name = self.event.value or None
+
+        if self.editing is not None:
+            # Deferring keeps the Manage Bookings message as this interaction's original
+            # response, so it can be redrawn once the edit is saved.
+            await interaction.response.defer()
+            saved = await edit_and_reply(
+                interaction,
+                self.deps,
+                self.editing.first.id,
+                server_index=server_index,
+                start=start,
+                duration=str(length),
+                event_name=event_name,
+                whole_series=self.editing.is_series,
+            )
+            if saved and self.on_saved is not None:
+                await self.on_saved(interaction)
+            return
+
+        recurrence, count = (self.repeat.values or ["none:1"])[0].split(":")
+        await book_and_reply(
+            interaction,
+            self.deps,
+            server_index,
+            start,
+            str(length),
+            recurrence,
+            int(count),
+            event_name=event_name,
+        )
 
 
 # ---------------------------------------------------------------- management
@@ -495,7 +306,7 @@ class ManageBookingsView(_SelfClosingView):
             description=fit_lines(lines) or "No active or upcoming bookings.",
             color=0x5865F2,
         )
-        self.embed.set_footer(text="🔁 = repeating series. Cancelling a series cancels all its remaining dates.")
+        self.embed.set_footer(text="🔁 = repeating series. Editing or cancelling a series changes all its remaining dates.")
         manageable = [
             g
             for g in groups
@@ -503,13 +314,13 @@ class ManageBookingsView(_SelfClosingView):
         ][:25]
         self.groups = {str(g.first.id): g for g in manageable}
         self.booking_select = _DeferSelect(
-            placeholder="Select a booking or series to cancel...",
+            placeholder="Select a booking or series to edit or cancel...",
             options=[
                 discord.SelectOption(
                     label=group_label(g, self.deps, self.viewer_guild_id),
                     value=str(g.first.id),
                     description=(
-                        f"Cancels all {len(g.bookings)} remaining dates" if g.is_series else None
+                        f"Edit or cancel all {len(g.bookings)} remaining dates" if g.is_series else None
                     ),
                 )
                 for g in manageable
@@ -519,9 +330,22 @@ class ManageBookingsView(_SelfClosingView):
         self.clear_items()
         if manageable:
             self.add_item(self.booking_select)
+            self.add_item(self.edit_selected)
             self.add_item(self.cancel_selected)
         self.add_item(self.refresh)
         self.add_item(_CloseButton(row=1))
+
+    @discord.ui.button(label="✏️ Edit selected", style=discord.ButtonStyle.primary, row=1)
+    async def edit_selected(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ):
+        if not self.booking_select.values:
+            await _reply(interaction, "Select a booking first.")
+            return
+        group = self.groups[self.booking_select.values[0]]
+        await interaction.response.send_modal(
+            BookingModal(self.deps, editing=group, on_saved=self._reload)
+        )
 
     @discord.ui.button(
         label="Cancel selected", style=discord.ButtonStyle.danger, row=1

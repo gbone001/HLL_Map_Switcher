@@ -15,7 +15,7 @@ import re
 import sqlite3
 from collections.abc import Callable
 from contextlib import closing
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime, time, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -246,6 +246,29 @@ class BookingConfig:
 
 
 EVENT_NAME_MAX_LENGTH = 60
+TIME_RANGE_HINT = "start-end, e.g. 19:30-22:00"
+
+_TIME_RANGE_PATTERN = re.compile(
+    r"^\s*(\d{1,2})[:.]?(\d{2})\s*(?:-|–|—|to)\s*(\d{1,2})[:.]?(\d{2})\s*$",
+    re.IGNORECASE,
+)
+
+
+def parse_time_range(text: str) -> tuple[int, int]:
+    """Parse '19:30-22:00' into (start minute of day, length in minutes).
+
+    An end at or before the start means the next day (22:00-01:00 is three hours).
+    """
+    match = _TIME_RANGE_PATTERN.match(text or "")
+    if not match:
+        raise BookingError(f"Couldn't read the time. Use {TIME_RANGE_HINT}.")
+    start_h, start_m, end_h, end_m = (int(group) for group in match.groups())
+    if start_h > 23 or end_h > 24 or start_m > 59 or end_m > 59 or (end_h == 24 and end_m):
+        raise BookingError(f"That isn't a valid time. Use {TIME_RANGE_HINT}.")
+    start = start_h * 60 + start_m
+    end = end_h * 60 + end_m
+    length = end - start if end > start else end + 1440 - start
+    return start, length
 
 
 def clean_event_name(text: str | None) -> str | None:
@@ -391,7 +414,7 @@ class BookingService:
         for start, end in slots:
             self._validate_slot(start, end, now)
 
-        bookings = []
+        bookings: list[Booking] = []
         repeating = len(slots) > 1
         series_id: int | None = None
         conn = self._connect()
@@ -442,10 +465,79 @@ class BookingService:
             conn.close()
         return bookings
 
-    def _validate_slot(self, start_utc: int, end_utc: int, now: int) -> None:
+    def reschedule(
+        self,
+        booking_id: int,
+        actor_id: int,
+        is_admin: bool,
+        admin_guild_id: int | None = None,
+        *,
+        server_key: str,
+        start_utc: int,
+        end_utc: int,
+        event_name: str | None = None,
+        whole_series: bool = True,
+    ) -> list[Booking]:
+        """Edit a booking, or every remaining date of its series, all or nothing.
+
+        For a series, `start_utc`/`end_utc` describe the new first remaining date; every
+        other date moves by the same amount and takes the same length, server and name.
+        Overlaps are checked against every other booking (the edited ones excluded).
+        """
+        booking = self.get(booking_id)
+        now = self.now_ts()
+        if booking is None or booking.cancelled_at is not None or booking.end_utc <= now:
+            raise BookingNotFoundError(
+                f"Booking #{booking_id} was not found or has already ended."
+            )
+        if not booking.manageable_by(actor_id, is_admin, admin_guild_id):
+            raise BookingPermissionError(f"Booking #{booking_id} is not yours.")
+        if whole_series and booking.is_recurring:
+            group = [b for b in self.list_live() if b.series_id == booking.series_id]
+        else:
+            group = [booking]
+        shift = start_utc - group[0].start_utc
+        length = end_utc - start_utc
+        event_name = clean_event_name(event_name)
+        slots = [(b, b.start_utc + shift, b.start_utc + shift + length) for b in group]
+        for original, start, end in slots:
+            # A booking that is already running may keep its start time.
+            self._validate_slot(start, end, now, allow_past_start=start == original.start_utc)
+
+        ids = [b.id for b, _, _ in slots]
+        placeholders = ", ".join("?" for _ in ids)
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            for original, start, end in slots:
+                row = conn.execute(
+                    f"SELECT {_COLUMNS} FROM bookings WHERE server_key = ? AND cancelled_at IS NULL "
+                    f"AND start_utc < ? AND end_utc > ? AND id NOT IN ({placeholders}) "
+                    "ORDER BY start_utc LIMIT 1",
+                    (server_key, end, start, *ids),
+                ).fetchone()
+                if row is not None:
+                    conn.execute("ROLLBACK")
+                    raise BookingOverlapError(_row_to_booking(row))
+                conn.execute(
+                    "UPDATE bookings SET server_key = ?, start_utc = ?, end_utc = ?, event_name = ? "
+                    "WHERE id = ?",
+                    (server_key, start, end, event_name, original.id),
+                )
+            conn.execute("COMMIT")
+        finally:
+            conn.close()
+        return [
+            replace(original, server_key=server_key, start_utc=start, end_utc=end, event_name=event_name)
+            for original, start, end in slots
+        ]
+
+    def _validate_slot(
+        self, start_utc: int, end_utc: int, now: int, allow_past_start: bool = False
+    ) -> None:
         if end_utc <= start_utc:
             raise BookingError("The booking must end after it starts.")
-        if start_utc < now - 60:
+        if start_utc < now - 60 and not allow_past_start:
             raise BookingError("The start time is in the past.")
         if (
             self.max_duration_seconds
