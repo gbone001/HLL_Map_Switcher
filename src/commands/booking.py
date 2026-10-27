@@ -301,16 +301,18 @@ async def edit_and_reply(
     start: str,
     duration: str,
     event_name: str | None,
-    whole_series: bool,
+    recurrence: str = "none",
+    count: int = 1,
 ) -> bool:
-    """Edit a booking (or every remaining date of its series) and reply; True if saved."""
+    """Edit a booking or a whole series (any field, including how it repeats) and reply;
+    True if saved. The old dates are replaced in one transaction."""
     await _defer(interaction)
     try:
         start_utc = parse_start(start, deps.config.timezone)
         end_utc = start_utc + parse_duration(duration)
         updated = await asyncio.to_thread(
             functools.partial(
-                deps.service.reschedule,
+                deps.service.rebook,
                 booking_id,
                 interaction.user.id,
                 is_booking_admin(interaction.user, deps.config),
@@ -319,7 +321,8 @@ async def edit_and_reply(
                 start_utc=start_utc,
                 end_utc=end_utc,
                 event_name=event_name,
-                whole_series=whole_series,
+                recurrence=recurrence,
+                count=count,
             )
         )
     except BookingOverlapError as exc:
@@ -336,12 +339,12 @@ async def edit_and_reply(
     server = deps.server_name_for_key(first.server_key)
     if len(updated) > 1:
         message = (
-            f"✅ Updated series #{first.series_id} on **{server}** ({len(updated)} dates). "
+            f"✅ Saved series #{first.series_id} on **{server}** ({len(updated)} dates). "
             f"Next: {timestamp(first.start_utc)} → {timestamp(first.end_utc, 't')}."
         )
     else:
         message = (
-            f"✅ Updated booking #{first.id}: **{server}** "
+            f"✅ Saved booking #{first.id}: **{server}** "
             f"{timestamp(first.start_utc)} → {timestamp(first.end_utc, 't')}."
         )
     await _reply(interaction, message)

@@ -9,7 +9,9 @@ from __future__ import annotations
 import asyncio
 import logging
 import sqlite3
-from datetime import datetime, timedelta
+from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
+from datetime import date, datetime, timedelta
 
 import discord
 
@@ -35,10 +37,8 @@ from services.booking import (
     EVENT_NAME_MAX_LENGTH,
     MAX_OCCURRENCES,
     Booking,
-    BookingError,
     BookingGroup,
     group_by_series,
-    parse_time_range,
 )
 
 logger = logging.getLogger(__name__)
@@ -71,7 +71,7 @@ async def open_book_panel(
     if not can_book(interaction.user, deps):
         await _reply(interaction, NOT_A_MEMBER_MESSAGE)
         return
-    await interaction.response.send_modal(BookingModal(deps))
+    await interaction.response.send_modal(BookingModal(deps, BookingDraft.new(deps)))
 
 
 class _SelfClosingView(discord.ui.View):
@@ -93,55 +93,110 @@ class _SelfClosingView(discord.ui.View):
 
 # Discord allows 25 options per dropdown, so the date list covers 25 days.
 DATE_DAYS = 25
-REPEAT_CHOICES = (
-    [("none:1", "Does not repeat")]
-    + [(f"daily:{n}", f"Daily · {n} days") for n in (2, 3, 5, 7, 14)]
-    + [(f"weekly:{n}", f"Weekly · {n} weeks") for n in (2, 3, 4, 6, 8, 10, 12, 16, 20)]
-    + [(f"biweekly:{n}", f"Every 2 weeks · {n} times") for n in (2, 3, 4, 6, 8, 10)]
-)
+MINUTE_CHOICES = (0, 15, 30, 45)
+LENGTH_CHOICES = range(30, 6 * 60 + 1, 15)
+FREQUENCY_CHOICES = [
+    ("none", "Does not repeat"),
+    ("daily", "Daily"),
+    ("weekly", "Weekly"),
+    ("biweekly", "Every 2 weeks"),
+]
+
+
+def _hhmm(minutes: int) -> str:
+    return f"{minutes // 60 % 24:02d}:{minutes % 60:02d}"
+
+
+def _length_label(minutes: int) -> str:
+    hours, mins = divmod(minutes, 60)
+    if not hours:
+        return f"{mins} min"
+    return f"{hours} h {mins:02d}" if mins else f"{hours} h"
+
+
+@dataclass
+class BookingDraft:
+    """What the two booking steps are building: the pop-up fills the when/where/what,
+    the confirm step the length and repeat. Editing starts from the booking's values."""
+
+    event_name: str | None = None
+    server_index: int | None = None
+    day: date | None = None
+    start_minute: int = 19 * 60
+    length: int = 120
+    recurrence: str = "none"
+    count: int = 2
+    editing: BookingGroup | None = None
+    on_saved: Callable[[], Awaitable[None]] | None = None
+
+    @classmethod
+    def new(cls, deps: BookingCommandDeps) -> BookingDraft:
+        servers = deps.servers()
+        now = datetime.now(deps.config.timezone)
+        next_hour = (now.hour + 1) % 24
+        return cls(
+            server_index=servers[0][0] if len(servers) == 1 else None,
+            day=now.date() + timedelta(days=1 if next_hour == 0 else 0),
+            start_minute=next_hour * 60,
+        )
+
+    @classmethod
+    def from_group(cls, group: BookingGroup, deps: BookingCommandDeps, on_saved=None) -> BookingDraft:
+        first = group.first
+        tz = deps.config.timezone
+        start = datetime.fromtimestamp(first.start_utc, tz)
+        return cls(
+            event_name=first.event_name,
+            server_index=next(
+                (i for i, _ in deps.servers() if deps.server_key(i) == first.server_key), None
+            ),
+            day=start.date(),
+            start_minute=start.hour * 60 + start.minute,
+            length=(first.end_utc - first.start_utc) // 60,
+            recurrence=first.recurrence if group.is_series else "none",
+            count=min(len(group.bookings), MAX_OCCURRENCES) if group.is_series else 2,
+            editing=group,
+            on_saved=on_saved,
+        )
+
+    @property
+    def dates(self) -> int:
+        return 1 if self.recurrence == "none" else self.count
 
 
 class BookingModal(discord.ui.Modal):
-    """Pop-up booking form: event name, server, date, time range and repeat.
+    """Step 1, a pop-up: event name, server, date and start time (hour, then minute).
 
-    With `editing`, the same form edits a booking (or a whole series, every remaining
-    date moving together) and leaves out Repeat. A Discord modal holds at most 5 fields.
+    A Discord modal holds at most 5 fields, so length and repeat follow in step 2
+    (BookingDetailsView). With `details` set, the pop-up was reopened from step 2 and
+    updates that message instead of sending a new one.
     """
 
-    def __init__(self, deps: BookingCommandDeps, *, editing: BookingGroup | None = None, on_saved=None):
-        super().__init__(title="Edit booking" if editing else "Book a server", timeout=900)
+    def __init__(self, deps: BookingCommandDeps, draft: BookingDraft, details: BookingDetailsView | None = None):
+        super().__init__(title="Edit booking" if draft.editing else "Book a server", timeout=900)
         self.deps = deps
-        self.editing = editing
-        self.on_saved = on_saved
-        tz = deps.config.timezone
-        today = datetime.now(tz).date()
-        first = editing.first if editing else None
-        start = datetime.fromtimestamp(first.start_utc, tz) if first else None
-        end = datetime.fromtimestamp(first.end_utc, tz) if first else None
+        self.draft = draft
+        self.details = details
+        today = datetime.now(deps.config.timezone).date()
 
         self.event = discord.ui.TextInput(
             required=False,
             max_length=EVENT_NAME_MAX_LENGTH,
             placeholder="Weekly Tank Battle",
-            default=first.event_name if first else None,
+            default=draft.event_name,
         )
         self.add_item(discord.ui.Label(text="Event name", description="Optional. Shown on the schedule.", component=self.event))
 
-        servers = deps.servers()[:25]
-        if first:
-            current = next((i for i, _ in servers if deps.server_key(i) == first.server_key), None)
-        else:
-            current = servers[0][0] if len(servers) == 1 else None
         self.server = discord.ui.Select(
             placeholder="Pick a server",
             options=[
-                discord.SelectOption(label=name[:100], value=str(index), default=index == current)
-                for index, name in servers
+                discord.SelectOption(label=name[:100], value=str(index), default=index == draft.server_index)
+                for index, name in deps.servers()[:25]
             ],
         )
         self.add_item(discord.ui.Label(text="Server", component=self.server))
 
-        chosen = start.date() if start else today
+        chosen = draft.day or today
         max_days = max(1, deps.config.max_lead_seconds // 86400)
         window_start = today if (chosen - today).days < DATE_DAYS else chosen - timedelta(days=DATE_DAYS // 2)
         days = [
@@ -163,72 +218,210 @@ class BookingModal(discord.ui.Modal):
         )
         self.add_item(discord.ui.Label(text="Date", component=self.date))
 
-        self.time = discord.ui.TextInput(
-            max_length=15,
-            placeholder="19:30-22:00",
-            default=f"{start:%H:%M}-{end:%H:%M}" if start else None,
+        hour, minute = divmod(draft.start_minute, 60)
+        self.hour = discord.ui.Select(
+            options=[
+                discord.SelectOption(label=f"{h:02d}:00", value=str(h), default=h == hour)
+                for h in range(24)
+            ],
         )
         self.add_item(
             discord.ui.Label(
-                text="Time",
-                description=f"Start and end, 24-hour, {tz.key}"[:100],
-                component=self.time,
+                text="Start hour",
+                description=f"24-hour, {deps.config.timezone.key}"[:100],
+                component=self.hour,
             )
         )
-
-        self.repeat = None
-        if editing is None:
-            self.repeat = discord.ui.Select(
-                options=[
-                    discord.SelectOption(label=label, value=value, default=value == "none:1")
-                    for value, label in REPEAT_CHOICES
-                    if int(value.split(":")[1]) <= MAX_OCCURRENCES
-                ],
-            )
-            self.add_item(discord.ui.Label(text="Repeat", component=self.repeat))
+        minute = max(m for m in MINUTE_CHOICES if m <= minute)
+        self.minute = discord.ui.Select(
+            options=[
+                discord.SelectOption(label=f":{m:02d}", value=str(m), default=m == minute)
+                for m in MINUTE_CHOICES
+            ],
+        )
+        self.add_item(discord.ui.Label(text="Start minute", component=self.minute))
 
     async def on_submit(self, interaction: discord.Interaction):
         if not self.server.values or not self.date.values:
             await _reply(interaction, "❌ Pick a server and a date.")
             return
-        try:
-            start_minute, length = parse_time_range(self.time.value)
-        except BookingError as exc:
-            await _reply(interaction, f"❌ {exc}")
-            return
-        server_index = int(self.server.values[0])
-        start = f"{self.date.values[0]} {start_minute // 60:02d}:{start_minute % 60:02d}"
-        event_name = self.event.value or None
+        draft = self.draft
+        draft.event_name = self.event.value or None
+        draft.server_index = int(self.server.values[0])
+        draft.day = date.fromisoformat(self.date.values[0])
+        draft.start_minute = int((self.hour.values or ["19"])[0]) * 60 + int((self.minute.values or ["0"])[0])
 
-        if self.editing is not None:
-            # Deferring keeps the Manage Bookings message as this interaction's original
-            # response, so it can be redrawn once the edit is saved.
-            await interaction.response.defer()
+        if self.details is not None:
+            self.details.render()
+            await interaction.response.edit_message(embed=self.details.embed(), view=self.details)
+            self.details.close = interaction.delete_original_response
+            return
+        details = BookingDetailsView(self.deps, draft)
+        await interaction.response.send_message(embed=details.embed(), view=details, ephemeral=True)
+        details.close = interaction.delete_original_response
+
+
+class BookingDetailsView(_SelfClosingView):
+    """Step 2: length, how often it repeats, and how many dates, then Book (or Save)."""
+
+    def __init__(self, deps: BookingCommandDeps, draft: BookingDraft):
+        super().__init__(timeout=900)
+        self.deps = deps
+        self.draft = draft
+        self.max_length = deps.config.max_duration_seconds // 60 or 24 * 60
+        self.render()
+
+    def embed(self) -> discord.Embed:
+        draft = self.draft
+        tz = self.deps.config.timezone
+        start = datetime.combine(draft.day, datetime.min.time(), tzinfo=tz) + timedelta(minutes=draft.start_minute)
+        end = start + timedelta(minutes=draft.length)
+        end_text = end.strftime("%H:%M") + (f" ({end:%a %d %b})" if end.date() != start.date() else "")
+        server = dict(self.deps.servers()).get(draft.server_index, "?")
+        repeat = (
+            "Does not repeat"
+            if draft.recurrence == "none"
+            else f"{dict(FREQUENCY_CHOICES)[draft.recurrence]} · {draft.count} dates"
+        )
+        lines = [
+            f"🕒 **{start:%A %d %B}** · **{start:%H:%M} – {end_text}** ({_length_label(draft.length)})",
+            f"🖥️ {server}",
+            f"🔁 {repeat}",
+        ]
+        if draft.event_name:
+            lines.insert(0, f"🏷️ **{discord.utils.escape_markdown(draft.event_name)}**")
+        lines.append(f"-# Times in {tz.key}. Pick the length and repeat, then press {self.save_label}.")
+        return discord.Embed(
+            title="✏️ Edit booking" if draft.editing else "📅 Book a server",
+            description="\n".join(lines),
+            color=0x5865F2,
+        )
+
+    @property
+    def save_label(self) -> str:
+        return "Save changes" if self.draft.editing else "Book"
+
+    def render(self) -> None:
+        draft = self.draft
+        self.clear_items()
+        self.add_item(
+            _DraftSelect(
+                "length",
+                placeholder="Length",
+                options=[
+                    discord.SelectOption(
+                        label=_length_label(m),
+                        value=str(m),
+                        description=f"Ends {_hhmm(draft.start_minute + m)}",
+                        default=m == draft.length,
+                    )
+                    for m in LENGTH_CHOICES
+                    if m <= self.max_length
+                ],
+                row=0,
+            )
+        )
+        self.add_item(
+            _DraftSelect(
+                "recurrence",
+                cast=str,
+                options=[
+                    discord.SelectOption(label=label, value=value, default=value == draft.recurrence)
+                    for value, label in FREQUENCY_CHOICES
+                ],
+                row=1,
+            )
+        )
+        self.add_item(
+            _DraftSelect(
+                "count",
+                placeholder="Number of dates",
+                disabled=draft.recurrence == "none",
+                options=[
+                    discord.SelectOption(label=f"{n} dates", value=str(n), default=n == draft.count)
+                    for n in range(2, MAX_OCCURRENCES + 1)
+                ],
+                row=2,
+            )
+        )
+        for button in (
+            _DraftButton(self.save, label=self.save_label, style=discord.ButtonStyle.success),
+            _DraftButton(self.change_details, label="✏️ Change details"),
+            _DraftButton(self.cancel, label="Cancel", style=discord.ButtonStyle.danger),
+        ):
+            button.row = 3
+            self.add_item(button)
+
+    async def redraw(self, interaction: discord.Interaction) -> None:
+        self.render()
+        await interaction.response.edit_message(embed=self.embed(), view=self)
+        self.close = interaction.delete_original_response
+
+    async def change_details(self, interaction: discord.Interaction) -> None:
+        await interaction.response.send_modal(BookingModal(self.deps, self.draft, details=self))
+
+    async def cancel(self, interaction: discord.Interaction) -> None:
+        await interaction.response.defer()
+        self.close = interaction.delete_original_response
+        await self.finish()
+
+    async def save(self, interaction: discord.Interaction) -> None:
+        draft = self.draft
+        # Deferring keeps this message as the interaction's original response, so it can
+        # be deleted once the booking is saved.
+        await interaction.response.defer()
+        start = f"{draft.day.isoformat()} {_hhmm(draft.start_minute)}"
+        if draft.editing is not None:
             saved = await edit_and_reply(
                 interaction,
                 self.deps,
-                self.editing.first.id,
-                server_index=server_index,
+                draft.editing.first.id,
+                server_index=draft.server_index,
                 start=start,
-                duration=str(length),
-                event_name=event_name,
-                whole_series=self.editing.is_series,
+                duration=str(draft.length),
+                event_name=draft.event_name,
+                recurrence=draft.recurrence,
+                count=draft.dates,
             )
-            if saved and self.on_saved is not None:
-                await self.on_saved(interaction)
+        else:
+            saved = await book_and_reply(
+                interaction,
+                self.deps,
+                draft.server_index,
+                start,
+                str(draft.length),
+                draft.recurrence,
+                draft.dates,
+                event_name=draft.event_name,
+            )
+        if not saved:
             return
+        self.close = interaction.delete_original_response
+        await self.finish()
+        if draft.on_saved is not None:
+            await draft.on_saved()
 
-        recurrence, count = (self.repeat.values or ["none:1"])[0].split(":")
-        await book_and_reply(
-            interaction,
-            self.deps,
-            server_index,
-            start,
-            str(length),
-            recurrence,
-            int(count),
-            event_name=event_name,
-        )
+
+class _DraftSelect(discord.ui.Select):
+    """Stores its pick on the draft and redraws the confirm step."""
+
+    def __init__(self, field: str, cast=int, **kwargs):
+        super().__init__(**kwargs)
+        self.field = field
+        self.cast = cast
+
+    async def callback(self, interaction: discord.Interaction):
+        setattr(self.view.draft, self.field, self.cast(self.values[0]))
+        await self.view.redraw(interaction)
+
+
+class _DraftButton(discord.ui.Button):
+    def __init__(self, action, **kwargs):
+        super().__init__(**kwargs)
+        self.action = action
+
+    async def callback(self, interaction: discord.Interaction):
+        await self.action(interaction)
 
 
 # ---------------------------------------------------------------- management
@@ -271,9 +464,11 @@ async def open_manage_panel(
         wait=True,
     )
     view.close = message.delete
+    view.message = message
 
 
 class ManageBookingsView(_SelfClosingView):
+    message = None  # the sent Manage Bookings message, redrawn after edits
     def __init__(
         self,
         deps: BookingCommandDeps,
@@ -344,7 +539,7 @@ class ManageBookingsView(_SelfClosingView):
             return
         group = self.groups[self.booking_select.values[0]]
         await interaction.response.send_modal(
-            BookingModal(self.deps, editing=group, on_saved=self._reload)
+            BookingModal(self.deps, BookingDraft.from_group(group, self.deps, on_saved=self.reload_message))
         )
 
     @discord.ui.button(
@@ -369,6 +564,17 @@ class ManageBookingsView(_SelfClosingView):
     ):
         await interaction.response.defer()
         await self._reload(interaction)
+
+    async def reload_message(self) -> None:
+        """Redraw this Manage Bookings message after an edit made from it."""
+        if self.message is None:
+            return
+        try:
+            bookings = await asyncio.to_thread(self.deps.service.list_live)
+            self._show(bookings)
+            await self.message.edit(embed=self.embed, view=self)
+        except (sqlite3.Error, discord.HTTPException):
+            logger.exception("Could not redraw Manage Bookings after an edit")
 
     async def _reload(self, interaction: discord.Interaction) -> None:
         bookings = await _load_live(interaction, self.deps)

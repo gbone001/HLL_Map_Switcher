@@ -514,66 +514,64 @@ class SeriesParentTests(BookingServiceTestCase):
         self.assertEqual(self.service.list_live(), [])
 
 
-class TimeRangeTests(unittest.TestCase):
-    def test_parses_ranges_including_past_midnight(self):
-        from services.booking import parse_time_range
-
-        self.assertEqual(parse_time_range("19:30-22:00"), (19 * 60 + 30, 150))
-        self.assertEqual(parse_time_range(" 7:30 – 10:00 "), (7 * 60 + 30, 150))
-        self.assertEqual(parse_time_range("2200 to 0100"), (22 * 60, 180))
-        for bad in ("", "19:30", "25:00-26:00", "19:75-20:00", "evening"):
-            with self.subTest(bad), self.assertRaises(BookingError):
-                parse_time_range(bad)
-
-
-class RescheduleTests(BookingServiceTestCase):
+class RebookTests(BookingServiceTestCase):
     def test_edit_single_booking_time_server_and_name(self):
-        booking = self.service.create("server1", 1, "u", T0 + HOUR, T0 + 2 * HOUR, event_name="Old")
+        booking = self.service.create("server1", 1, "u", T0 + HOUR, T0 + 2 * HOUR, event_name="Old", guild_id=5)
 
-        updated = self.service.reschedule(
+        [updated] = self.service.rebook(
             booking.id, 1, False, server_key="server2",
             start_utc=T0 + 3 * HOUR, end_utc=T0 + 5 * HOUR, event_name="New",
         )
 
-        stored = self.service.get(booking.id)
-        self.assertEqual((stored.server_key, stored.start_utc, stored.end_utc, stored.event_name),
-                         ("server2", T0 + 3 * HOUR, T0 + 5 * HOUR, "New"))
-        self.assertEqual(updated[0], stored)
+        self.assertIsNotNone(self.service.get(booking.id).cancelled_at)
+        self.assertEqual((updated.server_key, updated.start_utc, updated.end_utc, updated.event_name, updated.guild_id),
+                         ("server2", T0 + 3 * HOUR, T0 + 5 * HOUR, "New", 5))
+        self.assertEqual([b.id for b in self.service.list_live()], [updated.id])
 
-    def test_edit_series_moves_every_remaining_date_together(self):
-        series = self.service.create_series("server1", 1, "u", T0 + HOUR, T0 + 2 * HOUR, "weekly", 3)
+    def test_edit_can_change_the_repeat_pattern(self):
+        series = self.service.create_series("server1", 1, "u", T0 + HOUR, T0 + 2 * HOUR, "weekly", 4)
 
-        self.service.reschedule(
-            series[1].id, 1, False, server_key="server1",
-            start_utc=T0 + 2 * HOUR, end_utc=T0 + 4 * HOUR,
+        updated = self.service.rebook(
+            series[2].id, 1, False, server_key="server1",
+            start_utc=T0 + HOUR, end_utc=T0 + 2 * HOUR, recurrence="daily", count=3,
         )
 
-        week = 7 * 86400
-        stored = [self.service.get(b.id) for b in series]
-        self.assertEqual([(b.start_utc, b.end_utc) for b in stored],
-                         [(T0 + 2 * HOUR + i * week, T0 + 4 * HOUR + i * week) for i in range(3)])
+        self.assertEqual([b.start_utc - T0 for b in updated], [HOUR, HOUR + 86400, HOUR + 2 * 86400])
+        self.assertEqual({b.recurrence for b in updated}, {"daily"})
+        self.assertEqual([b.id for b in self.service.list_live()], [b.id for b in updated])
 
-    def test_edit_can_overlap_itself_but_not_others(self):
+        [single] = self.service.rebook(
+            updated[0].id, 1, False, server_key="server1", start_utc=T0 + HOUR, end_utc=T0 + 2 * HOUR,
+        )
+        self.assertFalse(single.is_recurring)
+        self.assertEqual(len(self.service.list_live()), 1)
+
+    def test_edit_can_reuse_its_own_slot_but_a_clash_changes_nothing(self):
         booking = self.service.create("server1", 1, "u", T0 + HOUR, T0 + 3 * HOUR)
         other = self.service.create("server1", 2, "o", T0 + 4 * HOUR, T0 + 5 * HOUR)
 
-        self.service.reschedule(booking.id, 1, False, server_key="server1",
-                                start_utc=T0 + 2 * HOUR, end_utc=T0 + 4 * HOUR)
+        [moved] = self.service.rebook(booking.id, 1, False, server_key="server1",
+                                      start_utc=T0 + 2 * HOUR, end_utc=T0 + 4 * HOUR)
         with self.assertRaises(BookingOverlapError) as caught:
-            self.service.reschedule(booking.id, 1, False, server_key="server1",
-                                    start_utc=T0 + 2 * HOUR, end_utc=T0 + 4 * HOUR + 1)
+            self.service.rebook(moved.id, 1, False, server_key="server1",
+                                start_utc=T0 + 2 * HOUR, end_utc=T0 + 4 * HOUR + 1)
         self.assertEqual(caught.exception.conflict.id, other.id)
+        self.assertEqual({b.id for b in self.service.list_live()}, {moved.id, other.id})
 
     def test_edit_rules_owner_only_and_running_booking_keeps_its_start(self):
         booking = self.service.create("server1", 1, "u", T0, T0 + 2 * HOUR)
         self.clock.ts = T0 + HOUR  # now running
 
         with self.assertRaises(BookingPermissionError):
-            self.service.reschedule(booking.id, 2, False, server_key="server1",
-                                    start_utc=T0, end_utc=T0 + 3 * HOUR)
-        self.service.reschedule(booking.id, 1, False, server_key="server1",
-                                start_utc=T0, end_utc=T0 + 3 * HOUR)  # extend while running
-        self.assertEqual(self.service.get(booking.id).end_utc, T0 + 3 * HOUR)
+            self.service.rebook(booking.id, 2, False, server_key="server1", start_utc=T0, end_utc=T0 + 3 * HOUR)
+        [extended] = self.service.rebook(booking.id, 1, False, server_key="server1",
+                                         start_utc=T0, end_utc=T0 + 3 * HOUR)
+        self.assertEqual(extended.end_utc, T0 + 3 * HOUR)
         with self.assertRaises(BookingError):
-            self.service.reschedule(booking.id, 1, False, server_key="server1",
-                                    start_utc=T0 - HOUR, end_utc=T0 + 3 * HOUR)
+            self.service.rebook(extended.id, 1, False, server_key="server1",
+                                start_utc=T0 - HOUR, end_utc=T0 + 3 * HOUR)
+
+    def test_at_most_ten_dates(self):
+        with self.assertRaises(BookingError):
+            self.service.create_series("server1", 1, "u", T0 + HOUR, T0 + 2 * HOUR, "daily", 11)
+        self.assertEqual(len(self.service.create_series("server1", 1, "u", T0 + HOUR, T0 + 2 * HOUR, "daily", 10)), 10)

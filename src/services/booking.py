@@ -15,7 +15,7 @@ import re
 import sqlite3
 from collections.abc import Callable
 from contextlib import closing
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from datetime import UTC, datetime, time, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -158,7 +158,7 @@ DEFAULT_PANEL_REFRESH_TIME = time(6, 0)
 SCHEDULE_DAYS = 14
 # Days between occurrences for each recurrence choice offered on the panel.
 RECURRENCE_DAYS = {"none": 0, "daily": 1, "weekly": 7, "biweekly": 14}
-MAX_OCCURRENCES = 20
+MAX_OCCURRENCES = 10
 
 
 @dataclass(frozen=True)
@@ -246,31 +246,6 @@ class BookingConfig:
 
 
 EVENT_NAME_MAX_LENGTH = 60
-TIME_RANGE_HINT = "start-end, e.g. 19:30-22:00"
-
-_TIME_RANGE_PATTERN = re.compile(
-    r"^\s*(\d{1,2})[:.]?(\d{2})\s*(?:-|–|—|to)\s*(\d{1,2})[:.]?(\d{2})\s*$",
-    re.IGNORECASE,
-)
-
-
-def parse_time_range(text: str) -> tuple[int, int]:
-    """Parse '19:30-22:00' into (start minute of day, length in minutes).
-
-    An end at or before the start means the next day (22:00-01:00 is three hours).
-    """
-    match = _TIME_RANGE_PATTERN.match(text or "")
-    if not match:
-        raise BookingError(f"Couldn't read the time. Use {TIME_RANGE_HINT}.")
-    start_h, start_m, end_h, end_m = (int(group) for group in match.groups())
-    if start_h > 23 or end_h > 24 or start_m > 59 or end_m > 59 or (end_h == 24 and end_m):
-        raise BookingError(f"That isn't a valid time. Use {TIME_RANGE_HINT}.")
-    start = start_h * 60 + start_m
-    end = end_h * 60 + end_m
-    length = end - start if end > start else end + 1440 - start
-    return start, length
-
-
 def clean_event_name(text: str | None) -> str | None:
     """Trim an event name to one short line; blank means no name."""
     if text is None:
@@ -397,75 +372,25 @@ class BookingService:
         conflict on any of them leaves the store unchanged. Overlaps are checked per game
         server across every guild: one calendar per server.
         """
-        if recurrence not in RECURRENCE_DAYS:
-            raise BookingError(f"Unknown recurrence {recurrence!r}.")
-        if not 1 <= count <= MAX_OCCURRENCES:
-            raise BookingError(
-                f"Occurrences must be between 1 and {MAX_OCCURRENCES}."
-            )
-        if RECURRENCE_DAYS[recurrence] == 0:
-            count = 1
-        step = RECURRENCE_DAYS[recurrence] * 86400
-        event_name = clean_event_name(event_name)
+        slots, recurrence = self._plan_slots(start_utc, end_utc, recurrence, count)
         now = self.now_ts()
-        slots = [
-            (start_utc + i * step, end_utc + i * step) for i in range(count)
-        ]
         for start, end in slots:
             self._validate_slot(start, end, now)
-
-        bookings: list[Booking] = []
-        repeating = len(slots) > 1
-        series_id: int | None = None
         conn = self._connect()
         try:
             # BEGIN IMMEDIATE takes the write lock up front so two concurrent /book calls
             # cannot both pass the overlap check.
             conn.execute("BEGIN IMMEDIATE")
-            for start, end in slots:
-                row = conn.execute(
-                    f"SELECT {_COLUMNS} FROM bookings WHERE server_key = ? AND cancelled_at IS NULL "
-                    "AND start_utc < ? AND end_utc > ? ORDER BY start_utc LIMIT 1",
-                    (server_key, end, start),
-                ).fetchone()
-                if row is not None:
-                    conn.execute("ROLLBACK")
-                    raise BookingOverlapError(_row_to_booking(row))
-                cursor = conn.execute(
-                    "INSERT INTO bookings (server_key, user_id, user_name, start_utc, end_utc, created_at, "
-                    "guild_id, event_name, series_id, recurrence) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                    (
-                        server_key, user_id, user_name, start, end, now, guild_id, event_name,
-                        series_id, recurrence if repeating else None,
-                    ),
-                )
-                if repeating and series_id is None:
-                    # The first date is the series parent; it points at itself.
-                    series_id = cursor.lastrowid
-                    conn.execute(
-                        "UPDATE bookings SET series_id = ? WHERE id = ?", (series_id, series_id)
-                    )
-                bookings.append(
-                    Booking(
-                        cursor.lastrowid,
-                        server_key,
-                        user_id,
-                        user_name,
-                        start,
-                        end,
-                        now,
-                        guild_id=guild_id,
-                        event_name=event_name,
-                        series_id=series_id,
-                        recurrence=recurrence if repeating else None,
-                    )
-                )
+            bookings = self._insert_slots(
+                conn, slots, server_key, user_id, user_name, guild_id,
+                clean_event_name(event_name), recurrence, now,
+            )
             conn.execute("COMMIT")
         finally:
             conn.close()
         return bookings
 
-    def reschedule(
+    def rebook(
         self,
         booking_id: int,
         actor_id: int,
@@ -476,13 +401,15 @@ class BookingService:
         start_utc: int,
         end_utc: int,
         event_name: str | None = None,
-        whole_series: bool = True,
+        recurrence: str = "none",
+        count: int = 1,
     ) -> list[Booking]:
         """Edit a booking, or every remaining date of its series, all or nothing.
 
-        For a series, `start_utc`/`end_utc` describe the new first remaining date; every
-        other date moves by the same amount and takes the same length, server and name.
-        Overlaps are checked against every other booking (the edited ones excluded).
+        The old dates are cancelled and the new ones (any server, time, name and repeat
+        pattern) created in one transaction, so a clash leaves everything as it was. The
+        booker and their guild stay the owner even when an admin edits. A booking that
+        is already running may keep its start time.
         """
         booking = self.get(booking_id)
         now = self.now_ts()
@@ -492,45 +419,92 @@ class BookingService:
             )
         if not booking.manageable_by(actor_id, is_admin, admin_guild_id):
             raise BookingPermissionError(f"Booking #{booking_id} is not yours.")
-        if whole_series and booking.is_recurring:
-            group = [b for b in self.list_live() if b.series_id == booking.series_id]
+        if booking.is_recurring:
+            old = [b for b in self.list_live() if b.series_id == booking.series_id]
         else:
-            group = [booking]
-        shift = start_utc - group[0].start_utc
-        length = end_utc - start_utc
-        event_name = clean_event_name(event_name)
-        slots = [(b, b.start_utc + shift, b.start_utc + shift + length) for b in group]
-        for original, start, end in slots:
-            # A booking that is already running may keep its start time.
-            self._validate_slot(start, end, now, allow_past_start=start == original.start_utc)
-
-        ids = [b.id for b, _, _ in slots]
-        placeholders = ", ".join("?" for _ in ids)
+            old = [booking]
+        slots, recurrence = self._plan_slots(start_utc, end_utc, recurrence, count)
+        for number, (start, end) in enumerate(slots):
+            self._validate_slot(
+                start, end, now, allow_past_start=number == 0 and start == old[0].start_utc
+            )
+        old_ids = [b.id for b in old]
         conn = self._connect()
         try:
             conn.execute("BEGIN IMMEDIATE")
-            for original, start, end in slots:
-                row = conn.execute(
-                    f"SELECT {_COLUMNS} FROM bookings WHERE server_key = ? AND cancelled_at IS NULL "
-                    f"AND start_utc < ? AND end_utc > ? AND id NOT IN ({placeholders}) "
-                    "ORDER BY start_utc LIMIT 1",
-                    (server_key, end, start, *ids),
-                ).fetchone()
-                if row is not None:
-                    conn.execute("ROLLBACK")
-                    raise BookingOverlapError(_row_to_booking(row))
-                conn.execute(
-                    "UPDATE bookings SET server_key = ?, start_utc = ?, end_utc = ?, event_name = ? "
-                    "WHERE id = ?",
-                    (server_key, start, end, event_name, original.id),
-                )
+            conn.execute(
+                "UPDATE bookings SET cancelled_at = ?, cancelled_by = ? "
+                f"WHERE id IN ({', '.join('?' for _ in old_ids)})",
+                (now, actor_id, *old_ids),
+            )
+            bookings = self._insert_slots(
+                conn, slots, server_key, booking.user_id, booking.user_name, booking.guild_id,
+                clean_event_name(event_name), recurrence, now,
+            )
             conn.execute("COMMIT")
         finally:
             conn.close()
-        return [
-            replace(original, server_key=server_key, start_utc=start, end_utc=end, event_name=event_name)
-            for original, start, end in slots
-        ]
+        return bookings
+
+    def _plan_slots(
+        self, start_utc: int, end_utc: int, recurrence: str, count: int
+    ) -> tuple[list[tuple[int, int]], str]:
+        if recurrence not in RECURRENCE_DAYS:
+            raise BookingError(f"Unknown recurrence {recurrence!r}.")
+        if not 1 <= count <= MAX_OCCURRENCES:
+            raise BookingError(f"Number of dates must be between 1 and {MAX_OCCURRENCES}.")
+        if RECURRENCE_DAYS[recurrence] == 0 or count == 1:
+            return [(start_utc, end_utc)], "none"
+        step = RECURRENCE_DAYS[recurrence] * 86400
+        return [(start_utc + i * step, end_utc + i * step) for i in range(count)], recurrence
+
+    def _insert_slots(
+        self,
+        conn: sqlite3.Connection,
+        slots: list[tuple[int, int]],
+        server_key: str,
+        user_id: int,
+        user_name: str,
+        guild_id: int | None,
+        event_name: str | None,
+        recurrence: str,
+        now: int,
+    ) -> list[Booking]:
+        """Overlap-check and insert inside the caller's transaction (rolled back on a clash)."""
+        repeating = len(slots) > 1
+        series_id: int | None = None
+        bookings: list[Booking] = []
+        for start, end in slots:
+            row = conn.execute(
+                f"SELECT {_COLUMNS} FROM bookings WHERE server_key = ? AND cancelled_at IS NULL "
+                "AND start_utc < ? AND end_utc > ? ORDER BY start_utc LIMIT 1",
+                (server_key, end, start),
+            ).fetchone()
+            if row is not None:
+                conn.execute("ROLLBACK")
+                raise BookingOverlapError(_row_to_booking(row))
+            cursor = conn.execute(
+                "INSERT INTO bookings (server_key, user_id, user_name, start_utc, end_utc, created_at, "
+                "guild_id, event_name, series_id, recurrence) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    server_key, user_id, user_name, start, end, now, guild_id, event_name,
+                    series_id, recurrence if repeating else None,
+                ),
+            )
+            if repeating and series_id is None:
+                # The first date is the series parent; it points at itself.
+                series_id = cursor.lastrowid
+                conn.execute(
+                    "UPDATE bookings SET series_id = ? WHERE id = ?", (series_id, series_id)
+                )
+            bookings.append(
+                Booking(
+                    cursor.lastrowid, server_key, user_id, user_name, start, end, now,
+                    guild_id=guild_id, event_name=event_name, series_id=series_id,
+                    recurrence=recurrence if repeating else None,
+                )
+            )
+        return bookings
 
     def _validate_slot(
         self, start_utc: int, end_utc: int, now: int, allow_past_start: bool = False
