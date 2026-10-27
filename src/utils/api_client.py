@@ -1,15 +1,14 @@
 import os
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
 
-from .crcon_http import CRCONCredentials, CRCONHTTPError, CRCONHttpClient
-from .hll_rcon import HLLRCONCredentials, HLLRCONError, HLLRCONClient
+from .crcon_http import CRCONCredentials, CRCONHttpClient, CRCONHTTPError
+from .hll_rcon import HLLRCONClient, HLLRCONCredentials, HLLRCONError
 
 
 @dataclass
 class ServerConfig:
     name: str
-    server_number: Optional[int]
+    server_number: int | None
 
 
 class HLLAPIClient:
@@ -17,17 +16,17 @@ class HLLAPIClient:
 
     def __init__(self, timeout: float = 10.0):
         self.timeout = timeout
-        self.servers: List[ServerConfig] = self._load_servers()
+        self.servers: list[ServerConfig] = self._load_servers()
         if not self.servers:
             raise ValueError(
                 "No CRCON servers configured. "
                 "No CRCON servers configured. Set CRCON_BASE_URL and CRCON_TOKEN for a single server, "
                 "or SERVER{N}_CRCON_BASE_URL and SERVER{N}_CRCON_TOKEN for multiple servers."
             )
-        self._clients: Dict[Optional[int], CRCONHttpClient] = {}
+        self._clients: dict[int | None, CRCONHttpClient] = {}
 
-    def _discover_server_numbers(self, max_servers: int = 25) -> List[int]:
-        numbers: List[int] = []
+    def _discover_server_numbers(self, max_servers: int = 25) -> list[int]:
+        numbers: list[int] = []
         for index in range(1, max_servers + 1):
             keys = (
                 f"SERVER{index}_NAME",
@@ -41,8 +40,8 @@ class HLLAPIClient:
                 numbers.append(index)
         return numbers
 
-    def _load_servers(self) -> List[ServerConfig]:
-        servers: List[ServerConfig] = []
+    def _load_servers(self) -> list[ServerConfig]:
+        servers: list[ServerConfig] = []
         numbers = self._discover_server_numbers()
 
         if numbers:
@@ -66,8 +65,12 @@ class HLLAPIClient:
                     # Leave partially configured slots out of active controls.
                     continue
 
-                server_name = os.getenv(f"SERVER{number}_NAME") or f"HLL Server {number}"
-                servers.append(ServerConfig(name=server_name, server_number=number))
+                server_name = (
+                    os.getenv(f"SERVER{number}_NAME") or f"HLL Server {number}"
+                )
+                servers.append(
+                    ServerConfig(name=server_name, server_number=number)
+                )
             return servers
 
         has_shared_http = False
@@ -102,59 +105,114 @@ class HLLAPIClient:
         if server_number in self._clients:
             return self._clients[server_number]
 
-        client = CRCONHttpClient.from_env(timeout=self.timeout, server_number=server_number)
+        client = CRCONHttpClient.from_env(
+            timeout=self.timeout, server_number=server_number
+        )
         self._clients[server_number] = client
         return client
 
-    def get_servers(self) -> List[Tuple[int, str]]:
-        return [(index, server.name) for index, server in enumerate(self.servers)]
+    def get_servers(self) -> list[tuple[int, str]]:
+        return [
+            (index, server.name) for index, server in enumerate(self.servers)
+        ]
 
     def get_server_name(self, server_index: int) -> str:
         if 0 <= server_index < len(self.servers):
             return self.servers[server_index].name
         return "Unknown Server"
 
-    def get_server_number(self, server_index: int) -> Optional[int]:
+    def get_server_number(self, server_index: int) -> int | None:
         if 0 <= server_index < len(self.servers):
             return self.servers[server_index].server_number
         return None
 
+    def get_server_key(self, server_index: int) -> str:
+        """Stable identity for a configured server: 'server{N}' from SERVER{N}_*, or 'default'.
+
+        Unlike server_index (a position in the configured list), this survives reordering and
+        is what bookings are stored against.
+        """
+        server_number = self.get_server_number(server_index)
+        return (
+            f"server{server_number}"
+            if server_number is not None
+            else "default"
+        )
+
+    def get_server_name_for_key(self, server_key: str) -> str:
+        for index, server in enumerate(self.servers):
+            if self.get_server_key(index) == server_key:
+                return server.name
+        return server_key
+
     def get_current_map(self, server_index: int) -> str:
-            try:
-                client = self._client_for_index(server_index)
-                response = client.get_gamestate()
-                gamestate = response.get("result") if isinstance(response, dict) else None
-                current_map = gamestate.get("current_map", {}) if isinstance(gamestate, dict) else {}
-                return current_map.get("pretty_name") or current_map.get("id") or "Unknown"
-            except CRCONHTTPError as exc:
-                # Log CRCON HTTP errors but don't swallow them - fall through to RCON
-                import logging
-                logging.getLogger(__name__).warning("CRCON HTTP get_gamestate failed for server %s: %s", server_index, exc)
-            except Exception as exc:
-                # Log unexpected errors for debugging
-                import logging
-                logging.getLogger(__name__).exception("Unexpected error in get_current_map for server %s", server_index)
+        try:
+            client = self._client_for_index(server_index)
+            response = client.get_gamestate()
+            gamestate = (
+                response.get("result") if isinstance(response, dict) else None
+            )
+            current_map = (
+                gamestate.get("current_map", {})
+                if isinstance(gamestate, dict)
+                else {}
+            )
+            return (
+                current_map.get("pretty_name")
+                or current_map.get("id")
+                or "Unknown"
+            )
+        except CRCONHTTPError as exc:
+            # Log CRCON HTTP errors but don't swallow them - fall through to RCON
+            import logging
 
-            server_number = self.get_server_number(server_index)
-            try:
-                rcon_client = HLLRCONClient.from_env(server_number=server_number, timeout=self.timeout)
-                session_info = rcon_client.get_session_info()
-            except Exception as exc:
-                import logging
-                logging.getLogger(__name__).warning("Direct RCON get_session_info failed for server %s: %s", server_index, exc)
-                return "Unknown"
+            logging.getLogger(__name__).warning(
+                "CRCON HTTP get_gamestate failed for server %s: %s",
+                server_index,
+                exc,
+            )
+        except Exception:
+            # Log unexpected errors for debugging
+            import logging
 
-            session = session_info.get("session") if isinstance(session_info.get("session"), dict) else session_info
-            if not isinstance(session, dict):
-                return "Unknown"
-            return str(session.get("MapName") or "Unknown")
+            logging.getLogger(__name__).exception(
+                "Unexpected error in get_current_map for server %s",
+                server_index,
+            )
 
-    def set_map(self, server_index: int, map_id: str) -> Tuple[bool, str]:
+        server_number = self.get_server_number(server_index)
+        try:
+            rcon_client = HLLRCONClient.from_env(
+                server_number=server_number, timeout=self.timeout
+            )
+            session_info = rcon_client.get_session_info()
+        except Exception as exc:
+            import logging
+
+            logging.getLogger(__name__).warning(
+                "Direct RCON get_session_info failed for server %s: %s",
+                server_index,
+                exc,
+            )
+            return "Unknown"
+
+        session = (
+            session_info.get("session")
+            if isinstance(session_info.get("session"), dict)
+            else session_info
+        )
+        if not isinstance(session, dict):
+            return "Unknown"
+        return str(session.get("MapName") or "Unknown")
+
+    def set_map(self, server_index: int, map_id: str) -> tuple[bool, str]:
         try:
             client = self._client_for_index(server_index)
             response = client.set_map(map_id)
             if isinstance(response, dict) and response.get("failed"):
-                return False, str(response.get("error") or "CRCON set_map failed")
+                return False, str(
+                    response.get("error") or "CRCON set_map failed"
+                )
             return True, f"Successfully set map to {map_id}"
         except CRCONHTTPError as exc:
             return False, str(exc)

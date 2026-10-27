@@ -1,30 +1,31 @@
 from __future__ import annotations
 
 import threading
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any, Callable, Optional
+from typing import Any
 
-from utils.crcon_http import CRCONHTTPError, CRCONHttpClient
+from utils.crcon_http import CRCONHttpClient, CRCONHTTPError
 from utils.hll_rcon import HLLRCONClient, HLLRCONError
 
 
 @dataclass(frozen=True)
 class ControlResult:
     success: bool
-    transport: Optional[str]
+    transport: str | None
     message: str
-    warning: Optional[str] = None
-    data: Optional[dict[str, Any]] = None
+    warning: str | None = None
+    data: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True)
 class GameStatus:
     transport: str
     current_map: str
-    allied_players: Optional[int]
-    axis_players: Optional[int]
-    time_remaining_seconds: Optional[int]
-    raw_time_remaining: Optional[str]
+    allied_players: int | None
+    axis_players: int | None
+    time_remaining_seconds: int | None
+    raw_time_remaining: str | None
 
 
 class ServerControlService:
@@ -32,8 +33,8 @@ class ServerControlService:
 
     def __init__(
         self,
-        server_number_resolver: Callable[[int], Optional[int]],
-        http_client_factory: Callable[[int], Optional[CRCONHttpClient]],
+        server_number_resolver: Callable[[int], int | None],
+        http_client_factory: Callable[[int], CRCONHttpClient | None],
         timeout: float = 10.0,
     ) -> None:
         self.server_number_resolver = server_number_resolver
@@ -83,7 +84,11 @@ class ServerControlService:
         return ControlResult(
             success=False,
             transport=None,
-            message=" ; ".join(errors) if errors else "No status transport is configured for this server.",
+            message=(
+                " ; ".join(errors)
+                if errors
+                else "No status transport is configured for this server."
+            ),
         )
 
     def change_map(self, server_index: int, map_id: str) -> ControlResult:
@@ -96,7 +101,9 @@ class ServerControlService:
             success_rcon_message=f"Map changed through direct RCON fallback to {map_id}.",
         )
 
-    def set_sector_layout(self, server_index: int, sectors: list[str]) -> ControlResult:
+    def set_sector_layout(
+        self, server_index: int, sectors: list[str]
+    ) -> ControlResult:
         return self._run_with_fallback(
             server_index=server_index,
             action_name="SetSectorLayout",
@@ -106,53 +113,81 @@ class ServerControlService:
             success_rcon_message="Sector layout applied through direct RCON fallback.",
         )
 
-    def set_dynamic_weather_enabled(self, server_index: int, map_id: str, enabled: bool) -> ControlResult:
+    def set_dynamic_weather_enabled(
+        self, server_index: int, map_id: str, enabled: bool
+    ) -> ControlResult:
         state = "enabled" if enabled else "disabled"
         return self._run_with_fallback(
             server_index=server_index,
             action_name="SetDynamicWeatherEnabled",
-            http_action=lambda client: client.set_dynamic_weather_enabled(map_id, enabled),
-            rcon_action=lambda client: client.set_dynamic_weather_enabled(map_id, enabled),
+            http_action=lambda client: client.set_dynamic_weather_enabled(
+                map_id, enabled
+            ),
+            rcon_action=lambda client: client.set_dynamic_weather_enabled(
+                map_id, enabled
+            ),
             success_http_message=f"Dynamic weather {state} through CRCON HTTP.",
             success_rcon_message=f"Dynamic weather {state} through direct RCON fallback.",
         )
 
-    def set_team_switch_cooldown(self, server_index: int, minutes: int) -> ControlResult:
+    def set_team_switch_cooldown(
+        self, server_index: int, minutes: int
+    ) -> ControlResult:
         return self._run_with_fallback(
             server_index=server_index,
             action_name="SetTeamSwitchCooldown",
-            http_action=lambda client: client.set_team_switch_cooldown(minutes),
-            rcon_action=lambda client: client.set_team_switch_cooldown(minutes),
+            http_action=lambda client: client.set_team_switch_cooldown(
+                minutes
+            ),
+            rcon_action=lambda client: client.set_team_switch_cooldown(
+                minutes
+            ),
             success_http_message=f"Team switch cooldown set to {minutes} minute(s) through CRCON HTTP.",
             success_rcon_message=f"Team switch cooldown set to {minutes} minute(s) through direct RCON fallback.",
         )
 
-    def set_match_timer(self, server_index: int, game_mode: str, minutes: int) -> ControlResult:
+    def set_match_timer(
+        self, server_index: int, game_mode: str, minutes: int
+    ) -> ControlResult:
         return self._run_with_fallback(
             server_index=server_index,
             action_name="SetMatchTimer",
-            http_action=lambda client: client.set_match_timer(game_mode, minutes),
-            rcon_action=lambda client: client.set_match_timer(game_mode, minutes),
+            http_action=lambda client: client.set_match_timer(
+                game_mode, minutes
+            ),
+            rcon_action=lambda client: client.set_match_timer(
+                game_mode, minutes
+            ),
             success_http_message=f"{game_mode.title()} match timer set through CRCON HTTP.",
             success_rcon_message=f"{game_mode.title()} match timer set through direct RCON fallback.",
         )
 
-    def set_warmup_timer(self, server_index: int, game_mode: str, minutes: int) -> ControlResult:
+    def set_warmup_timer(
+        self, server_index: int, game_mode: str, minutes: int
+    ) -> ControlResult:
         return self._run_with_fallback(
             server_index=server_index,
             action_name="SetWarmupTimer",
-            http_action=lambda client: client.set_warmup_timer(game_mode, minutes),
-            rcon_action=lambda client: client.set_warmup_timer(game_mode, minutes),
+            http_action=lambda client: client.set_warmup_timer(
+                game_mode, minutes
+            ),
+            rcon_action=lambda client: client.set_warmup_timer(
+                game_mode, minutes
+            ),
             success_http_message=f"{game_mode.title()} warmup timer set through CRCON HTTP.",
             success_rcon_message=f"{game_mode.title()} warmup timer set through direct RCON fallback.",
         )
 
-    def add_map_to_sequence(self, server_index: int, map_id: str, index: int = 0) -> ControlResult:
+    def add_map_to_sequence(
+        self, server_index: int, map_id: str, index: int = 0
+    ) -> ControlResult:
         return self._run_with_fallback(
             server_index=server_index,
             action_name="AddMapToSequence",
             http_action=None,
-            rcon_action=lambda client: client.add_map_to_sequence(map_id, index=index),
+            rcon_action=lambda client: client.add_map_to_sequence(
+                map_id, index=index
+            ),
             success_http_message="",
             success_rcon_message=f"Added {map_id} to the map sequence through direct RCON fallback.",
         )
@@ -162,7 +197,7 @@ class ServerControlService:
         *,
         server_index: int,
         action_name: str,
-        http_action: Optional[Callable[[CRCONHttpClient], dict[str, Any]]],
+        http_action: Callable[[CRCONHttpClient], dict[str, Any]] | None,
         rcon_action: Callable[[HLLRCONClient], dict[str, Any]],
         success_http_message: str,
         success_rcon_message: str,
@@ -178,70 +213,75 @@ class ServerControlService:
             )
 
     def _run_with_fallback_unlocked(
-            self,
-            *,
-            server_index: int,
-            action_name: str,
-            http_action: Optional[Callable[[CRCONHttpClient], dict[str, Any]]],
-            rcon_action: Callable[[HLLRCONClient], dict[str, Any]],
-            success_http_message: str,
-            success_rcon_message: str,
-        ) -> ControlResult:
-            errors: list[str] = []
-            http_warning: Optional[str] = None
+        self,
+        *,
+        server_index: int,
+        action_name: str,
+        http_action: Callable[[CRCONHttpClient], dict[str, Any]] | None,
+        rcon_action: Callable[[HLLRCONClient], dict[str, Any]],
+        success_http_message: str,
+        success_rcon_message: str,
+    ) -> ControlResult:
+        errors: list[str] = []
+        http_warning: str | None = None
 
-            if http_action is not None:
-                http_client = self.http_client_factory(server_index)
-                if http_client is not None:
-                    try:
-                        payload = http_action(http_client)
-                        warning = self._extract_warning(payload)
-                        return ControlResult(
-                            success=True,
-                            transport="crcon_http",
-                            message=success_http_message,
-                            warning=warning,
-                            data=payload if isinstance(payload, dict) else None,
-                        )
-                    except CRCONHTTPError as exc:
-                        http_warning = str(exc)
-                        errors.append(f"CRCON HTTP: {exc}")
-                        # Log the HTTP failure before falling back to RCON
-                        import logging
-                        logging.getLogger(__name__).warning(
-                            "CRCON HTTP %s failed for server %s, falling back to direct RCON: %s",
-                            action_name, server_index, exc
-                        )
-                else:
-                    http_warning = "CRCON HTTP is not configured for this server."
-                    errors.append(f"CRCON HTTP: {http_warning}")
+        if http_action is not None:
+            http_client = self.http_client_factory(server_index)
+            if http_client is not None:
+                try:
+                    payload = http_action(http_client)
+                    warning = self._extract_warning(payload)
+                    return ControlResult(
+                        success=True,
+                        transport="crcon_http",
+                        message=success_http_message,
+                        warning=warning,
+                        data=payload if isinstance(payload, dict) else None,
+                    )
+                except CRCONHTTPError as exc:
+                    http_warning = str(exc)
+                    errors.append(f"CRCON HTTP: {exc}")
+                    # Log the HTTP failure before falling back to RCON
+                    import logging
 
-            try:
-                rcon_client = self._rcon_client(server_index)
-                payload = rcon_action(rcon_client)
-                warning = http_warning or None
-                return ControlResult(
-                    success=True,
-                    transport="direct_rcon",
-                    message=success_rcon_message,
-                    warning=warning,
-                    data=payload if isinstance(payload, dict) else None,
-                )
-            except HLLRCONError as exc:
-                errors.append(f"Direct RCON: {exc}")
+                    logging.getLogger(__name__).warning(
+                        "CRCON HTTP %s failed for server %s, falling back to direct RCON: %s",
+                        action_name,
+                        server_index,
+                        exc,
+                    )
+            else:
+                http_warning = "CRCON HTTP is not configured for this server."
+                errors.append(f"CRCON HTTP: {http_warning}")
 
+        try:
+            rcon_client = self._rcon_client(server_index)
+            payload = rcon_action(rcon_client)
+            warning = http_warning or None
             return ControlResult(
-                success=False,
-                transport=None,
-                message=f"{action_name} failed. " + " ; ".join(errors),
+                success=True,
+                transport="direct_rcon",
+                message=success_rcon_message,
+                warning=warning,
+                data=payload if isinstance(payload, dict) else None,
             )
+        except HLLRCONError as exc:
+            errors.append(f"Direct RCON: {exc}")
+
+        return ControlResult(
+            success=False,
+            transport=None,
+            message=f"{action_name} failed. " + " ; ".join(errors),
+        )
 
     def _rcon_client(self, server_index: int) -> HLLRCONClient:
         server_number = self.server_number_resolver(server_index)
-        return HLLRCONClient.from_env(server_number=server_number, timeout=self.timeout)
+        return HLLRCONClient.from_env(
+            server_number=server_number, timeout=self.timeout
+        )
 
     @staticmethod
-    def _extract_warning(payload: dict[str, Any]) -> Optional[str]:
+    def _extract_warning(payload: dict[str, Any]) -> str | None:
         if isinstance(payload, dict):
             warning = payload.get("warning")
             if warning:
@@ -252,20 +292,34 @@ class ServerControlService:
     def _status_from_http(payload: dict[str, Any]) -> GameStatus:
         result = payload.get("result")
         if not isinstance(result, dict):
-            raise CRCONHTTPError("CRCON HTTP get_gamestate returned an invalid payload.")
+            raise CRCONHTTPError(
+                "CRCON HTTP get_gamestate returned an invalid payload."
+            )
 
         current_map = result.get("current_map")
         current_map_name = "Unknown"
         if isinstance(current_map, dict):
-            current_map_name = str(current_map.get("pretty_name") or current_map.get("id") or "Unknown")
+            current_map_name = str(
+                current_map.get("pretty_name")
+                or current_map.get("id")
+                or "Unknown"
+            )
 
         return GameStatus(
             transport="crcon_http",
             current_map=current_map_name,
-            allied_players=ServerControlService._optional_int(result.get("num_allied_players")),
-            axis_players=ServerControlService._optional_int(result.get("num_axis_players")),
-            time_remaining_seconds=ServerControlService._optional_int(result.get("time_remaining")),
-            raw_time_remaining=ServerControlService._optional_str(result.get("raw_time_remaining")),
+            allied_players=ServerControlService._optional_int(
+                result.get("num_allied_players")
+            ),
+            axis_players=ServerControlService._optional_int(
+                result.get("num_axis_players")
+            ),
+            time_remaining_seconds=ServerControlService._optional_int(
+                result.get("time_remaining")
+            ),
+            raw_time_remaining=ServerControlService._optional_str(
+                result.get("raw_time_remaining")
+            ),
         )
 
     @staticmethod
@@ -275,9 +329,15 @@ class ServerControlService:
         return GameStatus(
             transport="direct_rcon",
             current_map=str(session_data.get("MapName") or "Unknown"),
-            allied_players=ServerControlService._optional_int(session_data.get("AlliedPlayerCount")),
-            axis_players=ServerControlService._optional_int(session_data.get("AxisPlayerCount")),
-            time_remaining_seconds=ServerControlService._optional_int(session_data.get("RemainingMatchTime")),
+            allied_players=ServerControlService._optional_int(
+                session_data.get("AlliedPlayerCount")
+            ),
+            axis_players=ServerControlService._optional_int(
+                session_data.get("AxisPlayerCount")
+            ),
+            time_remaining_seconds=ServerControlService._optional_int(
+                session_data.get("RemainingMatchTime")
+            ),
             raw_time_remaining=None,
         )
 
@@ -288,7 +348,7 @@ class ServerControlService:
         return payload
 
     @staticmethod
-    def _optional_int(value: Any) -> Optional[int]:
+    def _optional_int(value: Any) -> int | None:
         try:
             if value is None or value == "":
                 return None
@@ -297,7 +357,7 @@ class ServerControlService:
             return None
 
     @staticmethod
-    def _optional_str(value: Any) -> Optional[str]:
+    def _optional_str(value: Any) -> str | None:
         if value is None:
             return None
         text = str(value).strip()

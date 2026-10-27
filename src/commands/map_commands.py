@@ -3,13 +3,16 @@ from discord.ext import commands
 
 from utils.map_data import get_maps_for_mode, get_variants_for_map
 
+
 class MapSelectView(ui.View):
     def __init__(self):
         super().__init__()
 
     @ui.button(label="Change Map", style=ButtonStyle.primary)
     async def change_map(self, button: ui.Button, interaction: Interaction):
-        await interaction.response.send_message("Select a mode:", view=self.mode_select(), delete_after=20)
+        await interaction.response.send_message(
+            "Select a mode:", view=self.mode_select(), delete_after=20
+        )
 
     def mode_select(self):
         options = [
@@ -19,13 +22,18 @@ class MapSelectView(ui.View):
         ]
         return MapModeSelect(options)
 
+
 class MapModeSelect(ui.Select):
     def __init__(self, options):
         super().__init__(placeholder="Choose a mode...", options=options)
 
     async def callback(self, interaction: Interaction):
         selected_mode = self.values[0]
-        await interaction.response.send_message(f"You selected: {selected_mode}. Now select a map:", view=self.map_select(selected_mode), delete_after=20)
+        await interaction.response.send_message(
+            f"You selected: {selected_mode}. Now select a map:",
+            view=self.map_select(selected_mode),
+            delete_after=20,
+        )
 
     def map_select(self, mode):
         maps = get_maps_for_mode(mode)
@@ -36,6 +44,7 @@ class MapModeSelect(ui.Select):
             for map_name in maps[:25]
         ]
         return MapSelect(mode, options)
+
 
 class MapSelect(ui.Select):
     def __init__(self, game_mode, options):
@@ -64,6 +73,7 @@ class MapSelect(ui.Select):
         ]
         return VariantSelect(self.game_mode, map_name, variants, options)
 
+
 class VariantSelect(ui.Select):
     def __init__(self, game_mode, map_name, variants, options):
         self.game_mode = game_mode
@@ -74,13 +84,18 @@ class VariantSelect(ui.Select):
     async def callback(self, interaction: Interaction):
         selected_id = self.values[0]
         label = next(
-            (variant["variant"] for variant in self.variants if variant["id"] == selected_id),
+            (
+                variant["variant"]
+                for variant in self.variants
+                if variant["id"] == selected_id
+            ),
             selected_id,
         )
         await interaction.response.send_message(
             f"You selected the variant: {label} (ID: {selected_id}).",
             delete_after=20,
         )
+
 
 async def setup(bot: commands.Bot):
     bot.add_view(MapSelectView())

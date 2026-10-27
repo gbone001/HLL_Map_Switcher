@@ -5,8 +5,7 @@ import socket
 import struct
 import threading
 from dataclasses import dataclass
-from typing import Any, Dict, Optional
-
+from typing import Any
 
 HEADER_MAGIC = 0xDE450508
 HEADER_SIZE = 12
@@ -24,7 +23,7 @@ class HLLRCONCredentials:
     password: str
 
     @staticmethod
-    def _env_value(name: str, server_number: Optional[int]) -> Optional[str]:
+    def _env_value(name: str, server_number: int | None) -> str | None:
         if server_number is not None:
             server_key = f"SERVER{server_number}_{name}"
             if server_key in os.environ:
@@ -32,17 +31,23 @@ class HLLRCONCredentials:
         return os.environ.get(name)
 
     @classmethod
-    def is_configured(cls, server_number: Optional[int] = None) -> bool:
+    def is_configured(cls, server_number: int | None = None) -> bool:
         host = (cls._env_value("RCON_HOST", server_number) or "").strip()
         port = (cls._env_value("RCON_PORT", server_number) or "").strip()
-        password = (cls._env_value("RCON_PASSWORD", server_number) or "").strip()
+        password = (
+            cls._env_value("RCON_PASSWORD", server_number) or ""
+        ).strip()
         return bool(host and port and password)
 
     @classmethod
-    def from_env(cls, server_number: Optional[int] = None) -> "HLLRCONCredentials":
+    def from_env(
+        cls, server_number: int | None = None
+    ) -> "HLLRCONCredentials":
         host = (cls._env_value("RCON_HOST", server_number) or "").strip()
         port_value = (cls._env_value("RCON_PORT", server_number) or "").strip()
-        password = (cls._env_value("RCON_PASSWORD", server_number) or "").strip()
+        password = (
+            cls._env_value("RCON_PASSWORD", server_number) or ""
+        ).strip()
 
         if not host or not port_value or not password:
             if server_number is not None:
@@ -59,10 +64,14 @@ class HLLRCONCredentials:
         try:
             port = int(port_value)
         except ValueError as exc:
-            raise HLLRCONError(f"Invalid RCON port value: {port_value}") from exc
+            raise HLLRCONError(
+                f"Invalid RCON port value: {port_value}"
+            ) from exc
 
         if port <= 0 or port > 65535:
-            raise HLLRCONError(f"RCON port must be between 1 and 65535. Got: {port}")
+            raise HLLRCONError(
+                f"RCON port must be between 1 and 65535. Got: {port}"
+            )
 
         return cls(host=host, port=port, password=password)
 
@@ -85,23 +94,40 @@ class HLLRCONClient:
         self._request_lock = threading.Lock()
 
     @classmethod
-    def from_env(cls, server_number: Optional[int] = None, timeout: float = 10.0) -> "HLLRCONClient":
-        return cls(credentials=HLLRCONCredentials.from_env(server_number=server_number), timeout=timeout)
+    def from_env(
+        cls, server_number: int | None = None, timeout: float = 10.0
+    ) -> "HLLRCONClient":
+        return cls(
+            credentials=HLLRCONCredentials.from_env(
+                server_number=server_number
+            ),
+            timeout=timeout,
+        )
 
-    def get_session_info(self) -> Dict[str, Any]:
-        result = self.execute("GetServerInformation", {"Name": "session", "Value": ""})
-        return self._decode_json_content(result, "GetServerInformation(session)")
+    def get_session_info(self) -> dict[str, Any]:
+        result = self.execute(
+            "GetServerInformation", {"Name": "session", "Value": ""}
+        )
+        return self._decode_json_content(
+            result, "GetServerInformation(session)"
+        )
 
-    def get_map_sequence(self) -> Dict[str, Any]:
-        result = self.execute("GetServerInformation", {"Name": "mapsequence", "Value": ""})
-        return self._decode_json_content(result, "GetServerInformation(mapsequence)")
+    def get_map_sequence(self) -> dict[str, Any]:
+        result = self.execute(
+            "GetServerInformation", {"Name": "mapsequence", "Value": ""}
+        )
+        return self._decode_json_content(
+            result, "GetServerInformation(mapsequence)"
+        )
 
-    def change_map(self, map_name: str) -> Dict[str, Any]:
+    def change_map(self, map_name: str) -> dict[str, Any]:
         return self.execute("ChangeMap", {"MapName": map_name})
 
-    def set_sector_layout(self, sectors: list[str]) -> Dict[str, Any]:
+    def set_sector_layout(self, sectors: list[str]) -> dict[str, Any]:
         if len(sectors) != 5:
-            raise HLLRCONError("SetSectorLayout requires exactly 5 sector values.")
+            raise HLLRCONError(
+                "SetSectorLayout requires exactly 5 sector values."
+            )
         payload = {
             "Sector_1": sectors[0],
             "Sector_2": sectors[1],
@@ -111,33 +137,54 @@ class HLLRCONClient:
         }
         return self.execute("SetSectorLayout", payload)
 
-    def add_map_to_sequence(self, map_name: str, index: int = 0) -> Dict[str, Any]:
-        return self.execute("AddMapToSequence", {"MapName": map_name, "Index": index})
+    def add_map_to_sequence(
+        self, map_name: str, index: int = 0
+    ) -> dict[str, Any]:
+        return self.execute(
+            "AddMapToSequence", {"MapName": map_name, "Index": index}
+        )
 
-    def set_dynamic_weather_enabled(self, map_id: str, enable: bool) -> Dict[str, Any]:
-        return self.execute("SetDynamicWeatherEnabled", {"MapId": map_id, "Enable": enable})
+    def set_dynamic_weather_enabled(
+        self, map_id: str, enable: bool
+    ) -> dict[str, Any]:
+        return self.execute(
+            "SetDynamicWeatherEnabled", {"MapId": map_id, "Enable": enable}
+        )
 
-    def set_team_switch_cooldown(self, minutes: int) -> Dict[str, Any]:
-        return self.execute("SetTeamSwitchCooldown", {"TeamSwitchTimer": minutes})
+    def set_team_switch_cooldown(self, minutes: int) -> dict[str, Any]:
+        return self.execute(
+            "SetTeamSwitchCooldown", {"TeamSwitchTimer": minutes}
+        )
 
-    def set_match_timer(self, game_mode: str, minutes: int) -> Dict[str, Any]:
-        return self.execute("SetMatchTimer", {"GameMode": game_mode, "MatchLength": minutes})
+    def set_match_timer(self, game_mode: str, minutes: int) -> dict[str, Any]:
+        return self.execute(
+            "SetMatchTimer", {"GameMode": game_mode, "MatchLength": minutes}
+        )
 
-    def set_warmup_timer(self, game_mode: str, minutes: int) -> Dict[str, Any]:
-        return self.execute("SetWarmupTimer", {"GameMode": game_mode, "WarmupLength": minutes})
+    def set_warmup_timer(self, game_mode: str, minutes: int) -> dict[str, Any]:
+        return self.execute(
+            "SetWarmupTimer", {"GameMode": game_mode, "WarmupLength": minutes}
+        )
 
-    def execute(self, command: str, content_body: Any) -> Dict[str, Any]:
+    def execute(self, command: str, content_body: Any) -> dict[str, Any]:
         """Run one command on a fresh connection; socket failures surface as HLLRCONError."""
         endpoint = f"{self.credentials.host}:{self.credentials.port}"
         try:
             return self._execute(command, content_body)
-        except socket.timeout as exc:
-            raise HLLRCONError(f"Direct RCON {command} to {endpoint} timed out after {self.timeout}s.") from exc
+        except TimeoutError as exc:
+            raise HLLRCONError(
+                f"Direct RCON {command} to {endpoint} timed out after {self.timeout}s."
+            ) from exc
         except OSError as exc:
-            raise HLLRCONError(f"Direct RCON {command} to {endpoint} failed: {exc.__class__.__name__}: {exc}") from exc
+            raise HLLRCONError(
+                f"Direct RCON {command} to {endpoint} failed: {exc.__class__.__name__}: {exc}"
+            ) from exc
 
-    def _execute(self, command: str, content_body: Any) -> Dict[str, Any]:
-        with socket.create_connection((self.credentials.host, self.credentials.port), timeout=self.timeout) as connection:
+    def _execute(self, command: str, content_body: Any) -> dict[str, Any]:
+        with socket.create_connection(
+            (self.credentials.host, self.credentials.port),
+            timeout=self.timeout,
+        ) as connection:
             connection.settimeout(self.timeout)
 
             xor_key_response = self._exchange(
@@ -174,15 +221,19 @@ class HLLRCONClient:
         xor_key: bytes,
         command: str,
         content_body: Any,
-    ) -> Dict[str, Any]:
-        request_bytes, request_id = self._pack_request(auth_token, command, content_body)
+    ) -> dict[str, Any]:
+        request_bytes, request_id = self._pack_request(
+            auth_token, command, content_body
+        )
         if len(request_bytes) > self.max_request_size:
             raise HLLRCONError(
                 f"RCON request for {command} exceeds the maximum allowed size of {self.max_request_size} bytes."
             )
 
         if xor_key:
-            encrypted_body = self._xor_bytes(request_bytes[HEADER_SIZE:], xor_key)
+            encrypted_body = self._xor_bytes(
+                request_bytes[HEADER_SIZE:], xor_key
+            )
             request_bytes = request_bytes[:HEADER_SIZE] + encrypted_body
 
         connection.sendall(request_bytes)
@@ -205,23 +256,31 @@ class HLLRCONClient:
         try:
             payload = json.loads(body.decode("utf-8"))
         except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-            raise HLLRCONError(f"Failed to decode RCON response for {command}.") from exc
+            raise HLLRCONError(
+                f"Failed to decode RCON response for {command}."
+            ) from exc
 
         if response_id != request_id:
             raise HLLRCONError(
                 f"RCON response ID mismatch for {command}: expected {request_id}, got {response_id}."
             )
         if not isinstance(payload, dict):
-            raise HLLRCONError(f"Unexpected RCON response type for {command}: {type(payload).__name__}.")
+            raise HLLRCONError(
+                f"Unexpected RCON response type for {command}: {type(payload).__name__}."
+            )
 
         status_code = payload.get("statusCode")
         if status_code != 200:
-            status_message = payload.get("statusMessage") or "Unknown direct RCON error"
+            status_message = (
+                payload.get("statusMessage") or "Unknown direct RCON error"
+            )
             raise HLLRCONError(f"{command} failed: {status_message}")
 
         return payload
 
-    def _pack_request(self, auth_token: str, command: str, content_body: Any) -> tuple[bytes, int]:
+    def _pack_request(
+        self, auth_token: str, command: str, content_body: Any
+    ) -> tuple[bytes, int]:
         with self._request_lock:
             self._request_id += 1
             request_id = self._request_id
@@ -231,7 +290,9 @@ class HLLRCONClient:
         elif content_body is None:
             content_body_value = ""
         else:
-            content_body_value = json.dumps(content_body, separators=(",", ":"))
+            content_body_value = json.dumps(
+                content_body, separators=(",", ":")
+            )
 
         payload = {
             "authToken": auth_token,
@@ -250,7 +311,9 @@ class HLLRCONClient:
         while len(buffer) < expected_bytes:
             chunk = connection.recv(expected_bytes - len(buffer))
             if not chunk:
-                raise HLLRCONError("Direct RCON connection closed unexpectedly.")
+                raise HLLRCONError(
+                    "Direct RCON connection closed unexpectedly."
+                )
             buffer.extend(chunk)
         return bytes(buffer)
 
@@ -258,27 +321,33 @@ class HLLRCONClient:
     def _xor_bytes(data: bytes, key: bytes) -> bytes:
         if not key:
             return data
-        return bytes(byte ^ key[index % len(key)] for index, byte in enumerate(data))
+        return bytes(
+            byte ^ key[index % len(key)] for index, byte in enumerate(data)
+        )
 
     @staticmethod
-    def _decode_xor_key(response: Dict[str, Any]) -> bytes:
+    def _decode_xor_key(response: dict[str, Any]) -> bytes:
         content_body = response.get("contentBody")
         if not isinstance(content_body, str):
             raise HLLRCONError("ServerConnect did not return a valid XOR key.")
         try:
             return base64.b64decode(content_body)
         except ValueError as exc:
-            raise HLLRCONError("Failed to decode direct RCON XOR key.") from exc
+            raise HLLRCONError(
+                "Failed to decode direct RCON XOR key."
+            ) from exc
 
     @staticmethod
-    def _extract_auth_token(response: Dict[str, Any]) -> str:
+    def _extract_auth_token(response: dict[str, Any]) -> str:
         content_body = response.get("contentBody")
         if not isinstance(content_body, str) or not content_body:
             raise HLLRCONError("Login did not return a valid auth token.")
         return content_body
 
     @staticmethod
-    def _decode_json_content(response: Dict[str, Any], command: str) -> Dict[str, Any]:
+    def _decode_json_content(
+        response: dict[str, Any], command: str
+    ) -> dict[str, Any]:
         content_body = response.get("contentBody")
         if isinstance(content_body, dict):
             return content_body
@@ -286,7 +355,9 @@ class HLLRCONClient:
             try:
                 decoded = json.loads(content_body)
             except json.JSONDecodeError as exc:
-                raise HLLRCONError(f"{command} did not return valid JSON content.") from exc
+                raise HLLRCONError(
+                    f"{command} did not return valid JSON content."
+                ) from exc
             if isinstance(decoded, dict):
                 return decoded
         raise HLLRCONError(f"{command} returned an unexpected content body.")
