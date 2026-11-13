@@ -16,6 +16,17 @@ class HLLRCONError(Exception):
     """Raised when the HLL direct RCON connection or command fails."""
 
 
+def session_value(session: dict[str, Any], name: str) -> Any:
+    """A field from a GetServerInformation(session) reply, by its PascalCase name.
+
+    Live servers answer in camelCase (`mapName`, `alliedPlayerCount`); PascalCase is
+    still accepted in case a server version or proxy uses it.
+    """
+    camel = name[:1].lower() + name[1:]
+    value = session.get(camel)
+    return session.get(name) if value is None else value
+
+
 @dataclass(frozen=True)
 class HLLRCONCredentials:
     host: str

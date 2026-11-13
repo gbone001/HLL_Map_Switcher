@@ -36,6 +36,7 @@ from commands.booking import (
 from services.booking import (
     EVENT_NAME_MAX_LENGTH,
     MAX_OCCURRENCES,
+    clean_event_name,
     Booking,
     BookingGroup,
     group_by_series,
@@ -232,11 +233,12 @@ class BookingModal(discord.ui.Modal):
                 component=self.hour,
             )
         )
-        minute = max(m for m in MINUTE_CHOICES if m <= minute)
+        # A booking made with /book can start on any minute; offer it so an edit keeps it.
+        minutes = sorted({*MINUTE_CHOICES, minute})
         self.minute = discord.ui.Select(
             options=[
                 discord.SelectOption(label=f":{m:02d}", value=str(m), default=m == minute)
-                for m in MINUTE_CHOICES
+                for m in minutes
             ],
         )
         self.add_item(discord.ui.Label(text="Start minute", component=self.minute))
@@ -246,7 +248,7 @@ class BookingModal(discord.ui.Modal):
             await _reply(interaction, "❌ Pick a server and a date.")
             return
         draft = self.draft
-        draft.event_name = self.event.value or None
+        draft.event_name = clean_event_name(self.event.value)
         draft.server_index = int(self.server.values[0])
         draft.day = date.fromisoformat(self.date.values[0])
         draft.start_minute = int((self.hour.values or ["19"])[0]) * 60 + int((self.minute.values or ["0"])[0])
@@ -315,8 +317,7 @@ class BookingDetailsView(_SelfClosingView):
                         description=f"Ends {_hhmm(draft.start_minute + m)}",
                         default=m == draft.length,
                     )
-                    for m in LENGTH_CHOICES
-                    if m <= self.max_length
+                    for m in self.length_choices()
                 ],
                 row=0,
             )
@@ -351,6 +352,13 @@ class BookingDetailsView(_SelfClosingView):
         ):
             button.row = 3
             self.add_item(button)
+
+    def length_choices(self) -> list[int]:
+        """The standard lengths, plus the draft's own when it isn't one (e.g. 100 min from /book)."""
+        choices = [m for m in LENGTH_CHOICES if m <= self.max_length]
+        if self.draft.length not in choices:
+            choices = sorted([*choices, self.draft.length])
+        return choices[:25]
 
     async def redraw(self, interaction: discord.Interaction) -> None:
         self.render()

@@ -10,7 +10,7 @@
 
 ## Live Service Modules
 - `src/utils/crcon_http.py` -> authoritative CRCON HTTP client. Handles token auth, gamestate, map changes, objective layout changes, dynamic weather, timer updates, and admin access operations.
-- `src/utils/hll_rcon.py` -> direct Hell Let Loose RCON v2 client for TCP fallback when CRCON HTTP is unavailable.
+- `src/utils/hll_rcon.py` -> direct Hell Let Loose RCON v2 client for TCP fallback when CRCON HTTP is unavailable. Live session replies are camelCase (`mapName`, `alliedPlayerCount`); read them with `session_value(...)`.
 - `src/utils/api_client.py` -> server discovery and lightweight CRCON-backed server metadata wrapper used by the Discord layer, including the stable server key (`get_server_key`) bookings are stored against.
 - `src/utils/map_data.py` -> CRCON map catalog loading, normalization, cache file persistence, and fallback map data.
 - `src/services/server_control.py` -> HTTP-first control service with direct RCON fallback for status reads, map changes, sector layout changes, dynamic weather, and timer updates.
@@ -29,8 +29,8 @@
 - Slash commands:
 - `/setup_panel [channel]` -> an approved guild's admins create that guild's control panel in one of its channels (default: the current one); the guild's old panel is removed and the new one remembered in `data/panel_message.json`, so restarts restore it there. `DISCORD_CHANNEL_ID` is only the home guild's fallback before its first `/setup_panel`. `/repost_button` reposts the calling guild's panel.
 - `/repost_button` -> reposts the persistent control panel for admins.
-- `/book`, `/bookings`, `/cancel_booking`, `/clear_bookings` -> server booking (enabled only when `BOOKING_ROLE_ID` and `DISCORD_GUILD_ID` are set; roles and admin rights count only inside `DISCORD_GUILD_ID`). See `docs/booking-shaping.md`.
-- Repeating bookings form a series: every date stores `series_id` (the first date's ID, the parent) and `recurrence`. `/bookings`, `/cancel_booking` (autocomplete) and Manage Bookings show one entry per series (`group_by_series`); cancelling a series (`BookingService.cancel_series`, `/cancel_booking series:True` is the default) cancels all its remaining dates.
+- `/book`, `/bookings`, `/cancel_booking`, `/clear_bookings` -> server booking (enabled when `DISCORD_GUILD_ID` is set; `BOOKING_ADMIN_ROLE_ID` and Administrator rights count only inside `DISCORD_GUILD_ID`). See `docs/booking-shaping.md`.
+- Repeating bookings form a series: every date stores `series_id` (the first date's ID, the parent) and `recurrence`. Dates are stepped in local calendar days in `BOOKING_TIMEZONE`, so a series keeps its local start time across daylight-saving changes. `/bookings`, `/cancel_booking` (autocomplete) and Manage Bookings show one entry per series (`group_by_series`); cancelling a series (`BookingService.cancel_series`, `/cancel_booking series:True` is the default) cancels all its remaining dates.
 - `/clear_bookings confirm:True` -> booking admins cancel every active and upcoming booking (rows are kept as cancelled).
 - Persistent panel actions:
 - `Change Server`
@@ -64,6 +64,9 @@
 
 ## Current Architecture Rules
 - Treat `src/bot.py` as the live orchestration layer until the bot is split further.
+- The bot uses slash commands and buttons only: no prefix commands and no Message Content intent. Persistent panel views are registered in `setup_hook`.
+- Start fire-and-forget coroutines with `_spawn(...)`, which keeps a reference until they finish.
+- After ChangeMap the game counts down `MAP_CHANGE_COUNTDOWN_SECONDS` (60) before switching, then loads the layer (~70 s total observed; CRCON can stall meanwhile). The bot records a `PendingMapChange`, shows the countdown on the server card, refreshes the panel afterwards, and `_deny_if_map_changing(...)` holds objectives and weather until status reports the new `map_id` after the countdown (gives up after `MAP_CHANGE_TIMEOUT_SECONDS`). Pickers opened before a map change are refused at write time. New map-specific controls should use the same guard.
 - Treat `src/utils/crcon_http.py` as the single source of truth for CRCON HTTP endpoints.
 - Treat `src/utils/hll_rcon.py` as the single source of truth for direct game-server RCON transport details.
 - Do not add raw `requests` calls directly inside Discord UI handlers when extending CRCON functionality.
@@ -114,7 +117,7 @@
 - Support both single-server and multi-server CRCON configuration.
 - Assume CRCON APIs can timeout or return partial failures.
 - Prefer explicit error messages over silent fallbacks.
-- Log critical control-plane actions and cache refresh failures.
+- Log critical control-plane actions and cache refresh failures. Successful control writes go through `_audit(...)` in `src/bot.py`; booking create/edit/cancel are logged in `src/commands/booking.py`. Logs go to stdout (Railway treats stderr as errors).
 - Preserve idempotency where possible for repeated button clicks and duplicate interaction attempts.
 - Handle missing or incomplete CRCON configuration without crashing unrelated Discord features.
 

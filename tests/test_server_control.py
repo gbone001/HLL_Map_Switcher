@@ -113,13 +113,13 @@ class ServerControlServiceTests(unittest.TestCase):
         service = TestableServerControlService(
             http_client=FakeHTTPClient(exception=CRCONHTTPError("http down")),
             rcon_client=FakeRCONClient(
+                # Shape of a live GetServerInformation(session) reply: flat and camelCase.
                 session={
-                    "session": {
-                        "MapName": "carentan_warfare",
-                        "AlliedPlayerCount": 20,
-                        "AxisPlayerCount": 21,
-                        "RemainingMatchTime": 1500,
-                    }
+                    "mapName": "CARENTAN",
+                    "mapId": "carentan_warfare",
+                    "alliedPlayerCount": 20,
+                    "axisPlayerCount": 21,
+                    "remainingMatchTime": 1500,
                 }
             ),
         )
@@ -128,8 +128,22 @@ class ServerControlServiceTests(unittest.TestCase):
 
         self.assertTrue(result.success)
         self.assertEqual(result.transport, "direct_rcon")
-        self.assertEqual(result.data["status"].current_map, "carentan_warfare")
+        status = result.data["status"]
+        self.assertEqual(
+            (status.current_map, status.allied_players, status.axis_players, status.time_remaining_seconds),
+            ("CARENTAN", 20, 21, 1500),
+        )
         self.assertIn("CRCON HTTP", result.warning)
+
+    def test_rcon_status_still_reads_pascal_case_sessions(self):
+        service = TestableServerControlService(
+            http_client=FakeHTTPClient(exception=CRCONHTTPError("http down")),
+            rcon_client=FakeRCONClient(session={"session": {"MapName": "carentan_warfare", "AlliedPlayerCount": 7}}),
+        )
+
+        status = service.get_status(0).data["status"]
+
+        self.assertEqual((status.current_map, status.allied_players), ("carentan_warfare", 7))
 
     def test_change_map_falls_back_to_direct_rcon(self):
         class FailingHTTP(FakeHTTPClient):
@@ -296,3 +310,41 @@ class MutationSerializationTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class RconNotConfiguredTests(unittest.TestCase):
+    def test_missing_rcon_credentials_are_reported_plainly(self):
+        import os
+        from unittest import mock
+
+        class DownHTTP(FakeHTTPClient):
+            def set_map(self, map_id):
+                raise CRCONHTTPError("http down")
+
+        service = ServerControlService(
+            server_number_resolver=lambda _index: 1,
+            http_client_factory=lambda _index: DownHTTP(exception=CRCONHTTPError("http down")),
+        )
+        with mock.patch.dict(os.environ, {}, clear=True):
+            result = service.change_map(0, "foy_warfare")
+            status = service.get_status(0)
+
+        for message in (result.message, status.message):
+            self.assertIn("http down", message)
+            self.assertIn("fallback not configured", message)
+            self.assertNotIn("SERVER1_RCON_HOST", message)
+
+
+class CurrentMapRconFallbackTests(unittest.TestCase):
+    def test_get_current_map_reads_live_camel_case_session(self):
+        import os
+        from unittest import mock
+
+        from utils import api_client as api_module
+
+        env = {"SERVER1_NAME": "One", "SERVER1_RCON_HOST": "127.0.0.1", "SERVER1_RCON_PORT": "1", "SERVER1_RCON_PASSWORD": "p"}
+        rcon = FakeRCONClient(session={"mapName": "EL ALAMEIN", "mapId": "elalamein_warfare"})
+        with mock.patch.dict(os.environ, env, clear=True), \
+             mock.patch.object(api_module.HLLRCONClient, "from_env", return_value=rcon):
+            client = api_module.HLLAPIClient()
+            self.assertEqual(client.get_current_map(0), "EL ALAMEIN")

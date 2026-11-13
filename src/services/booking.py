@@ -313,8 +313,11 @@ class BookingService:
         clock: Callable[[], datetime] = lambda: datetime.now(UTC),
         max_duration_seconds: int | None = None,
         max_lead_seconds: int | None = None,
+        timezone: ZoneInfo | None = None,
     ):
         self.db_path = Path(db_path)
+        # Repeats keep the same local clock time in this zone across daylight-saving changes.
+        self.timezone = timezone or ZoneInfo("UTC")
         self._clock = clock
         self.max_duration_seconds = max_duration_seconds
         self.max_lead_seconds = max_lead_seconds
@@ -455,8 +458,17 @@ class BookingService:
             raise BookingError(f"Number of dates must be between 1 and {MAX_OCCURRENCES}.")
         if RECURRENCE_DAYS[recurrence] == 0 or count == 1:
             return [(start_utc, end_utc)], "none"
-        step = RECURRENCE_DAYS[recurrence] * 86400
-        return [(start_utc + i * step, end_utc + i * step) for i in range(count)], recurrence
+        days = RECURRENCE_DAYS[recurrence]
+        length = end_utc - start_utc
+        # Step in local calendar days, not fixed 24h blocks, so a weekly 20:00 booking stays
+        # at 20:00 local after the clocks change.
+        local_start = datetime.fromtimestamp(start_utc, self.timezone).replace(tzinfo=None)
+        slots = []
+        for i in range(count):
+            local = local_start + timedelta(days=i * days)
+            start = int(local.replace(tzinfo=self.timezone).timestamp())
+            slots.append((start, start + length))
+        return slots, recurrence
 
     def _insert_slots(
         self,

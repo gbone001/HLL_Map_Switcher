@@ -2,7 +2,7 @@ import os
 from dataclasses import dataclass
 
 from .crcon_http import CRCONCredentials, CRCONHttpClient, CRCONHTTPError
-from .hll_rcon import HLLRCONClient, HLLRCONCredentials, HLLRCONError
+from .hll_rcon import HLLRCONClient, HLLRCONCredentials, HLLRCONError, session_value
 
 
 @dataclass
@@ -203,7 +203,7 @@ class HLLAPIClient:
         )
         if not isinstance(session, dict):
             return "Unknown"
-        return str(session.get("MapName") or "Unknown")
+        return str(session_value(session, "MapName") or "Unknown")
 
     def set_map(self, server_index: int, map_id: str) -> tuple[bool, str]:
         try:

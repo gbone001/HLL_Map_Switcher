@@ -484,7 +484,8 @@ class PanelAndRefreshTests(BookingBotTestCase):
         self.clock.ts = T0 + 2 * HOUR
         self.assertEqual(bot._panel_booking_lines(), {})
 
-    def test_game_controls_show_only_while_a_booking_is_live(self):
+    async def test_game_controls_show_only_while_a_booking_is_live(self):
+        # discord.ui.View needs a running event loop, so this test is async.
         def gated_ids(show):
             view = bot.GameModeView(show_controls=show)
             return {c.custom_id for c in view.children} & bot.BOOKING_GATED_BUTTONS
@@ -764,6 +765,35 @@ class BookingModalTests(BookingBotTestCase):
     def button(self, details, label):
         return next(item for item in details.children if getattr(item, "label", "") == label)
 
+    async def test_edit_keeps_an_off_grid_start_minute_and_length(self):
+        """A /book booking at 10:10 for 100 minutes must survive an untouched edit."""
+        from commands import booking_panel
+        from services.booking import group_by_series
+
+        original = self.service.create("server1", BOOKER_ID, "b", T0 + 2 * HOUR + 600, T0 + 2 * HOUR + 600 + 100 * 60)
+        deps = self.deps()
+        draft = booking_panel.BookingDraft.from_group(group_by_series([original])[0], deps)
+        modal = booking_panel.BookingModal(deps, draft)
+        self.assertEqual([o.value for o in modal.minute.options if o.default], ["10"])
+
+        details = await self.submit_modal(modal, day="2027-01-15", hour="10", minute="10")
+        length = next(item for item in details.children if getattr(item, "field", None) == "length")
+        self.assertEqual([o.value for o in length.options if o.default], ["100"])
+
+        await details.save(interaction_for(member(BOOKER_ID)))
+        saved = self.service.list_live()
+        self.assertEqual([(b.start_utc, b.end_utc) for b in saved], [(original.start_utc, original.end_utc)])
+
+    async def test_event_name_is_tidied_before_the_confirm_step(self):
+        from commands import booking_panel
+
+        details = await self.submit_modal(
+            booking_panel.BookingModal(self.deps(), booking_panel.BookingDraft.new(self.deps())),
+            event="  Weekly   Tank  Battle ",
+        )
+        self.assertEqual(details.draft.event_name, "Weekly Tank Battle")
+        self.assertIn("**Weekly Tank Battle**", details.embed().description)
+
     async def test_book_button_opens_the_pop_up_with_time_dropdowns(self):
         from commands import booking_panel
 
@@ -942,3 +972,86 @@ class ManageSeriesTests(BookingBotTestCase):
         await view.cancel_selected.callback(interaction)
 
         self.assertEqual([b.id for b in self.service.list_live()], [single.id])
+
+
+class MapChangeCountdownTests(unittest.IsolatedAsyncioTestCase):
+    """The game counts down ~60 s before switching maps; objectives/weather must wait."""
+
+    def setUp(self):
+        bot._pending_map_changes.clear()
+        bot._last_map_change_at.clear()
+        self.addCleanup(bot._pending_map_changes.clear)
+        self.addCleanup(bot._last_map_change_at.clear)
+        for name, value in {
+            "_deny_if_booked": mock.AsyncMock(return_value=False),
+            "refresh_main_embed": mock.AsyncMock(),
+            "_refresh_after_map_change": mock.AsyncMock(),
+        }.items():
+            patcher = mock.patch.object(bot, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def status(self, map_id):
+        game = bot.GameStatus("crcon_http", map_id, 0, 0, 5400, None, map_id=map_id)
+        return ControlResult(success=True, transport="crcon_http", message="ok", data={"status": game})
+
+    async def change_map(self, target="stmereeglise_warfare"):
+        interaction = interaction_for(member(BOOKER_ID))
+        view = bot.VariantSelectionView(0, "warfare", "St. Mere Eglise", [{"id": target, "variant": "Day"}])
+        view.children[0]._values = [target]
+        ok = ControlResult(success=True, transport="crcon_http", message="ok")
+        with mock.patch.object(bot.server_control, "change_map", return_value=ok), \
+             mock.patch.object(bot.api_client, "get_current_map") as current_map:
+            await view.children[0].callback(interaction)
+        current_map.assert_not_called()  # the server still reports the old map here
+        return interaction
+
+    async def test_map_change_reply_explains_the_countdown_and_records_it(self):
+        interaction = await self.change_map()
+
+        embed = interaction.edit_original_response.await_args.kwargs["embed"]
+        self.assertEqual(embed.title, "✅ Map Change Started")
+        self.assertIn("counts down 60 seconds", embed.description)
+        self.assertEqual(bot._pending_map_changes[0].map_id, "stmereeglise_warfare")
+        bot._refresh_after_map_change.assert_called_once()
+
+    async def test_objectives_wait_until_the_new_map_has_loaded(self):
+        await self.change_map()
+        interaction = interaction_for(member(BOOKER_ID))
+        interaction.response._done = True
+        with mock.patch.object(bot.server_control, "get_status", return_value=self.status("foy_warfare")), \
+             mock.patch.object(bot, "_get_http_client") as http:
+            await bot.send_objective_selection(interaction, 0, edit_message=False)
+        http.assert_not_called()
+        sent = interaction.followup.send.await_args.kwargs.get("content", "")
+        self.assertIn("is switching to **St. Mere Eglise (Day)**", sent)
+
+        # Countdown over and the server reports the new layer: the hold lifts.
+        bot._pending_map_changes[0].started -= bot.MAP_CHANGE_COUNTDOWN_SECONDS + 1
+        with mock.patch.object(bot.server_control, "get_status", return_value=self.status("stmereeglise_warfare")):
+            self.assertIsNone(await bot._map_change_in_progress(0))
+        self.assertNotIn(0, bot._pending_map_changes)
+
+    async def test_reselecting_the_running_map_still_waits_for_the_countdown(self):
+        await self.change_map("foy_warfare")
+        with mock.patch.object(bot.server_control, "get_status", return_value=self.status("foy_warfare")):
+            self.assertIsNotNone(await bot._map_change_in_progress(0))
+
+    async def test_objective_picker_opened_before_a_map_change_is_refused(self):
+        picker = bot.ObjectiveSelectionView(0, [["A", "B", "C"]] * 5, "Server", "Foy")
+        picker.selected = {slot: "A" for slot in range(1, 6)}
+        await self.change_map()
+        bot._pending_map_changes.clear()  # new map already loaded
+        interaction = interaction_for(member(BOOKER_ID))
+        interaction.response._done = True
+        with mock.patch.object(bot.server_control, "set_sector_layout") as write:
+            await picker.lock_objectives(interaction)
+        write.assert_not_called()
+        content = interaction.edit_original_response.await_args.kwargs["content"]
+        self.assertIn("changed after this was opened", content)
+
+    async def test_panel_card_shows_the_countdown(self):
+        await self.change_map()
+        servers = [(0, "Alpha")]
+        fields, _ = bot._build_server_fields(servers, {0: self.status("foy_warfare")}, {})
+        self.assertIn("⏳ Switching to **St. Mere Eglise (Day)** in ~", fields[0][1])

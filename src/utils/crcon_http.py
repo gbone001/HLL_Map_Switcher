@@ -233,7 +233,10 @@ class CRCONHttpClient:
                 self._status_error_message("set_map", response)
             )
 
-        return self._parse_json(response)
+        payload = self._parse_json(response)
+        if payload.get("failed"):
+            raise CRCONHTTPError(f"set_map reported failure: {payload.get('error')}")
+        return payload
 
     def set_game_layout(
         self,

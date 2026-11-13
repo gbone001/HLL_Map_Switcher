@@ -125,3 +125,17 @@ class CRCONHttpNetworkErrorTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class SetMapFailureTests(unittest.TestCase):
+    def test_set_map_failed_envelope_raises(self):
+        class PostSession:
+            def post(self, url, headers=None, json=None, timeout=None):
+                return build_response(200, '{"result": null, "failed": true, "error": "not a valid layer"}')
+
+        client = CRCONHttpClient(credentials=CRCONCredentials(base_url="https://crcon.example", token="token"))
+        client.session = PostSession()
+
+        with self.assertRaises(CRCONHTTPError) as context:
+            client.set_map("bogus")
+        self.assertIn("not a valid layer", str(context.exception))

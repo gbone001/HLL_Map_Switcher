@@ -6,8 +6,9 @@ from dataclasses import dataclass
 from typing import Any
 
 from utils.crcon_http import CRCONHttpClient, CRCONHTTPError
-from utils.hll_rcon import HLLRCONClient, HLLRCONError
+from utils.hll_rcon import HLLRCONClient, HLLRCONCredentials, HLLRCONError, session_value
 
+RCON_NOT_CONFIGURED = "fallback not configured for this server."
 
 @dataclass(frozen=True)
 class ControlResult:
@@ -26,6 +27,8 @@ class GameStatus:
     axis_players: int | None
     time_remaining_seconds: int | None
     raw_time_remaining: str | None
+    # Layer ID (e.g. "stmereeglise_warfare"), used to tell when a requested map has loaded.
+    map_id: str | None = None
 
 
 class ServerControlService:
@@ -70,6 +73,10 @@ class ServerControlService:
 
         try:
             rcon_client = self._rcon_client(server_index)
+        except HLLRCONError as exc:
+            errors.append(f"Direct RCON: {self._rcon_setup_error(server_index, exc)}")
+            return ControlResult(success=False, transport=None, message=" ; ".join(errors))
+        try:
             session_info = rcon_client.get_session_info()
             return ControlResult(
                 success=True,
@@ -256,23 +263,32 @@ class ServerControlService:
 
         try:
             rcon_client = self._rcon_client(server_index)
-            payload = rcon_action(rcon_client)
-            warning = http_warning or None
-            return ControlResult(
-                success=True,
-                transport="direct_rcon",
-                message=success_rcon_message,
-                warning=warning,
-                data=payload if isinstance(payload, dict) else None,
-            )
         except HLLRCONError as exc:
-            errors.append(f"Direct RCON: {exc}")
+            errors.append(f"Direct RCON: {self._rcon_setup_error(server_index, exc)}")
+        else:
+            try:
+                payload = rcon_action(rcon_client)
+                return ControlResult(
+                    success=True,
+                    transport="direct_rcon",
+                    message=success_rcon_message,
+                    warning=http_warning or None,
+                    data=payload if isinstance(payload, dict) else None,
+                )
+            except HLLRCONError as exc:
+                errors.append(f"Direct RCON: {exc}")
 
         return ControlResult(
             success=False,
             transport=None,
             message=f"{action_name} failed. " + " ; ".join(errors),
         )
+
+    def _rcon_setup_error(self, server_index: int, exc: HLLRCONError) -> str:
+        """Plain wording when no RCON fallback is set up, instead of a list of env var names."""
+        if HLLRCONCredentials.is_configured(self.server_number_resolver(server_index)):
+            return str(exc)
+        return RCON_NOT_CONFIGURED
 
     def _rcon_client(self, server_index: int) -> HLLRCONClient:
         server_number = self.server_number_resolver(server_index)
@@ -320,6 +336,9 @@ class ServerControlService:
             raw_time_remaining=ServerControlService._optional_str(
                 result.get("raw_time_remaining")
             ),
+            map_id=ServerControlService._optional_str(
+                current_map.get("id") if isinstance(current_map, dict) else None
+            ),
         )
 
     @staticmethod
@@ -328,17 +347,18 @@ class ServerControlService:
 
         return GameStatus(
             transport="direct_rcon",
-            current_map=str(session_data.get("MapName") or "Unknown"),
+            current_map=str(session_value(session_data, "MapName") or "Unknown"),
             allied_players=ServerControlService._optional_int(
-                session_data.get("AlliedPlayerCount")
+                session_value(session_data, "AlliedPlayerCount")
             ),
             axis_players=ServerControlService._optional_int(
-                session_data.get("AxisPlayerCount")
+                session_value(session_data, "AxisPlayerCount")
             ),
             time_remaining_seconds=ServerControlService._optional_int(
-                session_data.get("RemainingMatchTime")
+                session_value(session_data, "RemainingMatchTime")
             ),
             raw_time_remaining=None,
+            map_id=ServerControlService._optional_str(session_value(session_data, "MapId")),
         )
 
     @staticmethod

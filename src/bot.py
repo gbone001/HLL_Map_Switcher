@@ -1,10 +1,12 @@
 import asyncio
 import functools
 import json
+import logging
 import os
 import sys
 import threading
-from datetime import datetime, timedelta, timezone
+import time
+from dataclasses import dataclass
 
 import discord
 from discord.ext import commands
@@ -86,6 +88,9 @@ async def sync_app_commands(
 
 class MapSwitcherBot(commands.Bot):
     async def setup_hook(self) -> None:
+        # Register the panel buttons before the gateway connects, so clicks work as soon as
+        # the bot is online rather than after on_ready's slower startup work.
+        self.add_view(GameModeView())
         await sync_app_commands(self.tree)
 
     async def close(self) -> None:
@@ -99,8 +104,9 @@ class MapSwitcherBot(commands.Bot):
 intents = discord.Intents.none()
 intents.guilds = True
 intents.guild_messages = True
-intents.message_content = True
-bot = MapSwitcherBot(command_prefix="!", intents=intents)
+# Slash commands and buttons only: no prefix commands, so no privileged Message Content
+# intent, and chat messages starting with "!" no longer raise CommandNotFound.
+bot = MapSwitcherBot(command_prefix=commands.when_mentioned, intents=intents)
 
 # Approved Discord guilds: DISCORD_GUILD_ID (home) plus BOOKING_GUILD_IDS (guests).
 guild_registry = GuildRegistry.from_env()
@@ -163,7 +169,7 @@ server_control = ServerControlService(
 )
 
 
-# Server booking (docs/booking-shaping.md). Disabled unless BOOKING_ROLE_ID is set.
+# Server booking (docs/booking-shaping.md). Enabled when DISCORD_GUILD_ID is set.
 booking_config = BookingConfig.from_env()
 booking_service: BookingService | None = None
 if booking_config.enabled:
@@ -172,6 +178,7 @@ if booking_config.enabled:
             booking_config.db_path,
             max_duration_seconds=booking_config.max_duration_seconds,
             max_lead_seconds=booking_config.max_lead_seconds,
+            timezone=booking_config.timezone,
         )
         print(
             f"Server booking enabled (store: {booking_config.db_path}, time zone: {booking_config.timezone.key})."
@@ -330,10 +337,30 @@ async def _deny_if_booked(
         await update_interaction_message(
             interaction, content=message, embed=None, view=None
         )
-        asyncio.create_task(_delete_interaction_after(interaction, 20.0))
+        _spawn(_delete_interaction_after(interaction, 20.0))
     else:
         await send_temporary_response(interaction, content=message, delay=20)
     return True
+
+
+# Fire-and-forget tasks (auto-deletes, delayed refreshes). asyncio keeps only weak
+# references to tasks, so hold them here until they finish or they can be collected mid-run.
+_background_tasks: set[asyncio.Task] = set()
+
+
+def _spawn(coro) -> asyncio.Task:
+    task = asyncio.create_task(coro)
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
+    return task
+
+
+def _audit(interaction: discord.Interaction, server_index: int, action: str) -> None:
+    """Log a successful control write so production has a record of who changed what."""
+    print(
+        f"[audit] user {interaction.user.id} from guild {interaction.guild_id} {action} "
+        f"on {api_client.get_server_name(server_index)} (server index {server_index})"
+    )
 
 
 async def _run_server_write(server_index: int, func, *args, **kwargs):
@@ -431,40 +458,109 @@ _current_objectives_state: dict[tuple[int, str], list[str]] = {}
 # Map (server_index, map_id) -> dynamic weather state last set through this bot
 _dynamic_weather_state: dict[tuple[int, str], bool] = {}
 
+# After ChangeMap the game counts down (about 60 s) before it switches, then loads the new
+# layer. Until then objectives and weather would apply to the old map, so those flows wait.
+MAP_CHANGE_COUNTDOWN_SECONDS = 60
+# Stop waiting for a requested map after this long (e.g. it was changed again elsewhere).
+MAP_CHANGE_TIMEOUT_SECONDS = 180
+
+
+@dataclass
+class PendingMapChange:
+    map_id: str
+    label: str
+    started: float  # time.monotonic() when the change was accepted
+
+    def seconds_left(self) -> int:
+        return max(0, int(self.started + MAP_CHANGE_COUNTDOWN_SECONDS - time.monotonic()))
+
+    def countdown_over(self) -> bool:
+        return time.monotonic() - self.started >= MAP_CHANGE_COUNTDOWN_SECONDS
+
+
+# server_index -> map change the bot requested that has not loaded yet
+_pending_map_changes: dict[int, PendingMapChange] = {}
+# server_index -> time.monotonic() of the bot's latest map change (loaded or not)
+_last_map_change_at: dict[int, float] = {}
+
+
+def _pending_map_change(server_index: int) -> PendingMapChange | None:
+    pending = _pending_map_changes.get(server_index)
+    if pending is not None and time.monotonic() - pending.started > MAP_CHANGE_TIMEOUT_SECONDS:
+        _pending_map_changes.pop(server_index, None)
+        return None
+    return pending
+
+
+def _settle_map_change(server_index: int, status: object) -> PendingMapChange | None:
+    """Clear the pending change once `status` shows the requested map after the countdown.
+
+    The countdown check matters when re-selecting the map already running: the old match
+    reports the same layer until the game actually restarts it.
+    """
+    pending = _pending_map_change(server_index)
+    if (
+        pending is not None
+        and pending.countdown_over()
+        and isinstance(status, GameStatus)
+        and status.map_id == pending.map_id
+    ):
+        if _pending_map_changes.get(server_index) is pending:
+            del _pending_map_changes[server_index]
+        return None
+    return pending
+
+
+async def _map_change_in_progress(server_index: int) -> PendingMapChange | None:
+    """The bot's map change on this server if the new map has not loaded yet (reads status)."""
+    if _pending_map_change(server_index) is None:
+        return None
+    result = await asyncio.to_thread(server_control.get_status, server_index)
+    status = (result.data or {}).get("status") if result.success else None
+    return _settle_map_change(server_index, status)
+
+
+def _map_change_wait_message(pending: PendingMapChange, server_name: str) -> str:
+    left = pending.seconds_left()
+    when = f"in about {left}s" if left else "loading now"
+    return (
+        f"⏳ **{server_name}** is switching to **{pending.label}** ({when}). Objectives and "
+        "weather would apply to the old map, so set them once the new map has loaded."
+    )
+
+
+async def _refresh_after_map_change(server_index: int, pending: PendingMapChange) -> None:
+    """Re-render the panels once the countdown is over and the new map is up."""
+    await asyncio.sleep(MAP_CHANGE_COUNTDOWN_SECONDS + 15)
+    for _ in range(4):
+        if _pending_map_changes.get(server_index) is not pending:
+            break  # loaded already, or superseded by a newer change with its own refresh
+        if await _map_change_in_progress(server_index) is None:
+            break
+        await asyncio.sleep(20)
+    try:
+        await refresh_main_embed()
+    except Exception:
+        logging.getLogger(__name__).exception("Panel refresh after a map change failed")
+
 # ============================================================
 # Periodic cleanup for unbounded module-level dicts (P2 fix)
 # ============================================================
 
 _MAX_CACHE_ENTRIES = 1000
-_MAX_CACHE_AGE_HOURS = 24
 _cache_cleanup_task: asyncio.Task | None = None
 
 
 def _cleanup_state_caches() -> None:
-    """Remove stale entries from unbounded caches to prevent memory leaks."""
-
-    # Clean _current_objectives_state
-    if len(_current_objectives_state) > _MAX_CACHE_ENTRIES:
-        # Keep only recent entries (by arbitrary ordering, we can't track timestamps without more structure)
-        # For now, just trim to max size - in practice, a server won't have 1000 different maps
-        keys_to_keep = list(_current_objectives_state.keys())[
-            -_MAX_CACHE_ENTRIES:
-        ]
-        _current_objectives_state.clear()
-        for k in keys_to_keep:
-            if k in _current_objectives_state:
-                pass  # already cleared
-        # Actually, let's just keep it simple and don't auto-evict for now
-        # The dicts are keyed by (server_index, map_name) which is naturally bounded
-
-    # Clean _dynamic_weather_state
-    if len(_dynamic_weather_state) > _MAX_CACHE_ENTRIES:
-        pass
-
-    # Clean _persistent_focused_server (channel-focused servers)
-    # These are per-channel and typically small, but let's bound them
-    if len(_persistent_focused_server) > _MAX_CACHE_ENTRIES:
-        pass
+    """Bound the in-memory state caches by dropping their oldest entries (insertion order)."""
+    for cache in (
+        _current_objectives_state,
+        _dynamic_weather_state,
+        _persistent_focused_server,
+    ):
+        excess = len(cache) - _MAX_CACHE_ENTRIES
+        for key in list(cache)[: max(0, excess)]:
+            cache.pop(key, None)
 
 
 async def _periodic_cache_cleanup() -> None:
@@ -477,7 +573,6 @@ async def _periodic_cache_cleanup() -> None:
             break
         except Exception:
             # Don't let cleanup crashes affect the bot
-            import logging
 
             logging.getLogger(__name__).exception("Cache cleanup task crashed")
 
@@ -630,6 +725,13 @@ def _build_server_fields(
                     details.append("🌦 weather on" if known_weather else "🌦 weather off")
                 lines.append(f"**{pretty_name}**")
                 lines.append("-# " + " · ".join(details))
+                pending = _settle_map_change(index, status)
+                if pending is not None:
+                    left = pending.seconds_left()
+                    lines.append(
+                        f"-# ⏳ Switching to **{pending.label}** "
+                        + (f"in ~{left}s" if left else "· loading")
+                    )
                 if status.transport != "crcon_http":
                     lines.append("-# Using direct RCON (CRCON HTTP unavailable)")
                     degraded.append(server_name)
@@ -731,9 +833,8 @@ async def fetch_server_statuses() -> dict[int, ControlResult]:
     )
     # Handle exceptions: convert to failed ControlResult
     processed_results = {}
-    for index, result in zip(indices, results):
+    for index, result in zip(indices, results, strict=True):
         if isinstance(result, Exception):
-            import logging
 
             logging.getLogger(__name__).warning(
                 "fetch_server_statuses: server %s raised %s: %s",
@@ -1201,7 +1302,7 @@ async def send_temporary_response(
                 content=content, ephemeral=ephemeral
             )
         if delay is not None and delay > 0:
-            asyncio.create_task(_delete_interaction_after(interaction, delay))
+            _spawn(_delete_interaction_after(interaction, delay))
     else:
         if embed is not None and view is not None:
             followup = await interaction.followup.send(
@@ -1232,7 +1333,7 @@ async def send_temporary_response(
                 wait=True,
             )
         if delay is not None and delay > 0 and followup is not None:
-            asyncio.create_task(_delete_message_after(followup, delay))
+            _spawn(_delete_message_after(followup, delay))
 
 
 async def _delete_message_after(
@@ -1319,10 +1420,16 @@ class AddAdminCamModal(discord.ui.Modal, title="ADD ADMIN CAM ACCESS"):
                 role="spectator",
                 description="Admin cam access",
             )
-        except CRCONHTTPError:
-            added = False
+        except CRCONHTTPError as exc:
+            await send_temporary_response(
+                interaction,
+                content=f"❌ Could not reach CRCON, so admin cam was not changed: {exc}",
+                delay=20,
+            )
+            return
 
         if added:
+            _audit(interaction, self.server_index, f"added admin cam for {player_id}")
             await send_temporary_response(
                 interaction, content="Player ADDED", delay=10
             )
@@ -1384,6 +1491,7 @@ class TeamSwitchCooldownModal(
             )
             return
 
+        _audit(interaction, self.server_index, f"set team switch cooldown to {cooldown_minutes} min")
         warning = ""
         if result.warning:
             warning = f" Note: {result.warning}"
@@ -1419,7 +1527,7 @@ class RemoveAdminCamConfirmView(discord.ui.View):
                 embed=None,
                 view=None,
             )
-            asyncio.create_task(_delete_interaction_after(interaction, 10.0))
+            _spawn(_delete_interaction_after(interaction, 10.0))
             return
 
         if await _deny_if_booked(
@@ -1431,18 +1539,20 @@ class RemoveAdminCamConfirmView(discord.ui.View):
             removed = await _run_server_write(
                 self.server_index, client.remove_admin, self.player_id
             )
-        except CRCONHTTPError:
-            removed = False
+        except CRCONHTTPError as exc:
+            removed = None
+            message = f"❌ Could not reach CRCON, so admin cam was not changed: {exc}"
 
         if removed:
+            _audit(interaction, self.server_index, f"removed admin cam for {self.player_id}")
             message = "Player REMOVED"
-        else:
+        elif removed is not None:
             message = "Player NOT FOUND"
 
         await update_interaction_message(
             interaction, content=message, embed=None, view=None
         )
-        asyncio.create_task(_delete_interaction_after(interaction, 10.0))
+        _spawn(_delete_interaction_after(interaction, 10.0))
 
     @discord.ui.button(label="No", style=discord.ButtonStyle.secondary)
     async def confirm_no(
@@ -1451,7 +1561,7 @@ class RemoveAdminCamConfirmView(discord.ui.View):
         await interaction.response.edit_message(
             content="Cancelled.", embed=None, view=None
         )
-        asyncio.create_task(_delete_interaction_after(interaction, 1.0))
+        _spawn(_delete_interaction_after(interaction, 1.0))
 
 
 class RemoveAdminCamSelect(discord.ui.Select):
@@ -1603,6 +1713,7 @@ class GameModeView(PersistentView):
             )
             return
 
+        _audit(interaction, server_index, f"set warfare {timer_name} to {minutes} min")
         await send_temporary_response(
             interaction,
             content=(
@@ -1704,7 +1815,7 @@ class GameModeView(PersistentView):
             )
 
             embed = discord.Embed(
-                title="??? Map Change Control",
+                title="🗺️ Map Change Control",
                 description=f"**Server:** {server_name}\n**Current Map:** {current_map}\n\nSelect a game mode:",
                 color=0x00FF00,
             )
@@ -1722,14 +1833,14 @@ class GameModeView(PersistentView):
             )
 
             embed = discord.Embed(
-                title="??? Map Change Control",
+                title="🗺️ Map Change Control",
                 description=f"**Server:** {server_name}\n**Current Map:** {current_map}\n\nSelect a game mode:",
                 color=0x00FF00,
             )
             view = GameModeSelectionView(server_index)
         else:
             embed = discord.Embed(
-                title="??? Map Change Control",
+                title="🗺️ Map Change Control",
                 description="Select a server:",
                 color=0x00FF00,
             )
@@ -2114,7 +2225,7 @@ class ChangeServerDropdown(discord.ui.Select):
                 embed=None,
                 view=None,
             )
-            asyncio.create_task(_delete_interaction_after(interaction, 10.0))
+            _spawn(_delete_interaction_after(interaction, 10.0))
         except Exception as exc:
             await send_temporary_response(
                 interaction,
@@ -2159,12 +2270,44 @@ class ServerDropdown(discord.ui.Select):
         await update_interaction_message(interaction, embed=embed, view=view)
 
 
+async def _deny_if_map_changing(
+    interaction: discord.Interaction,
+    server_index: int,
+    *,
+    edit_message: bool,
+    opened_at: float | None = None,
+) -> bool:
+    """True (and tell the user) while the bot's map change on this server has not loaded yet,
+    or, with `opened_at`, when the map was changed after this picker was opened (its
+    objectives or map ID belong to the old map)."""
+    server_name = api_client.get_server_name(server_index)
+    pending = await _map_change_in_progress(server_index)
+    if pending is not None:
+        message = _map_change_wait_message(pending, server_name)
+    elif opened_at is not None and _last_map_change_at.get(server_index, -1.0) >= opened_at:
+        # >=: on a coarse clock a change in the same tick as opening must still count.
+        message = (
+            f"🔁 The map on **{server_name}** changed after this was opened. "
+            "Open it again to pick from the new map."
+        )
+    else:
+        return False
+    if edit_message:
+        await update_interaction_message(interaction, content=message, embed=None, view=None)
+        _spawn(_delete_interaction_after(interaction, 20.0))
+    else:
+        await send_temporary_response(interaction, content=message, delay=20)
+    return True
+
+
 async def send_objective_selection(
     interaction: discord.Interaction,
     server_index: int,
     *,
     edit_message: bool,
 ) -> None:
+    if await _deny_if_map_changing(interaction, server_index, edit_message=edit_message):
+        return
     client = _get_http_client(server_index)
     if not client:
         message = _http_error_message(server_index)
@@ -2172,13 +2315,13 @@ async def send_objective_selection(
             await update_interaction_message(
                 interaction,
                 embed=discord.Embed(
-                    title="?? Objective Controls Disabled",
+                    title="⚠️ Objective Controls Disabled",
                     description=message,
                     color=0xFFA500,
                 ),
                 view=None,
             )
-            asyncio.create_task(_delete_interaction_after(interaction, 20.0))
+            _spawn(_delete_interaction_after(interaction, 20.0))
         else:
             await send_temporary_response(
                 interaction, content=message, delay=20
@@ -2193,13 +2336,13 @@ async def send_objective_selection(
             await update_interaction_message(
                 interaction,
                 embed=discord.Embed(
-                    title="?? Objective Fetch Failed",
+                    title="⚠️ Objective Fetch Failed",
                     description=message,
                     color=0xFFA500,
                 ),
                 view=None,
             )
-            asyncio.create_task(_delete_interaction_after(interaction, 20.0))
+            _spawn(_delete_interaction_after(interaction, 20.0))
         else:
             await send_temporary_response(
                 interaction, content=message, delay=20
@@ -2227,6 +2370,8 @@ async def send_dynamic_weather_controls(
     *,
     edit_message: bool,
 ) -> None:
+    if await _deny_if_map_changing(interaction, server_index, edit_message=edit_message):
+        return
     client = _get_http_client(server_index)
     if not client:
         message = _http_error_message(server_index)
@@ -2234,13 +2379,13 @@ async def send_dynamic_weather_controls(
             await update_interaction_message(
                 interaction,
                 embed=discord.Embed(
-                    title="?? Dynamic Weather Disabled",
+                    title="⚠️ Dynamic Weather Disabled",
                     description=message,
                     color=0xFFA500,
                 ),
                 view=None,
             )
-            asyncio.create_task(_delete_interaction_after(interaction, 20.0))
+            _spawn(_delete_interaction_after(interaction, 20.0))
         else:
             await send_temporary_response(
                 interaction, content=message, delay=20
@@ -2260,13 +2405,13 @@ async def send_dynamic_weather_controls(
             await update_interaction_message(
                 interaction,
                 embed=discord.Embed(
-                    title="?? Dynamic Weather Unavailable",
+                    title="⚠️ Dynamic Weather Unavailable",
                     description=message,
                     color=0xFFA500,
                 ),
                 view=None,
             )
-            asyncio.create_task(_delete_interaction_after(interaction, 20.0))
+            _spawn(_delete_interaction_after(interaction, 20.0))
         else:
             await send_temporary_response(
                 interaction, content=message, delay=20
@@ -2288,13 +2433,13 @@ async def send_dynamic_weather_controls(
             await update_interaction_message(
                 interaction,
                 embed=discord.Embed(
-                    title="?? Dynamic Weather Unavailable",
+                    title="⚠️ Dynamic Weather Unavailable",
                     description=message,
                     color=0xFFA500,
                 ),
                 view=None,
             )
-            asyncio.create_task(_delete_interaction_after(interaction, 20.0))
+            _spawn(_delete_interaction_after(interaction, 20.0))
         else:
             await send_temporary_response(
                 interaction, content=message, delay=20
@@ -2347,6 +2492,7 @@ class DynamicWeatherToggleView(discord.ui.View):
         self.server_index = server_index
         self.map_id = map_id
         self.map_pretty = map_pretty
+        self.opened_at = time.monotonic()
 
     def build_embed(self) -> discord.Embed:
         description = (
@@ -2374,6 +2520,11 @@ class DynamicWeatherToggleView(discord.ui.View):
         ):
             self.stop()
             return
+        if await _deny_if_map_changing(
+            interaction, self.server_index, edit_message=True, opened_at=self.opened_at
+        ):
+            self.stop()
+            return
 
         result = await asyncio.to_thread(
             server_control.set_dynamic_weather_enabled,
@@ -2388,9 +2539,10 @@ class DynamicWeatherToggleView(discord.ui.View):
                 wait=True,
             )
             if followup is not None:
-                asyncio.create_task(_delete_message_after(followup, 20.0))
+                _spawn(_delete_message_after(followup, 20.0))
             return
 
+        _audit(interaction, self.server_index, f"turned dynamic weather {'on' if enabled else 'off'} for {self.map_id}")
         _dynamic_weather_state[(self.server_index, self.map_id)] = enabled
         _dynamic_weather_state[(self.server_index, self.map_pretty)] = enabled
 
@@ -2409,7 +2561,7 @@ class DynamicWeatherToggleView(discord.ui.View):
             embed=success_embed, view=None
         )
         await refresh_main_embed()
-        asyncio.create_task(_delete_interaction_after(interaction, 10.0))
+        _spawn(_delete_interaction_after(interaction, 10.0))
 
     @discord.ui.button(label="Turn On", style=discord.ButtonStyle.success)
     async def enable(
@@ -2467,6 +2619,7 @@ class ObjectiveSelectionView(discord.ui.View):
         self.initial_map = current_map
         self.rows = rows
         self.selected: dict[int, str] = {}
+        self.opened_at = time.monotonic()
 
         for slot, options in enumerate(rows, start=1):
             self.add_item(ObjectiveDropdown(slot, options))
@@ -2517,6 +2670,11 @@ class ObjectiveSelectionView(discord.ui.View):
         ):
             self.stop()
             return
+        if await _deny_if_map_changing(
+            interaction, self.server_index, edit_message=True, opened_at=self.opened_at
+        ):
+            self.stop()
+            return
 
         result = await asyncio.to_thread(
             server_control.set_sector_layout, self.server_index, objective_list
@@ -2528,6 +2686,7 @@ class ObjectiveSelectionView(discord.ui.View):
             )
             return
 
+        _audit(interaction, self.server_index, f"locked objectives {objective_list}")
         latest_map = await asyncio.to_thread(
             api_client.get_current_map, self.server_index
         )
@@ -2555,7 +2714,7 @@ class ObjectiveSelectionView(discord.ui.View):
             embed=success_embed, view=None
         )
         await refresh_main_embed()
-        asyncio.create_task(
+        _spawn(
             _delete_interaction_after_and_refresh(interaction, 10.0)
         )
 
@@ -2783,15 +2942,13 @@ class VariantDropdown(discord.ui.Select):
                 if result.warning:
                     status_lines.append(f"Note: {result.warning}")
             overall_success = True
+            _audit(interaction, self.server_index, f"changed map to {selected_variant_id}")
         else:
             status_lines.append(result.message)
 
         status_summary = "\n".join(f"• {line}" for line in status_lines)
 
         if overall_success:
-            new_current_map = await asyncio.to_thread(
-                api_client.get_current_map, self.server_index
-            )
             stale_objective_keys = [
                 key
                 for key in _current_objectives_state
@@ -2800,12 +2957,25 @@ class VariantDropdown(discord.ui.Select):
             for key in stale_objective_keys:
                 _current_objectives_state.pop(key, None)
 
+            # The game counts down before switching, so the server still reports the old map
+            # here. Remember the change, and refresh the panel once the new map is up.
+            pending = PendingMapChange(
+                map_id=selected_variant_id,
+                label=f"{self.map_name} ({variant_name})",
+                started=time.monotonic(),
+            )
+            _pending_map_changes[self.server_index] = pending
+            _last_map_change_at[self.server_index] = pending.started
+            _spawn(_refresh_after_map_change(self.server_index, pending))
+
             final_embed = discord.Embed(
-                title="✅ Map Changed Successfully!",
+                title="✅ Map Change Started",
                 description=(
                     f"**Server:** {server_name}\n"
-                    f"**New Map:** {new_current_map}\n"
                     f"**Target:** {self.map_name} ({variant_name})\n\n"
+                    f"⏳ The server counts down {MAP_CHANGE_COUNTDOWN_SECONDS} seconds, then loads "
+                    "the new map. Set objectives and weather after it has loaded; the panel "
+                    "updates when it's live.\n\n"
                     f"{status_summary}"
                 ),
                 color=0x00FF00,
@@ -2814,7 +2984,7 @@ class VariantDropdown(discord.ui.Select):
                 embed=final_embed, view=None
             )
             await refresh_main_embed()
-            asyncio.create_task(_delete_interaction_after(interaction, 10.0))
+            _spawn(_delete_interaction_after(interaction, 30.0))
         else:
             final_embed = discord.Embed(
                 title="❌ Map Change Failed",
@@ -2828,7 +2998,7 @@ class VariantDropdown(discord.ui.Select):
             await interaction.edit_original_response(
                 embed=final_embed, view=None
             )
-            asyncio.create_task(_delete_interaction_after(interaction, 20.0))
+            _spawn(_delete_interaction_after(interaction, 20.0))
 
 
 class BackToServerSelectionButton(discord.ui.Button):
@@ -2941,9 +3111,6 @@ async def on_ready():
 
     # Warm cache when available, but avoid noisy startup warnings if CRCON isn't reachable yet.
     await asyncio.to_thread(refresh_map_cache, force=False)
-
-    # Add the persistent view
-    bot.add_view(GameModeView())
 
     # Restore every guild's panel where /setup_panel last put it (home: or DISCORD_CHANNEL_ID).
     messages = await refresh_main_embed()
@@ -3072,4 +3239,6 @@ if __name__ == "__main__":
         print("Error: DISCORD_TOKEN not found in environment variables")
         sys.exit(1)
 
-    bot.run(token)
+    # Log to stdout: Railway marks everything on stderr as an error, including discord.py's
+    # routine INFO lines. root_logger=True also routes this bot's own logging calls there.
+    bot.run(token, log_handler=logging.StreamHandler(sys.stdout), root_logger=True)

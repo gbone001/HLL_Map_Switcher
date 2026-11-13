@@ -575,3 +575,16 @@ class RebookTests(BookingServiceTestCase):
         with self.assertRaises(BookingError):
             self.service.create_series("server1", 1, "u", T0 + HOUR, T0 + 2 * HOUR, "daily", 11)
         self.assertEqual(len(self.service.create_series("server1", 1, "u", T0 + HOUR, T0 + 2 * HOUR, "daily", 10)), 10)
+
+
+class SeriesDaylightSavingTests(unittest.TestCase):
+    def test_weekly_series_keeps_local_start_time_across_dst_end(self):
+        sydney = ZoneInfo("Australia/Sydney")
+        now = datetime(2027, 3, 20, 12, 0, tzinfo=sydney)
+        with tempfile.TemporaryDirectory() as tmp:
+            service = BookingService(Path(tmp) / "b.db", clock=lambda: now, timezone=sydney)
+            start = int(datetime(2027, 3, 28, 20, 0, tzinfo=sydney).timestamp())  # DST ends 4 Apr
+            series = service.create_series("server1", 1, "u", start, start + HOUR, "weekly", 3)
+        local = [datetime.fromtimestamp(b.start_utc, sydney) for b in series]
+        self.assertEqual([(d.day, d.hour, d.minute) for d in local], [(28, 20, 0), (4, 20, 0), (11, 20, 0)])
+        self.assertTrue(all(b.end_utc - b.start_utc == HOUR for b in series))

@@ -267,6 +267,10 @@ async def book_and_reply(
         return False
 
     first = bookings[0]
+    logger.info(
+        "User %s from guild %s booked %s #%s (%s date(s))",
+        interaction.user.id, interaction.guild_id, server_key, first.id, len(bookings),
+    )
     series = f" (+{len(bookings) - 1} more, {recurrence})" if len(bookings) > 1 else ""
     named = f" for **{discord.utils.escape_markdown(first.event_name)}**" if first.event_name else ""
     await _reply(
@@ -336,6 +340,10 @@ async def edit_and_reply(
         await _reply(interaction, f"❌ {exc}")
         return False
     first = updated[0]
+    logger.info(
+        "User %s from guild %s edited booking #%s -> #%s on %s (%s date(s))",
+        interaction.user.id, interaction.guild_id, booking_id, first.id, first.server_key, len(updated),
+    )
     server = deps.server_name_for_key(first.server_key)
     if len(updated) > 1:
         message = (
@@ -378,6 +386,10 @@ async def cancel_and_reply(
         return False
     cancelled = cancelled if isinstance(cancelled, list) else [cancelled]
     first = cancelled[0]
+    logger.info(
+        "User %s from guild %s cancelled booking #%s on %s (%s date(s))",
+        interaction.user.id, interaction.guild_id, first.id, first.server_key, len(cancelled),
+    )
     server = deps.server_name_for_key(first.server_key)
     if len(cancelled) > 1:
         message = f"✅ Cancelled series #{first.series_id} on **{server}** ({len(cancelled)} dates)."
