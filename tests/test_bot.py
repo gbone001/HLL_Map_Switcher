@@ -21,42 +21,56 @@ with mock.patch.dict(
 
 
 class FakeTree:
-    def __init__(self):
-        self.copied_to = None
-        self.synced_guild = "unset"
+    def __init__(self, fail_for=()):
+        self.copied_to = []
+        self.synced = []
+        self.fail_for = set(fail_for)
 
     def copy_global_to(self, *, guild):
-        self.copied_to = guild
+        self.copied_to.append(guild.id)
 
     async def sync(self, *, guild=None):
-        self.synced_guild = guild
-        return ["repost_button"]
+        if guild is not None and guild.id in self.fail_for:
+            raise bot.discord.HTTPException(mock.Mock(status=403, reason="Forbidden"), "Missing Access")
+        self.synced.append(guild.id if guild else None)
+        return [f"repost_button@{guild.id if guild else 'global'}"]
+
+
+def registry(home="", guests=""):
+    return bot.GuildRegistry.from_env({"DISCORD_GUILD_ID": home, "BOOKING_GUILD_IDS": guests})
 
 
 class SyncAppCommandsTests(unittest.IsolatedAsyncioTestCase):
-    async def test_syncs_to_configured_guild(self):
+    async def test_syncs_to_home_and_every_guest_guild(self):
         tree = FakeTree()
 
-        synced = await bot.sync_app_commands(tree, "1234")
+        synced = await bot.sync_app_commands(tree, registry("1234", "5678, 9012"))
 
-        self.assertEqual(synced, ["repost_button"])
-        self.assertEqual(tree.copied_to.id, 1234)
-        self.assertEqual(tree.synced_guild.id, 1234)
+        self.assertEqual(synced, ["repost_button@1234"])
+        self.assertEqual(tree.copied_to, [1234, 5678, 9012])
+        self.assertEqual(tree.synced, [1234, 5678, 9012])
 
-    async def test_syncs_globally_without_guild(self):
+    async def test_one_failing_guild_does_not_block_the_others(self):
+        tree = FakeTree(fail_for={5678})
+
+        await bot.sync_app_commands(tree, registry("1234", "5678, 9012"))
+
+        self.assertEqual(tree.synced, [1234, 9012])
+
+    async def test_syncs_globally_without_home_guild(self):
         tree = FakeTree()
 
-        await bot.sync_app_commands(tree, "")
+        await bot.sync_app_commands(tree, registry())
 
-        self.assertIsNone(tree.copied_to)
-        self.assertIsNone(tree.synced_guild)
+        self.assertEqual(tree.copied_to, [])
+        self.assertEqual(tree.synced, [None])
 
-    async def test_invalid_guild_falls_back_to_global(self):
+    async def test_invalid_home_guild_falls_back_to_global(self):
         tree = FakeTree()
 
-        await bot.sync_app_commands(tree, "not-a-number")
+        await bot.sync_app_commands(tree, registry("not-a-number"))
 
-        self.assertIsNone(tree.synced_guild)
+        self.assertEqual(tree.synced, [None])
 
     async def test_setup_hook_syncs_the_repost_command(self):
         self.assertIn("repost_button", [command.name for command in bot.bot.tree.get_commands()])
@@ -107,7 +121,8 @@ class OffEventLoopTests(unittest.IsolatedAsyncioTestCase):
         with mock.patch.object(bot.server_control, "get_status", side_effect=SlowStatus(delay=0)):
             embed, view = await bot.build_panel()
 
-        self.assertIn("Issues detected", embed.description)
+        self.assertIn("CRCON unavailable", embed.description)
+        self.assertEqual(embed.color.value, bot.PANEL_COLOR_OUTAGE)
         crcon_buttons = [
             child for child in view.children if getattr(child, "custom_id", None) in bot.CRCON_PANEL_DEPENDENT_BUTTONS
         ]
@@ -148,3 +163,116 @@ class OffEventLoopTests(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+HOME, GUEST = 100, 200
+
+
+def fake_channel(channel_id, guild_id, message_id=None):
+    channel = mock.MagicMock(id=channel_id)
+    channel.guild = mock.MagicMock(id=guild_id)
+    partial = mock.MagicMock()
+    partial.edit = mock.AsyncMock(return_value=f"edited {channel_id}")
+    partial.delete = mock.AsyncMock()
+    channel.get_partial_message.return_value = partial
+    channel.send = mock.AsyncMock(return_value=mock.MagicMock(id=message_id))
+    channel.history.side_effect = AssertionError("history should not be read")
+    return channel
+
+
+class PanelMessageTests(unittest.IsolatedAsyncioTestCase):
+    """Multi-guild slice 4: one saved panel per guild."""
+
+    def setUp(self):
+        import tempfile
+
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.path = Path(self._tmp.name) / "panel_message.json"
+        patches = [
+            mock.patch.object(bot, "_PANEL_REF_PATH", self.path),
+            mock.patch.object(bot, "panel_refs", {}),
+            mock.patch.object(bot, "guild_registry", registry(str(HOME), str(GUEST))),
+            mock.patch.object(bot, "build_panel", mock.AsyncMock(return_value=("embed", "view"))),
+        ]
+        for patch in patches:
+            patch.start()
+            self.addCleanup(patch.stop)
+
+    def test_panels_survive_a_restart_per_guild(self):
+        bot._set_panel_ref(HOME, 11, 22)
+        bot._set_panel_ref(GUEST, 33, 44)
+
+        self.assertEqual(bot._load_panel_refs(), {HOME: (11, 22), GUEST: (33, 44)})
+
+    def test_old_single_panel_file_becomes_the_home_guild_panel(self):
+        self.path.write_text('{"channel_id": 11, "message_id": 22}', encoding="utf-8")
+
+        self.assertEqual(bot._load_panel_refs(), {HOME: (11, 22)})
+
+    def test_panel_channel_per_guild_with_env_fallback_for_home_only(self):
+        with mock.patch.dict(os.environ, {"DISCORD_CHANNEL_ID": "99"}):
+            self.assertEqual(bot._panel_channel_id(HOME), 99)
+            self.assertIsNone(bot._panel_channel_id(GUEST))
+            bot._set_panel_ref(HOME, 11, 22)
+            bot._set_panel_ref(GUEST, 33, 44)
+            self.assertEqual(bot._panel_channel_id(HOME), 11)
+            self.assertEqual(bot._panel_channel_id(GUEST), 33)
+            self.assertEqual(bot._panel_channel_ids(), [11, 33])
+
+    async def test_post_panel_replaces_only_this_guilds_panel(self):
+        bot._set_panel_ref(HOME, 11, 22)
+        bot._set_panel_ref(GUEST, 33, 44)
+        old_guest = fake_channel(33, GUEST)
+        new_guest = fake_channel(55, GUEST, message_id=66)
+
+        with mock.patch.object(bot, "_resolve_text_channel", mock.AsyncMock(return_value=old_guest)):
+            await bot.post_panel(new_guest)
+
+        old_guest.get_partial_message.assert_called_once_with(44)
+        old_guest.get_partial_message.return_value.delete.assert_awaited_once()
+        self.assertEqual(bot._load_panel_refs(), {HOME: (11, 22), GUEST: (55, 66)})
+
+    async def test_refresh_updates_every_guild_panel_with_one_status_read(self):
+        bot._set_panel_ref(HOME, 11, 22)
+        bot._set_panel_ref(GUEST, 33, 44)
+        channels = {11: fake_channel(11, HOME), 33: fake_channel(33, GUEST)}
+        statuses = mock.AsyncMock(return_value={"status": "ok"})
+
+        with mock.patch.object(bot, "_resolve_text_channel", mock.AsyncMock(side_effect=channels.get)), \
+                mock.patch.object(bot, "fetch_server_statuses", statuses):
+            messages = await bot.refresh_main_embed()
+
+        self.assertEqual(messages, ["edited 11", "edited 33"])
+        statuses.assert_awaited_once()
+        built_for = [call.args[1] for call in bot.build_panel.await_args_list]
+        self.assertEqual(built_for, [HOME, GUEST])
+        channels[11].get_partial_message.assert_called_once_with(22)
+        channels[33].get_partial_message.assert_called_once_with(44)
+
+    async def test_unapproved_guild_panels_are_not_refreshed(self):
+        bot._set_panel_ref(HOME, 11, 22)
+        bot._set_panel_ref(999, 77, 88)
+
+        self.assertEqual(bot._panel_channel_ids(), [11])
+
+
+class GuildApprovalTests(unittest.IsolatedAsyncioTestCase):
+    def fake_guild(self, guild_id):
+        guild = mock.MagicMock(id=guild_id)
+        guild.name = f"guild {guild_id}"
+        guild.leave = mock.AsyncMock()
+        return guild
+
+    async def test_unlisted_guild_is_left_and_listed_ones_kept(self):
+        with mock.patch.object(bot, "guild_registry", registry("100", "200")):
+            for guild_id, should_leave in ((100, False), (200, False), (300, True)):
+                guild = self.fake_guild(guild_id)
+                self.assertEqual(await bot._leave_if_unapproved(guild), should_leave)
+                self.assertEqual(guild.leave.await_count, int(should_leave))
+
+    async def test_nothing_is_left_without_a_home_guild(self):
+        guild = self.fake_guild(300)
+        with mock.patch.object(bot, "guild_registry", registry()):
+            self.assertFalse(await bot._leave_if_unapproved(guild))
+        guild.leave.assert_not_awaited()

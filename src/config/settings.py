@@ -1,4 +1,5 @@
 import os
+
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -12,4 +13,6 @@ def validate_required_env() -> None:
     if not DISCORD_TOKEN:
         missing.append("DISCORD_TOKEN")
     if missing:
-        raise ValueError(f"Missing required environment variables: {', '.join(missing)}")
+        raise ValueError(
+            f"Missing required environment variables: {', '.join(missing)}"
+        )

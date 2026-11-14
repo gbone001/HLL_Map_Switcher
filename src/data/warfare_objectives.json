@@ -1,0 +1,696 @@
+{
+  "source": "RCON v2 GetClientReferenceData(SetSectorLayout), read with each map loaded",
+  "collected": "2026-11-14",
+  "game_mode": "warfare",
+  "notes": [
+    "sectors[i] lists the three strongpoint choices for sector i+1, in the order the game reports them.",
+    "Time-of-day variants share objectives (verified for Remagen day vs night); every layer of a map is listed under it.",
+    "Names are the exact strings the game accepts for SetSectorLayout, e.g. 'ROAD TO CARENTAN ' keeps its trailing space."
+  ],
+  "maps": [
+    {
+      "map": "FOY",
+      "layers": [
+        "foy_warfare",
+        "foy_warfare_night"
+      ],
+      "sectors": [
+        [
+          "ROAD TO RECOGNE",
+          "COBRU APPROACH",
+          "ROAD TO NOVILLE"
+        ],
+        [
+          "COBRU FACTORY",
+          "FOY",
+          "FLAK BATTERY"
+        ],
+        [
+          "WEST BEND",
+          "SOUTHERN EDGE",
+          "DUGOUT BARN"
+        ],
+        [
+          "N30 HIGHWAY",
+          "BIZORY-FOY ROAD",
+          "EASTERN OURTHE"
+        ],
+        [
+          "ROAD TO BASTOGNE",
+          "BOIS JACQUES",
+          "FOREST OUTSKIRTS"
+        ]
+      ]
+    },
+    {
+      "map": "ST MARIE DU MONT",
+      "layers": [
+        "stmariedumont_warfare",
+        "stmariedumont_warfare_night"
+      ],
+      "sectors": [
+        [
+          "WINTERS LANDING",
+          "LE GRAND CHEMIN",
+          "THE BARN"
+        ],
+        [
+          "BRECOURT BATTERY",
+          "CATTLESHEDS",
+          "RUE DE LA GARE"
+        ],
+        [
+          "THE DUGOUT",
+          "AA NETWORK",
+          "PIERRE'S FARM"
+        ],
+        [
+          "HUGO'S FARM",
+          "THE HAMLET",
+          "STE MARIE DU MONT"
+        ],
+        [
+          "THE CORNER",
+          "HILL 6",
+          "THE FIELDS"
+        ]
+      ]
+    },
+    {
+      "map": "HÜRTGEN FOREST",
+      "layers": [
+        "hurtgenforest_warfare_V2",
+        "hurtgenforest_warfare_V2_night"
+      ],
+      "sectors": [
+        [
+          "MAUSBACH APPROACH",
+          "RESERVE STATION",
+          "LUMBER YARD"
+        ],
+        [
+          "WEHEBACH OVERLOOK",
+          "KALL TRAIL",
+          "THE RUIN"
+        ],
+        [
+          "NORTH PASS",
+          "THE SCAR",
+          "THE SIEGFRIED LINE"
+        ],
+        [
+          "HILL 15",
+          "JACOB'S BARN",
+          "SALIENT 42"
+        ],
+        [
+          "GROSSHAU APPROACH",
+          "HURTGEN APPROACH",
+          "LOGGING CAMP"
+        ]
+      ]
+    },
+    {
+      "map": "UTAH BEACH",
+      "layers": [
+        "utahbeach_warfare",
+        "utahbeach_warfare_night"
+      ],
+      "sectors": [
+        [
+          "MAMMUT RADAR",
+          "FLOODED HOUSE",
+          "SAINTE MARIE APPROACH"
+        ],
+        [
+          "SUNKEN BRIDGE",
+          "LA GRANDE CRIQUE",
+          "DROWNED FIELDS"
+        ],
+        [
+          "WN4",
+          "THE CHAPEL",
+          "WN7"
+        ],
+        [
+          "AA BATTERY",
+          "HILL 5",
+          "WN5"
+        ],
+        [
+          "TARE GREEN",
+          "RED ROOF HOUSE",
+          "UNCLE RED"
+        ]
+      ]
+    },
+    {
+      "map": "SAINTE-MÈRE-ÉGLISE",
+      "layers": [
+        "stmereeglise_warfare",
+        "stmereeglise_warfare_night"
+      ],
+      "sectors": [
+        [
+          "FLAK POSITION",
+          "VAULAVILLE",
+          "LA PRAIRIE"
+        ],
+        [
+          "ROUTE DU HARAS",
+          "WESTERN APPROACH",
+          "RUE DE GAMBOSVILLE"
+        ],
+        [
+          "HOSPICE",
+          "SAINTE-MÈRE-ÉGLISE",
+          "CHECKPOINT"
+        ],
+        [
+          "ARTILLERY BATTERY",
+          "THE CEMETERY",
+          "MAISON DU CRIQUE"
+        ],
+        [
+          "LES VIEUX VERGERS",
+          "CROSS ROADS",
+          "RUISSEAU DE FERME"
+        ]
+      ]
+    },
+    {
+      "map": "HILL 400",
+      "layers": [
+        "hill400_warfare"
+      ],
+      "sectors": [
+        [
+          "CONVOY AMBUSH",
+          "FEDERHECKE JUNCTION",
+          "STUCKCHEN FARM"
+        ],
+        [
+          "ROER RIVER HOUSE",
+          "BERGSTEIN CHURCH",
+          "KIRCHWEG"
+        ],
+        [
+          "FLAK PITS",
+          "HILL 400",
+          "SOUTHERN APPROACH"
+        ],
+        [
+          "ESELSWEG JUNCTION",
+          "EASTERN SLOPE",
+          "TRAIN WRECK"
+        ],
+        [
+          "ROER RIVER CROSSING",
+          "ZERKALL",
+          "PAPER MILL"
+        ]
+      ]
+    },
+    {
+      "map": "CARENTAN",
+      "layers": [
+        "carentan_warfare",
+        "carentan_warfare_night"
+      ],
+      "sectors": [
+        [
+          "BLACTOT",
+          "502ND START",
+          "FARM RUINS"
+        ],
+        [
+          "PUMPING STATION",
+          "RUINS",
+          "DERAILED TRAIN"
+        ],
+        [
+          "CANAL CROSSING",
+          "TOWN CENTER",
+          "TRAIN STATION"
+        ],
+        [
+          "CUSTOMS",
+          "RAIL CROSSING",
+          "MONT HALAIS"
+        ],
+        [
+          "CANAL LOCKS",
+          "RAIL CAUSEWAY",
+          "LA MAISON DES ORMES"
+        ]
+      ]
+    },
+    {
+      "map": "KURSK",
+      "layers": [
+        "kursk_warfare",
+        "kursk_warfare_night"
+      ],
+      "sectors": [
+        [
+          "ARTILLERY POSITION",
+          "GRUSHKI",
+          "GRUSHKI FLANK"
+        ],
+        [
+          "PANZER'S END",
+          "DEFENCE IN DEPTH",
+          "LISTENING POST"
+        ],
+        [
+          "THE WINDMILLS",
+          "YAMKI",
+          "OLEG'S HOUSE"
+        ],
+        [
+          "RUDNO",
+          "DESTROYED BATTERY",
+          "THE MUDDY CHURN"
+        ],
+        [
+          "ROAD TO KURSK",
+          "AMMO DUMP",
+          "EASTERN POSITION"
+        ]
+      ]
+    },
+    {
+      "map": "OMAHA BEACH",
+      "layers": [
+        "omahabeach_warfare",
+        "omahabeach_warfare_night"
+      ],
+      "sectors": [
+        [
+          "BEAUMONT ROAD",
+          "CROSSROADS",
+          "LES ISLES"
+        ],
+        [
+          "REAR BATTERY",
+          "CHURCH ROAD",
+          "THE ORCHARDS"
+        ],
+        [
+          "WEST VIERVILLE",
+          "VIERVILLE SUR MER",
+          "ARTILLERY BATTERY"
+        ],
+        [
+          "WN73",
+          "WN71",
+          "WN70"
+        ],
+        [
+          "DOG GREEN",
+          "THE DRAW",
+          "DOG WHITE"
+        ]
+      ]
+    },
+    {
+      "map": "KHARKOV",
+      "layers": [
+        "kharkov_warfare",
+        "kharkov_warfare_night"
+      ],
+      "sectors": [
+        [
+          "MARSH TOWN",
+          "SOVIET VANTAGE POINT",
+          "GERMAN FUEL DUMP"
+        ],
+        [
+          "BITTER SPRING",
+          "LUMBER WORKS",
+          "WINDMILL HILLSIDE"
+        ],
+        [
+          "WATER MILL",
+          "ST MARY",
+          "DISTILLERY"
+        ],
+        [
+          "RIVER CROSSING",
+          "BELGOROD OUTSKIRTS",
+          "LUMBERYARD"
+        ],
+        [
+          "WEHRMACHT OUTLOOK",
+          "HAY STORAGE",
+          "OVERPASS"
+        ]
+      ]
+    },
+    {
+      "map": "EL ALAMEIN",
+      "layers": [
+        "elalamein_warfare",
+        "elalamein_warfare_night"
+      ],
+      "sectors": [
+        [
+          "VEHICLE DEPOT",
+          "ARTILLERY GUNS",
+          "MITEIRIYA RIDGE"
+        ],
+        [
+          "HAMLET RUINS",
+          "EL MREIR",
+          "WATCHTOWER"
+        ],
+        [
+          "DESERT RAT TRENCHES",
+          "OASIS",
+          "VALLEY"
+        ],
+        [
+          "FUEL DEPOT",
+          "AIRFIELD COMMAND",
+          "AIRFIELD HANGARS"
+        ],
+        [
+          "CLIFFSIDE VILLAGE",
+          "AMBUSHED CONVOY",
+          "QUARRY"
+        ]
+      ]
+    },
+    {
+      "map": "DRIEL",
+      "layers": [
+        "driel_warfare",
+        "driel_warfare_night"
+      ],
+      "sectors": [
+        [
+          "OOSTERBEEK APPROACH",
+          "ROSANDER POLDER",
+          "KASTEEL ROSANDE"
+        ],
+        [
+          "BOATYARD",
+          "BRIDGEWAY",
+          "RIJN BANKS"
+        ],
+        [
+          "BRICK FACTORY",
+          "RAILWAY BRIDGE",
+          "GUN EMPLACEMENTS"
+        ],
+        [
+          "RIETVELD",
+          "SOUTH RAILWAY",
+          "MIDDEL ROAD"
+        ],
+        [
+          "ORCHARDS",
+          "SCHADUWWOLKEN FARM",
+          "FIELDS"
+        ]
+      ]
+    },
+    {
+      "map": "MORTAIN",
+      "layers": [
+        "mortain_warfare_day",
+        "mortain_warfare_overcast",
+        "mortain_warfare_dusk"
+      ],
+      "sectors": [
+        [
+          "HOTEL DE LA POSTE",
+          "FORWARD BATTERY",
+          "SOUTHERN APPROACH"
+        ],
+        [
+          "MORTAIN OUTSKIRTS",
+          "FORWARD MEDICAL AID STATION",
+          "MORTAIN APPROACH"
+        ],
+        [
+          "HILL 314",
+          "LA PETITE CHAPELLE SAINT-MICHEL",
+          "U.S. SOUTHERN ROADBLOCK"
+        ],
+        [
+          "DESTROYED GERMAN CONVOY",
+          "GERMAN RECON CAMP",
+          "LES AUBRILS FARM"
+        ],
+        [
+          "ABANDONED GERMAN CHECKPOINT",
+          "GERMAN DEFENSIVE CAMP",
+          "LE FERME DU DESCHAMPS"
+        ]
+      ]
+    },
+    {
+      "map": "PURPLE HEART LANE",
+      "layers": [
+        "PHL_L_1944_Warfare",
+        "PHL_L_1944_Warfare_Night"
+      ],
+      "sectors": [
+        [
+          "BLOODY BEND",
+          "DEAD MAN'S CORNER",
+          "FORWARD BATTERY"
+        ],
+        [
+          "JOURDAN CANAL",
+          "DOUVE BRIDGE",
+          "DOUVE RIVER BATTERY"
+        ],
+        [
+          "GROULT PILLBOX",
+          "CARENTAN CAUSEWAY",
+          "FLAK POSITION"
+        ],
+        [
+          "MADELEINE FARM",
+          "MADELEINE BRIDGE",
+          "AID STATION"
+        ],
+        [
+          "INGOUF CROSSROADS",
+          "ROAD TO CARENTAN ",
+          "CABBAGE PATCH"
+        ]
+      ]
+    },
+    {
+      "map": "ELSENBORN RIDGE",
+      "layers": [
+        "elsenbornridge_warfare_day",
+        "elsenbornridge_warfare_morning",
+        "elsenbornridge_warfare_night"
+      ],
+      "sectors": [
+        [
+          "99TH COMMAND CENTRE",
+          "GUN BATTERY",
+          "U.S. CAMP"
+        ],
+        [
+          "ELSENBORN RIDGE",
+          "FARAHILDE FARM",
+          "JENSIT PILLBOXES"
+        ],
+        [
+          "ROAD TO ELSENBORN RIDGE",
+          "DUGOUT TANKS",
+          "CHECKPOINT"
+        ],
+        [
+          "ERELSDELL FARMHOUSE",
+          "AA BATTERY",
+          "HINTERBERG"
+        ],
+        [
+          "SUPPLY CACHE",
+          "FOXHOLES",
+          "FUEL DEPOT"
+        ]
+      ]
+    },
+    {
+      "map": "TOBRUK",
+      "layers": [
+        "tobruk_warfare_day",
+        "tobruk_warfare_dusk",
+        "tobruk_warfare_morning"
+      ],
+      "sectors": [
+        [
+          "GUARD ROOM",
+          "TANK GRAVEYARD",
+          "DIVISION HEADQUARTERS"
+        ],
+        [
+          "WEST CREEK",
+          "ALBERGO RISTORANTE MODERNO",
+          "KING SQUARE"
+        ],
+        [
+          "DESERT RAT CAVES",
+          "CHURCH GROUNDS",
+          "ADMIRALTY HOUSE"
+        ],
+        [
+          "ABANDONED AMMO CACHE",
+          "8TH ARMY MEDICAL HOSPITAL",
+          "SUPPLY DUMP"
+        ],
+        [
+          "ROAD TO SENUSSI MINE",
+          "MAKESHIFT AID STATION",
+          "CARGO WAREHOUSES"
+        ]
+      ]
+    },
+    {
+      "map": "STALINGRAD",
+      "layers": [
+        "STA_L_1942_Warfare",
+        "STA_L_1942_Warfare_Night"
+      ],
+      "sectors": [
+        [
+          "MAMAYEV APPROACH",
+          "NAIL FACTORY",
+          "CITY OVERLOOK"
+        ],
+        [
+          "DOLGIY RAVINE",
+          "YELLOW HOUSE",
+          "KOMSOMOL HQ"
+        ],
+        [
+          "RAILWAY CROSSING",
+          "CARRIAGE DEPOT",
+          "TRAIN STATION"
+        ],
+        [
+          "HOUSE OF THE WORKERS",
+          "PAVLOV'S HOUSE",
+          "THE BREWERY"
+        ],
+        [
+          "L-SHAPED HOUSE",
+          "GRUDININ'S MILL",
+          "VOLGA BANKS"
+        ]
+      ]
+    },
+    {
+      "map": "SMOLENSK",
+      "layers": [
+        "smolensk_warfare_day",
+        "smolensk_warfare_dusk",
+        "smolensk_warfare_night"
+      ],
+      "sectors": [
+        [
+          "PANZER LOADING STATION",
+          "TRAM DEPOT",
+          "SMOLENSK OUTSKIRTS"
+        ],
+        [
+          "SMOLENSK HAUPTBAHNHOF",
+          "LUMBER YARD",
+          "DNIEPER WEST CROSSING"
+        ],
+        [
+          "PYATNITSKII OVERPASS",
+          "ZHELYABOVA SQUARE",
+          "84TH BATTALION BRIDGE"
+        ],
+        [
+          "ZADNEPROVIE DISTRICT",
+          "MOSKOVSKAYA STREET",
+          "SMOLENSK CITADEL"
+        ],
+        [
+          "RAILYARD STORAGE",
+          "APARTMENT BLOCK",
+          "BOMBARDED RIVERFRONT"
+        ]
+      ]
+    },
+    {
+      "map": "JUNO BEACH",
+      "layers": [
+        "junobeach_warfare_day",
+        "junobeach_warfare_morning",
+        "junobeach_warfare_night"
+      ],
+      "sectors": [
+        [
+          "REGINA LANDING",
+          "BUNKER R612",
+          "WN29"
+        ],
+        [
+          "LA PLATINE",
+          "LA MARINA",
+          "HÉROULT HOUSE"
+        ],
+        [
+          "GRAYE-SUR-MER",
+          "LA SEULLES RIVER",
+          "MARKET SQUARE"
+        ],
+        [
+          "WEAPONS FACTORY",
+          "LE SENTIER SEULLES",
+          "ROAD TO BÉNY-SUR-MER"
+        ],
+        [
+          "GRAYE-SUR-MER OUTSKIRTS",
+          "RADAR STATION",
+          "CHEM DE LA LAMPE"
+        ]
+      ]
+    },
+    {
+      "map": "REMAGEN",
+      "layers": [
+        "REM_L_1945_Warfare",
+        "REM_L_1945_WarfareNight"
+      ],
+      "sectors": [
+        [
+          "ALTE LIEBE BARSCH",
+          "BEWALDET KREUZUNG",
+          "DAN RADART 512"
+        ],
+        [
+          "ERPEL",
+          "ERPELER LEY",
+          "KASBACH OUTLOOK"
+        ],
+        [
+          "ST. SEVERIN CHAPEL",
+          "LUDENDORFF BRIDGE",
+          "BAUERNHOF AM RHEIN"
+        ],
+        [
+          "REMAGEN",
+          "MÖBELFABRIK",
+          "SCHLIEFFEN AUSWEG"
+        ],
+        [
+          "WALDBURG",
+          "MÜHLENWEG",
+          "HAGELKREUZ"
+        ]
+      ]
+    }
+  ]
+}
