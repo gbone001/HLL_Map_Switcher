@@ -567,3 +567,48 @@ def get_map_id(game_mode: str, map_name: str, variant: str) -> str | None:
         if entry["variant"] == variant:
             return entry["id"]
     return None
+
+
+# ------------------------------------------------------------------ warfare objectives
+# Bundled 5x3 strongpoint choices per warfare map (src/data/warfare_objectives.json),
+# collected from RCON with each map loaded. Lives under src/ because Railway mounts a
+# volume over /app/data. Regenerate it if a game update adds maps or renames objectives.
+WARFARE_OBJECTIVES_FILE = (
+    Path(__file__).resolve().parents[1] / "data" / "warfare_objectives.json"
+)
+_warfare_objectives: dict[str, list[list[str]]] | None = None
+_warfare_objectives_lock = threading.Lock()
+
+
+def _load_warfare_objectives() -> dict[str, list[list[str]]]:
+    """Layer ID (case-insensitive) -> five sectors of three choices. Empty if unreadable."""
+    global _warfare_objectives
+    with _warfare_objectives_lock:
+        if _warfare_objectives is not None:
+            return _warfare_objectives
+        table: dict[str, list[list[str]]] = {}
+        try:
+            data = json.loads(WARFARE_OBJECTIVES_FILE.read_text(encoding="utf-8"))
+            for entry in data.get("maps", []):
+                sectors = entry.get("sectors")
+                if not (
+                    isinstance(sectors, list)
+                    and len(sectors) == 5
+                    and all(isinstance(row, list) and len(row) == 3 for row in sectors)
+                ):
+                    logger.warning("Skipping malformed objectives entry for %s", entry.get("map"))
+                    continue
+                for layer in entry.get("layers", []):
+                    table[str(layer).lower()] = [list(row) for row in sectors]
+        except (OSError, ValueError) as exc:
+            logger.error("Could not load %s: %s", WARFARE_OBJECTIVES_FILE, exc)
+        _warfare_objectives = table
+        return table
+
+
+def get_warfare_objectives(map_id: str | None) -> list[list[str]] | None:
+    """The bundled objective choices for this warfare layer, or None if it isn't in the table."""
+    if not map_id:
+        return None
+    rows = _load_warfare_objectives().get(map_id.strip().lower())
+    return [list(row) for row in rows] if rows else None

@@ -1055,3 +1055,153 @@ class MapChangeCountdownTests(unittest.IsolatedAsyncioTestCase):
         servers = [(0, "Alpha")]
         fields, _ = bot._build_server_fields(servers, {0: self.status("foy_warfare")}, {})
         self.assertIn("⏳ Switching to **St. Mere Eglise (Day)** in ~", fields[0][1])
+
+
+class CrconPickerReadRetryTests(unittest.IsolatedAsyncioTestCase):
+    """CRCON drops reads around map changes; the pickers retry once before giving up."""
+
+    def setUp(self):
+        bot._pending_map_changes.clear()
+        for name, value in {"CRCON_READ_RETRY_DELAY_SECONDS": 0}.items():
+            patcher = mock.patch.object(bot, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    async def open_objectives(self, outcomes):
+        client = mock.Mock()
+        client.get_objective_rows.side_effect = outcomes
+        client.get_objective_rows.__name__ = "get_objective_rows"
+        interaction = interaction_for(member(BOOKER_ID))
+        interaction.response._done = True
+        # A live offensive layer is not in the warfare table, so the picker asks CRCON.
+        live = live_status("REM_L_1945_OffensiveUS", "REMAGEN")
+        with mock.patch.object(bot, "_get_http_client", return_value=client), \
+             mock.patch.object(bot.server_control, "get_status", return_value=live):
+            await bot.send_objective_selection(interaction, 0, edit_message=False)
+        return client, interaction.followup.send.await_args
+
+    async def test_objectives_picker_recovers_from_one_failed_read(self):
+        rows = [["A", "B", "C"]] * 5
+        client, sent = await self.open_objectives(
+            [bot.CRCONHTTPError("get_objective_rows failed with status 500: BrokenPipeError(32, 'Broken pipe')"), rows]
+        )
+        self.assertEqual(client.get_objective_rows.call_count, 2)
+        self.assertIsInstance(sent.kwargs["view"], bot.ObjectiveSelectionView)
+
+    async def test_objectives_picker_reports_a_second_failure(self):
+        client, sent = await self.open_objectives(
+            [bot.CRCONHTTPError("timed out"), bot.CRCONHTTPError("timed out again")]
+        )
+        self.assertEqual(client.get_objective_rows.call_count, 2)
+        self.assertIn("Failed to load objectives: timed out again", sent.kwargs["content"])
+
+    async def test_weather_picker_retries_its_gamestate_read(self):
+        client = mock.Mock()
+        client.get_gamestate.side_effect = [
+            bot.CRCONHTTPError("timed out"),
+            {"result": {"current_map": {"id": "REM_L_1945_WarfareNight", "pretty_name": "Remagen"}}},
+        ]
+        client.get_gamestate.__name__ = "get_gamestate"
+        interaction = interaction_for(member(BOOKER_ID))
+        interaction.response._done = True
+        with mock.patch.object(bot, "_get_http_client", return_value=client):
+            await bot.send_dynamic_weather_controls(interaction, 0, edit_message=False)
+        self.assertEqual(client.get_gamestate.call_count, 2)
+        self.assertIsInstance(interaction.followup.send.await_args.kwargs["view"], bot.DynamicWeatherToggleView)
+
+
+def live_status(map_id, name="LIVE MAP", transport="direct_rcon"):
+    game = bot.GameStatus(transport, name, 0, 0, 5400, None, map_id=map_id)
+    return ControlResult(success=True, transport=transport, message="ok", data={"status": game})
+
+
+class WarfareObjectivesTableTests(unittest.IsolatedAsyncioTestCase):
+    """Warfare choices come from src/data/warfare_objectives.json for the live map only."""
+
+    def setUp(self):
+        bot._pending_map_changes.clear()
+        bot._last_map_change_at.clear()
+        for name, value in {
+            "_deny_if_booked": mock.AsyncMock(return_value=False),
+            "refresh_main_embed": mock.AsyncMock(),
+        }.items():
+            patcher = mock.patch.object(bot, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    async def open_picker(self, status_result, http_client=None):
+        interaction = interaction_for(member(BOOKER_ID))
+        interaction.response._done = True
+        with mock.patch.object(bot.server_control, "get_status", return_value=status_result), \
+             mock.patch.object(bot, "_get_http_client", return_value=http_client):
+            await bot.send_objective_selection(interaction, 0, edit_message=False)
+        return interaction.followup.send.await_args.kwargs
+
+    def test_table_covers_every_warfare_layer_with_five_by_three(self):
+        from utils import map_data
+
+        table = map_data._load_warfare_objectives()
+        self.assertEqual(len(table), 44)
+        self.assertTrue(all(len(rows) == 5 and all(len(r) == 3 for r in rows) for rows in table.values()))
+        self.assertEqual(table["rem_l_1945_warfare"], table["rem_l_1945_warfarenight"])
+        self.assertIsNone(map_data.get_warfare_objectives("foy_offensive_us"))
+
+    async def test_live_warfare_map_uses_the_table_without_crcon(self):
+        sent = await self.open_picker(live_status("REM_L_1945_WarfareNight", "REMAGEN"))
+
+        view = sent["view"]
+        self.assertIsInstance(view, bot.ObjectiveSelectionView)
+        self.assertEqual(view.map_id, "REM_L_1945_WarfareNight")
+        self.assertEqual(view.rows[0], ["ALTE LIEBE BARSCH", "BEWALDET KREUZUNG", "DAN RADART 512"])
+        self.assertIn("**Live Map:** REMAGEN", sent["embed"].description)
+
+    async def test_no_choices_when_the_live_map_is_unknown(self):
+        failed = ControlResult(success=False, transport=None, message="both down")
+        sent = await self.open_picker(failed, http_client=mock.Mock())
+
+        self.assertNotIn("view", sent)
+        self.assertIn("Couldn't read the live map", sent["content"])
+
+    async def test_non_warfare_without_crcon_explains(self):
+        sent = await self.open_picker(live_status("foy_offensive_us", "FOY"), http_client=None)
+
+        self.assertNotIn("view", sent)
+        self.assertIn("isn't a warfare map", sent["content"])
+
+    async def test_choices_are_sent_by_position_keeping_exact_game_strings(self):
+        sent = await self.open_picker(live_status("PHL_L_1944_Warfare", "PURPLE HEART LANE"))
+        dropdown = sent["view"].children[4]
+
+        self.assertEqual([o.value for o in dropdown.options], ["0", "1", "2"])
+        self.assertEqual(dropdown.options[1].label, "ROAD TO CARENTAN")
+        dropdown._values = ["1"]
+        await dropdown.callback(interaction_for(member(BOOKER_ID)))  # 1 of 5 picked: just redraws
+        self.assertEqual(sent["view"].selected[5], "ROAD TO CARENTAN ")
+
+    async def lock(self, opened_on, live_now):
+        rows = bot.get_warfare_objectives(opened_on)
+        picker = bot.ObjectiveSelectionView(0, rows, "Alpha", "MAP", map_id=opened_on)
+        picker.selected = {slot: rows[slot - 1][0] for slot in range(1, 6)}
+        interaction = interaction_for(member(BOOKER_ID))
+        interaction.response._done = True
+        ok = ControlResult(success=True, transport="crcon_http", message="ok")
+        with mock.patch.object(bot.server_control, "get_status", return_value=live_now), \
+             mock.patch.object(bot.server_control, "set_sector_layout", return_value=ok) as write, \
+             mock.patch.object(bot.api_client, "get_current_map", return_value="MAP"):
+            await picker.lock_objectives(interaction)
+        return write, interaction
+
+    async def test_lock_refuses_when_the_live_map_changed_elsewhere(self):
+        write, interaction = await self.lock("foy_warfare", live_status("kursk_warfare", "KURSK"))
+
+        write.assert_not_called()
+        self.assertIn("is now on **KURSK**", interaction.edit_original_response.await_args.kwargs["content"])
+
+    async def test_lock_proceeds_on_the_same_live_map_any_time_of_day_case(self):
+        write, _ = await self.lock("foy_warfare", live_status("FOY_WARFARE", "FOY"))
+
+        write.assert_called_once_with(0, ["ROAD TO RECOGNE", "COBRU FACTORY", "WEST BEND", "N30 HIGHWAY", "ROAD TO BASTOGNE"])
+
+    def test_panel_footer_tells_users_to_switch_map_first(self):
+        embed = bot.build_main_embed(None, {})
+        self.assertIn("To set objectives for a map: first switch to it with 🗺️ Map", embed.footer.text)

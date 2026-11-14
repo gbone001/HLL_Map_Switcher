@@ -40,6 +40,7 @@ from utils.crcon_http import CRCONHttpClient, CRCONHTTPError
 from utils.map_data import (
     get_maps_for_mode,
     get_variants_for_map,
+    get_warfare_objectives,
     refresh_map_cache,
 )
 
@@ -1088,6 +1089,16 @@ def _panel_crcon_outage_state(
     return healthy_count == 0, unavailable_server_names
 
 
+# Bottom-of-panel guidance (embed footer). Objectives can only be set for the live map, so
+# say so where people look before pressing 🎯. Discord appends the "Updated" timestamp.
+PANEL_FOOTER_TEXT = (
+    "To set objectives for a map: first switch to it with 🗺️ Map, wait for the "
+    "~60 s countdown and load, then press 🎯 Objectives. Choices shown are always "
+    "for the map that is live now.\n"
+    "The last objective you pick applies the layout immediately · Updated"
+)
+
+
 def build_main_embed(
     focused_server_index: int | None,
     statuses: dict[int, ControlResult],
@@ -1116,7 +1127,7 @@ def build_main_embed(
     )
     for name, value in fields:
         embed.add_field(name=name, value=value or "\u200b", inline=True)
-    embed.set_footer(text="The last objective you pick applies the layout immediately · Updated")
+    embed.set_footer(text=PANEL_FOOTER_TEXT)
     if schedule_lines is not None:
         _add_schedule_fields(embed, schedule_lines)
     return embed
@@ -1868,14 +1879,8 @@ class GameModeView(PersistentView):
             )
             return
 
-        if not any(_get_http_client(index) for index, _ in servers):
-            await send_temporary_response(
-                interaction,
-                content="CRCON HTTP credentials are not configured for any server; objective controls are unavailable.",
-                delay=20,
-            )
-            return
-
+        # No CRCON pre-check: warfare choices come from the bundled table and the live map
+        # can be read over RCON. send_objective_selection reports what is actually missing.
         focused_server = _get_channel_focused_server(interaction.channel)
         if focused_server is not None and any(
             index == focused_server for index, _ in servers
@@ -2270,6 +2275,28 @@ class ServerDropdown(discord.ui.Select):
         await update_interaction_message(interaction, embed=embed, view=view)
 
 
+# Pause before retrying a failed CRCON read. Live tests saw CRCON time out or return
+# "500 BrokenPipeError" around map changes, then answer normally moments later.
+CRCON_READ_RETRY_DELAY_SECONDS = 3.0
+
+
+async def _crcon_read_with_retry(read, server_index: int):
+    """Run a CRCON read off the event loop, retrying once on CRCONHTTPError.
+
+    Only for reads (no side effects), so a retry can't apply anything twice. The second
+    failure propagates for the caller to report.
+    """
+    try:
+        return await asyncio.to_thread(read)
+    except CRCONHTTPError as exc:
+        logging.getLogger(__name__).warning(
+            "CRCON %s failed for server index %s, retrying once: %s",
+            getattr(read, "__name__", "read"), server_index, exc,
+        )
+    await asyncio.sleep(CRCON_READ_RETRY_DELAY_SECONDS)
+    return await asyncio.to_thread(read)
+
+
 async def _deny_if_map_changing(
     interaction: discord.Interaction,
     server_index: int,
@@ -2300,60 +2327,89 @@ async def _deny_if_map_changing(
     return True
 
 
+async def _live_status(server_index: int) -> GameStatus | None:
+    """Fresh status for this server (CRCON, then RCON), or None if neither answered."""
+    result = await asyncio.to_thread(server_control.get_status, server_index)
+    status = (result.data or {}).get("status") if result.success else None
+    return status if isinstance(status, GameStatus) else None
+
+
+async def _objective_picker_error(
+    interaction: discord.Interaction, *, edit_message: bool, title: str, message: str
+) -> None:
+    if edit_message:
+        await update_interaction_message(
+            interaction,
+            embed=discord.Embed(title=title, description=message, color=0xFFA500),
+            view=None,
+        )
+        _spawn(_delete_interaction_after(interaction, 20.0))
+    else:
+        await send_temporary_response(interaction, content=message, delay=20)
+
+
 async def send_objective_selection(
     interaction: discord.Interaction,
     server_index: int,
     *,
     edit_message: bool,
 ) -> None:
+    """Show the objectives picker for the map that is live on the server right now.
+
+    Warfare choices come from the bundled table (src/data/warfare_objectives.json), keyed by
+    the live layer ID read from the server. Other modes, or a layer missing from the table,
+    still ask CRCON for the loaded map's rows. If the live map can't be read, nothing is shown:
+    the choices must never belong to a different map.
+    """
     if await _deny_if_map_changing(interaction, server_index, edit_message=edit_message):
         return
-    client = _get_http_client(server_index)
-    if not client:
-        message = _http_error_message(server_index)
-        if edit_message:
-            await update_interaction_message(
-                interaction,
-                embed=discord.Embed(
-                    title="⚠️ Objective Controls Disabled",
-                    description=message,
-                    color=0xFFA500,
-                ),
-                view=None,
-            )
-            _spawn(_delete_interaction_after(interaction, 20.0))
-        else:
-            await send_temporary_response(
-                interaction, content=message, delay=20
-            )
+
+    status = await _live_status(server_index)
+    if status is None or not status.map_id:
+        await _objective_picker_error(
+            interaction,
+            edit_message=edit_message,
+            title="⚠️ Live Map Unknown",
+            message=(
+                "Couldn't read the live map from the server, so no objectives were shown. "
+                "Try again in a moment."
+            ),
+        )
         return
 
-    try:
-        rows = await asyncio.to_thread(client.get_objective_rows)
-    except CRCONHTTPError as exc:
-        message = f"Failed to load objectives: {exc}"
-        if edit_message:
-            await update_interaction_message(
+    rows = get_warfare_objectives(status.map_id)
+    if rows is None:
+        # Offensive, skirmish, or a layer newer than the table: CRCON reports the loaded map's rows.
+        client = _get_http_client(server_index)
+        if not client:
+            await _objective_picker_error(
                 interaction,
-                embed=discord.Embed(
-                    title="⚠️ Objective Fetch Failed",
-                    description=message,
-                    color=0xFFA500,
+                edit_message=edit_message,
+                title="⚠️ Objective Controls Disabled",
+                message=(
+                    f"**{status.current_map}** isn't a warfare map in the bot's objectives table, "
+                    f"and CRCON isn't available: {_http_error_message(server_index)}"
                 ),
-                view=None,
             )
-            _spawn(_delete_interaction_after(interaction, 20.0))
-        else:
-            await send_temporary_response(
-                interaction, content=message, delay=20
+            return
+        try:
+            rows = await _crcon_read_with_retry(client.get_objective_rows, server_index)
+        except CRCONHTTPError as exc:
+            await _objective_picker_error(
+                interaction,
+                edit_message=edit_message,
+                title="⚠️ Objective Fetch Failed",
+                message=f"Failed to load objectives: {exc}",
             )
-        return
+            return
 
-    server_name = api_client.get_server_name(server_index)
-    current_map = await asyncio.to_thread(
-        api_client.get_current_map, server_index
+    view = ObjectiveSelectionView(
+        server_index,
+        rows,
+        api_client.get_server_name(server_index),
+        status.current_map,
+        map_id=status.map_id,
     )
-    view = ObjectiveSelectionView(server_index, rows, server_name, current_map)
     embed = view.build_embed()
 
     if edit_message:
@@ -2393,7 +2449,7 @@ async def send_dynamic_weather_controls(
         return
 
     try:
-        gamestate_resp = await asyncio.to_thread(client.get_gamestate)
+        gamestate_resp = await _crcon_read_with_retry(client.get_gamestate, server_index)
         gamestate = (
             gamestate_resp.get("result")
             if isinstance(gamestate_resp, dict)
@@ -2612,11 +2668,14 @@ class ObjectiveSelectionView(discord.ui.View):
         rows: list[list[str]],
         server_name: str,
         current_map: str,
+        map_id: str | None = None,
     ):
         super().__init__(timeout=300)
         self.server_index = server_index
         self.server_name = server_name
         self.initial_map = current_map
+        # Live layer these choices belong to; re-checked before the layout is sent.
+        self.map_id = map_id
         self.rows = rows
         self.selected: dict[int, str] = {}
         self.opened_at = time.monotonic()
@@ -2627,8 +2686,9 @@ class ObjectiveSelectionView(discord.ui.View):
     def build_embed(self) -> discord.Embed:
         description = (
             f"**Server:** {self.server_name}\n"
-            f"**Current Map:** {self.initial_map}\n\n"
-            "Choose one strongpoint for each slot, then lock the layout for this match."
+            f"**Live Map:** {self.initial_map}\n\n"
+            "These are the objectives for the map that is live right now. Choose one "
+            "strongpoint for each slot; the last pick locks the layout for this match."
         )
 
         lines = []
@@ -2649,6 +2709,30 @@ class ObjectiveSelectionView(discord.ui.View):
             name="Selections", value="\n".join(lines), inline=False
         )
         return embed
+
+    async def _deny_if_live_map_differs(self, interaction: discord.Interaction) -> bool:
+        """True (and tell the user) unless the server is still on the map these choices are for.
+
+        Covers map changes the bot didn't make (CRCON UI, map rotation), which the
+        pending-change guard can't see.
+        """
+        live = await _live_status(self.server_index)
+        live_id = (live.map_id or "") if live is not None else ""
+        if live_id.lower() == (self.map_id or "").lower():
+            return False
+        if live is None or not live_id:
+            message = (
+                f"⚠️ Couldn't confirm the live map on **{self.server_name}**, so the layout "
+                "wasn't sent. Try again in a moment."
+            )
+        else:
+            message = (
+                f"🔁 **{self.server_name}** is now on **{live.current_map}**, not the map these "
+                "objectives are for. Open 🎯 Objectives again to pick from the live map."
+            )
+        await update_interaction_message(interaction, content=message, embed=None, view=None)
+        _spawn(_delete_interaction_after(interaction, 20.0))
+        return True
 
     async def lock_objectives(self, interaction: discord.Interaction) -> None:
         objective_list = [
@@ -2673,6 +2757,9 @@ class ObjectiveSelectionView(discord.ui.View):
         if await _deny_if_map_changing(
             interaction, self.server_index, edit_message=True, opened_at=self.opened_at
         ):
+            self.stop()
+            return
+        if self.map_id is not None and await self._deny_if_live_map_differs(interaction):
             self.stop()
             return
 
@@ -2721,9 +2808,11 @@ class ObjectiveSelectionView(discord.ui.View):
 
 class ObjectiveDropdown(discord.ui.Select):
     def __init__(self, slot: int, options: list[str]):
+        # Values are positions, not names: some game names carry trailing spaces
+        # (e.g. "ROAD TO CARENTAN ") that must reach the server byte for byte.
         select_options = [
-            discord.SelectOption(label=option, value=option)
-            for option in options
+            discord.SelectOption(label=option.strip() or option, value=str(position))
+            for position, option in enumerate(options)
         ]
         super().__init__(
             placeholder=f"Objective Slot {slot}",
@@ -2732,9 +2821,10 @@ class ObjectiveDropdown(discord.ui.Select):
             options=select_options,
         )
         self.slot = slot
+        self.choices = list(options)
 
     async def callback(self, interaction: discord.Interaction):
-        objective = self.values[0]
+        objective = self.choices[int(self.values[0])]
         view: ObjectiveSelectionView = self.view  # type: ignore[assignment]
         view.selected[self.slot] = objective
         if all(
